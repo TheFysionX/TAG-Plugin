@@ -44,7 +44,10 @@ test("Windows scheduler plan is branded, hourly, current-user-only, and has no e
   assert.match(plan.create.arguments.join(" "), /\/RL LIMITED/);
   assert.match(plan.create.arguments.join(" "), /\/TN TAG Plugin/);
   assert.match(plan.create.arguments.join(" "), /scheduled-run --home/);
-  assert.doesNotMatch(plan.create.arguments.join(" "), /SYSTEM|HIGHEST|\/RU/i);
+  assert.equal(
+    plan.create.arguments.some((argument) => /^(?:SYSTEM|HIGHEST|\/RU)$/i.test(argument)),
+    false
+  );
 });
 
 test("repeated Windows uninstall ignores only the known missing-task outcome", async () => {
