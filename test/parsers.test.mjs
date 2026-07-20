@@ -1,0 +1,469 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { parseCodexRollout } from "../src/adapters/codex-rollout.mjs";
+import { parseClaudeProject } from "../src/adapters/claude-project.mjs";
+import { parseKimiWire } from "../src/adapters/kimi-wire.mjs";
+import { MAX_JOURNAL_LINE_BYTES } from "../src/adapters/shared.mjs";
+import { canonicalModelId as resolveCanonicalModel } from "../src/model-registry.mjs";
+
+const fixtureDirectory = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
+const aliasKey = Buffer.alloc(32, 7).toString("base64");
+const dedupNamespaceKey = Buffer.alloc(32, 9).toString("base64url");
+
+function serialized(value) {
+  return JSON.stringify(value);
+}
+
+test("Codex fallback extracts only allowlisted final-turn usage", async () => {
+  const parsed = await parseCodexRollout(path.join(fixtureDirectory, "codex-rollout.jsonl"), {
+    aliasKey,
+    fileAlias: "codex-fixture",
+    dedupNamespaceKey,
+    now: 123
+  });
+  assert.equal(parsed.events.length, 1);
+  const [event] = parsed.events;
+  assert.equal(event.modelId, "gpt-5.6-sol");
+  assert.equal(event.mode.fast, true);
+  assert.deepEqual(event.usage, {
+    input: 60,
+    cachedInput: 40,
+    cacheWriteInput: 5,
+    output: 30,
+    reasoningOutput: 8,
+    total: 135
+  });
+  assert.equal(parsed.malformed, 0);
+  assert.equal(parsed.duplicateSnapshots, 1);
+  assert.equal(parsed.cumulativeMismatches, 0);
+  assert.doesNotMatch(serialized(parsed), /SECRET_|private|repository/i);
+});
+
+test("Claude fallback deduplicates message snapshots using the maximum/final usage", async () => {
+  const parsed = await parseClaudeProject(path.join(fixtureDirectory, "claude-project.jsonl"), {
+    aliasKey,
+    fileAlias: "claude-fixture",
+    dedupNamespaceKey
+  });
+  assert.equal(parsed.events.length, 2);
+  const known = parsed.events.find((event) => event.modelId === "claude-sonnet-5");
+  const unknown = parsed.events.find((event) => event.modelId === null);
+  assert.equal(known.usage.output, 25);
+  assert.equal(known.usage.total, 42);
+  assert.equal(known.mode.fast, true);
+  assert.equal(unknown.sourceModelId, "claude-unregistered-99");
+  assert.doesNotMatch(serialized(parsed), /SECRET_|private|source\.ts/i);
+});
+
+test("Kimi v0.28 fallback prefilters usage.record and maps HighSpeed to fast", async () => {
+  const parsed = await parseKimiWire(path.join(fixtureDirectory, "kimi-wire.jsonl"), {
+    aliasKey,
+    fileAlias: "kimi-fixture",
+    stableJournalIdentity: "stable-kimi-session-agent",
+    dedupNamespaceKey,
+    now: 123
+  });
+  assert.equal(parsed.events.length, 1);
+  assert.equal(parsed.events[0].modelId, "kimi-k2.7-code");
+  assert.equal(parsed.events[0].mode.fast, true);
+  assert.equal(parsed.events[0].usage.total, 42);
+  assert.doesNotMatch(serialized(parsed), /SECRET_|private|kimi\.py/i);
+});
+
+test("uploaded event IDs are stable across fresh local alias keys", async () => {
+  const codexPath = path.join(fixtureDirectory, "codex-rollout.jsonl");
+  const claudePath = path.join(fixtureDirectory, "claude-project.jsonl");
+  const kimiPath = path.join(fixtureDirectory, "kimi-wire.jsonl");
+  const firstKey = Buffer.alloc(32, 1).toString("base64");
+  const secondKey = Buffer.alloc(32, 2).toString("base64");
+  const firstCodex = await parseCodexRollout(codexPath, { aliasKey: firstKey, fileAlias: "first", dedupNamespaceKey });
+  const secondCodex = await parseCodexRollout(codexPath, { aliasKey: secondKey, fileAlias: "second", dedupNamespaceKey });
+  const firstClaude = await parseClaudeProject(claudePath, { aliasKey: firstKey, fileAlias: "first", dedupNamespaceKey });
+  const secondClaude = await parseClaudeProject(claudePath, { aliasKey: secondKey, fileAlias: "second", dedupNamespaceKey });
+  const firstKimi = await parseKimiWire(kimiPath, {
+    aliasKey: firstKey,
+    fileAlias: "first",
+    stableJournalIdentity: "stable-kimi-session-agent",
+    dedupNamespaceKey
+  });
+  const secondKimi = await parseKimiWire(kimiPath, {
+    aliasKey: secondKey,
+    fileAlias: "second",
+    stableJournalIdentity: "stable-kimi-session-agent",
+    dedupNamespaceKey
+  });
+  assert.deepEqual(firstCodex.events.map((event) => event.eventId), secondCodex.events.map((event) => event.eventId));
+  assert.deepEqual(firstClaude.events.map((event) => event.eventId), secondClaude.events.map((event) => event.eventId));
+  assert.deepEqual(firstKimi.events.map((event) => event.eventId), secondKimi.events.map((event) => event.eventId));
+});
+
+test("account namespaces prevent cross-account event-ID correlation", async () => {
+  const codexPath = path.join(fixtureDirectory, "codex-rollout.jsonl");
+  const first = await parseCodexRollout(codexPath, {
+    dedupNamespaceKey: Buffer.alloc(32, 3).toString("base64url")
+  });
+  const second = await parseCodexRollout(codexPath, {
+    dedupNamespaceKey: Buffer.alloc(32, 4).toString("base64url")
+  });
+  assert.notDeepEqual(
+    first.events.map((event) => event.eventId),
+    second.events.map((event) => event.eventId)
+  );
+});
+
+test("legacy byte cursors without file identity safely rescan once", async () => {
+  const codexPath = path.join(fixtureDirectory, "codex-rollout.jsonl");
+  const kimiPath = path.join(fixtureDirectory, "kimi-wire.jsonl");
+  const codex = await parseCodexRollout(codexPath, {
+    dedupNamespaceKey,
+    cursor: { offset: (await fs.stat(codexPath)).size }
+  });
+  const kimi = await parseKimiWire(kimiPath, {
+    dedupNamespaceKey,
+    stableJournalIdentity: "stable-kimi-session-agent",
+    cursor: { offset: (await fs.stat(kimiPath)).size }
+  });
+  assert.equal(codex.events.length, 1);
+  assert.equal(kimi.events.length, 1);
+  assert.equal(typeof codex.cursor.fileIdentity, "string");
+  assert.equal(typeof kimi.cursor.fileIdentity, "string");
+});
+
+test("Codex cursor resets when a larger journal replaces the file at the same path", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-codex-replace-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "rollout.jsonl");
+  const replacementPath = path.join(temporary, "replacement.jsonl");
+  const original = await fs.readFile(path.join(fixtureDirectory, "codex-rollout.jsonl"), "utf8");
+  await fs.writeFile(activePath, original, "utf8");
+  const first = await parseCodexRollout(activePath, { dedupNamespaceKey });
+  await fs.writeFile(replacementPath, original + "\n".repeat(512), "utf8");
+  await fs.rm(activePath);
+  await fs.rename(replacementPath, activePath);
+  const second = await parseCodexRollout(activePath, {
+    dedupNamespaceKey,
+    cursor: first.cursor
+  });
+  assert.notEqual(second.cursor.fileIdentity, first.cursor.fileIdentity);
+  assert.equal(second.events.length, 1);
+});
+
+test("Kimi cursor resets when a larger journal replaces the file at the same path", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-kimi-replace-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "wire.jsonl");
+  const replacementPath = path.join(temporary, "replacement.jsonl");
+  const original = await fs.readFile(path.join(fixtureDirectory, "kimi-wire.jsonl"), "utf8");
+  await fs.writeFile(activePath, original, "utf8");
+  const options = {
+    stableJournalIdentity: "stable-kimi-session-agent",
+    dedupNamespaceKey
+  };
+  const first = await parseKimiWire(activePath, options);
+  const changed = original.replace("2026-07-19T12:00:01.000Z", "2026-07-19T12:00:02.000Z")
+    + "\n".repeat(512);
+  await fs.writeFile(replacementPath, changed, "utf8");
+  await fs.rm(activePath);
+  await fs.rename(replacementPath, activePath);
+  const second = await parseKimiWire(activePath, { ...options, cursor: first.cursor });
+  assert.notEqual(second.cursor.fileIdentity, first.cursor.fileIdentity);
+  assert.equal(second.events.length, 1);
+  assert.notEqual(second.events[0].eventId, first.events[0].eventId);
+});
+
+test("Codex cursor resets after an in-place larger rewrite preserves file metadata identity", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-codex-rewrite-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "rollout.jsonl");
+  const original = await fs.readFile(path.join(fixtureDirectory, "codex-rollout.jsonl"), "utf8");
+  await fs.writeFile(activePath, original, "utf8");
+  const first = await parseCodexRollout(activePath, { dedupNamespaceKey });
+  const changed = original
+    .replaceAll("1000135", "2000270")
+    .replaceAll('"total_tokens":135', '"total_tokens":270')
+    + "\n".repeat(512);
+  await fs.writeFile(activePath, changed, "utf8");
+  const second = await parseCodexRollout(activePath, {
+    dedupNamespaceKey,
+    cursor: first.cursor
+  });
+  assert.equal(second.cursor.fileIdentity, first.cursor.fileIdentity);
+  assert.equal(second.events.length, 1);
+  assert.equal(second.events[0].usage.total, 270);
+  assert.equal(second.events[0].eventId, first.events[0].eventId);
+  assert.notEqual(second.cursor.usagePrefixDigest, first.cursor.usagePrefixDigest);
+});
+
+test("Kimi cursor resets after an in-place larger rewrite preserves file metadata identity", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-kimi-rewrite-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "wire.jsonl");
+  const original = await fs.readFile(path.join(fixtureDirectory, "kimi-wire.jsonl"), "utf8");
+  await fs.writeFile(activePath, original, "utf8");
+  const options = {
+    stableJournalIdentity: "stable-kimi-session-agent",
+    dedupNamespaceKey
+  };
+  const first = await parseKimiWire(activePath, options);
+  const changed = original.replace('"output":20', '"output":220') + "\n".repeat(512);
+  await fs.writeFile(activePath, changed, "utf8");
+  const second = await parseKimiWire(activePath, { ...options, cursor: first.cursor });
+  assert.equal(second.cursor.fileIdentity, first.cursor.fileIdentity);
+  assert.equal(second.events.length, 1);
+  assert.equal(second.events[0].usage.total, 242);
+  assert.equal(second.events[0].eventId, first.events[0].eventId);
+  assert.notEqual(second.cursor.usagePrefixDigest, first.cursor.usagePrefixDigest);
+});
+
+test("Kimi event IDs survive same-path replacement and non-usage header insertion", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-kimi-id-stability-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "wire.jsonl");
+  const original = await fs.readFile(path.join(fixtureDirectory, "kimi-wire.jsonl"), "utf8");
+  const options = {
+    stableJournalIdentity: "stable-kimi-session-agent",
+    dedupNamespaceKey
+  };
+  await fs.writeFile(activePath, original, "utf8");
+  const first = await parseKimiWire(activePath, options);
+  const insertedHeader = JSON.stringify({ type: "trace", time: "2026-07-19T11:59:59.000Z", payload: "ignored" });
+  await fs.writeFile(activePath, `${insertedHeader}\n${original}${"\n".repeat(512)}`, "utf8");
+  const second = await parseKimiWire(activePath, { ...options, cursor: first.cursor });
+  assert.equal(second.cursor.fileIdentity, first.cursor.fileIdentity);
+  assert.equal(second.events.length, 1);
+  assert.equal(second.events[0].eventId, first.events[0].eventId);
+});
+
+test("Kimi IDs distinguish separate usage occurrences at the same timestamp", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-kimi-same-time-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "wire.jsonl");
+  const base = {
+    type: "usage.record",
+    time: "2026-07-19T12:00:01.000Z",
+    model: "kimi-code/kimi-for-coding-highspeed",
+    usageScope: "turn"
+  };
+  await fs.writeFile(activePath, [
+    JSON.stringify({ ...base, usage: { inputOther: 12, inputCacheRead: 7, inputCacheCreation: 3, output: 20 } }),
+    JSON.stringify({ ...base, usage: { inputOther: 12, inputCacheRead: 7, inputCacheCreation: 3, output: 21 } }),
+    JSON.stringify({ ...base, usage: { inputOther: 12, inputCacheRead: 7, inputCacheCreation: 3, output: 20 } })
+  ].join("\n") + "\n", "utf8");
+  const parsed = await parseKimiWire(activePath, {
+    stableJournalIdentity: "stable-kimi-session-agent",
+    dedupNamespaceKey
+  });
+  assert.notEqual(parsed.events[0].eventId, parsed.events[1].eventId);
+  assert.notEqual(parsed.events[0].eventId, parsed.events[2].eventId);
+  assert.notEqual(parsed.events[1].eventId, parsed.events[2].eventId);
+});
+
+test("Kimi advances past an unknown model so later known usage is not blocked", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-kimi-model-replay-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "wire.jsonl");
+  const lines = [
+    { type: "trace", time: "2026-07-19T12:00:00.000Z", payload: "ignored" },
+    {
+      type: "usage.record",
+      time: "2026-07-19T12:00:01.000Z",
+      model: "kimi-future-code",
+      usage: { inputOther: 12, inputCacheRead: 7, inputCacheCreation: 3, output: 20 },
+      usageScope: "turn"
+    },
+    {
+      type: "usage.record",
+      time: "2026-07-19T12:00:02.000Z",
+      model: "kimi-code/kimi-for-coding-highspeed",
+      usage: { inputOther: 14, inputCacheRead: 7, inputCacheCreation: 3, output: 20 },
+      usageScope: "turn"
+    }
+  ].map(JSON.stringify).join("\n") + "\n";
+  await fs.writeFile(activePath, lines, "utf8");
+  const options = { stableJournalIdentity: "stable-kimi-session-agent", dedupNamespaceKey };
+  const first = await parseKimiWire(activePath, options);
+  assert.equal(first.events.length, 2);
+  assert.equal(first.events[0].modelId, null);
+  assert.equal(first.events[1].modelId, "kimi-k2.7-code");
+  assert.equal(first.cursor.offset, (await fs.stat(activePath)).size);
+  const second = await parseKimiWire(activePath, {
+    ...options,
+    cursor: first.cursor,
+    canonicalModelId: (provider, sourceModelId) => sourceModelId === "kimi-future-code"
+      ? "kimi-k2.7-code"
+      : resolveCanonicalModel(provider, sourceModelId)
+  });
+  assert.equal(second.events.length, 0);
+  assert.equal(second.cursor.offset, (await fs.stat(activePath)).size);
+});
+
+test("Codex advances past an unknown model for the local unresolved queue", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-codex-model-replay-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "rollout-00000000-0000-4000-8000-000000000001.jsonl");
+  const lines = [
+    { type: "session_meta", payload: { id: "00000000-0000-4000-8000-000000000001" } },
+    { type: "turn_context", payload: { model: "gpt-future-codex" } },
+    {
+      timestamp: "2026-07-19T10:00:02.000Z",
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: { total_tokens: 15 },
+          last_token_usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 }
+        }
+      }
+    }
+  ].map(JSON.stringify).join("\n") + "\n";
+  await fs.writeFile(activePath, lines, "utf8");
+  const first = await parseCodexRollout(activePath, { dedupNamespaceKey });
+  assert.equal(first.events.length, 1);
+  assert.equal(first.events[0].modelId, null);
+  assert.equal(first.cursor.offset, (await fs.stat(activePath)).size);
+  const second = await parseCodexRollout(activePath, {
+    dedupNamespaceKey,
+    cursor: first.cursor,
+    canonicalModelId: (_provider, sourceModelId) => sourceModelId === "gpt-future-codex"
+      ? "gpt-5.6-sol"
+      : null
+  });
+  assert.equal(second.events.length, 0);
+  assert.equal(second.cursor.offset, (await fs.stat(activePath)).size);
+});
+
+test("Codex timestamp-fallback IDs survive reformatting when cumulative usage is absent", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-codex-id-stability-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "rollout-00000000-0000-4000-8000-000000000001.jsonl");
+  const session = JSON.stringify({ type: "session_meta", payload: { id: "00000000-0000-4000-8000-000000000001" } });
+  const contextLine = JSON.stringify({ type: "turn_context", payload: { model: "gpt-5.6-sol" } });
+  const usage = JSON.stringify({
+    timestamp: "2026-07-19T10:00:02.000Z",
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: { last_token_usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 } }
+    }
+  });
+  const original = `${session}\n${contextLine}\n${usage}\n`;
+  await fs.writeFile(activePath, original, "utf8");
+  const first = await parseCodexRollout(activePath, { dedupNamespaceKey });
+  await fs.writeFile(activePath, `${JSON.stringify({ type: "trace", ignored: true })}\n${original}${"\n".repeat(512)}`, "utf8");
+  const second = await parseCodexRollout(activePath, { dedupNamespaceKey, cursor: first.cursor });
+  assert.equal(second.cursor.fileIdentity, first.cursor.fileIdentity);
+  assert.equal(second.events.length, 1);
+  assert.equal(second.events[0].eventId, first.events[0].eventId);
+});
+
+test("Codex IDs distinguish separate eligible token records at the same timestamp", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-codex-same-time-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "rollout-00000000-0000-4000-8000-000000000001.jsonl");
+  const usageRecord = (cumulativeTotal, input, output) => ({
+    timestamp: "2026-07-19T10:00:02.000Z",
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: {
+        total_token_usage: { total_tokens: cumulativeTotal },
+        last_token_usage: {
+          input_tokens: input,
+          output_tokens: output,
+          total_tokens: input + output
+        }
+      }
+    }
+  });
+  await fs.writeFile(activePath, [
+    { type: "session_meta", payload: { id: "00000000-0000-4000-8000-000000000001" } },
+    { type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+    usageRecord(15, 10, 5),
+    usageRecord(31, 10, 6)
+  ].map(JSON.stringify).join("\n") + "\n", "utf8");
+  const parsed = await parseCodexRollout(activePath, { dedupNamespaceKey });
+  assert.equal(parsed.events.length, 2);
+  assert.notEqual(parsed.events[0].eventId, parsed.events[1].eventId);
+});
+
+test("Codex IDs survive replacement that changes only a non-usage header", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-codex-header-replace-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "rollout-00000000-0000-4000-8000-000000000001.jsonl");
+  const replacementPath = path.join(temporary, "replacement.jsonl");
+  const original = await fs.readFile(path.join(fixtureDirectory, "codex-rollout.jsonl"), "utf8");
+  await fs.writeFile(activePath, `${JSON.stringify({ type: "trace", label: "before" })}\n${original}`, "utf8");
+  const first = await parseCodexRollout(activePath, { dedupNamespaceKey });
+  await fs.writeFile(
+    replacementPath,
+    `${JSON.stringify({ type: "trace", label: "after" })}\n${original}${"\n".repeat(512)}`,
+    "utf8"
+  );
+  await fs.rm(activePath);
+  await fs.rename(replacementPath, activePath);
+  const second = await parseCodexRollout(activePath, { dedupNamespaceKey, cursor: first.cursor });
+  assert.notEqual(second.cursor.fileIdentity, first.cursor.fileIdentity);
+  assert.deepEqual(
+    second.events.map((event) => event.eventId),
+    first.events.map((event) => event.eventId)
+  );
+});
+
+test("Kimi prefix verification catches an earlier in-place rewrite when the last usage record is unchanged", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-kimi-prefix-rewrite-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "wire.jsonl");
+  const firstLine = JSON.stringify({
+    type: "usage.record",
+    time: "2026-07-19T12:00:01.000Z",
+    model: "kimi-code/kimi-for-coding-highspeed",
+    usage: { inputOther: 12, inputCacheRead: 7, inputCacheCreation: 3, output: 20 },
+    usageScope: "turn"
+  });
+  const secondLine = JSON.stringify({
+    type: "usage.record",
+    time: "2026-07-19T12:00:02.000Z",
+    model: "kimi-code/kimi-for-coding-highspeed",
+    usage: { inputOther: 14, inputCacheRead: 7, inputCacheCreation: 3, output: 20 },
+    usageScope: "turn"
+  });
+  await fs.writeFile(activePath, `${firstLine}\n${secondLine}\n`, "utf8");
+  const options = {
+    stableJournalIdentity: "stable-kimi-session-agent",
+    dedupNamespaceKey
+  };
+  const first = await parseKimiWire(activePath, options);
+  const changedFirstLine = firstLine.replace('"output":20', '"output":21');
+  assert.equal(changedFirstLine.length, firstLine.length);
+  await fs.writeFile(activePath, `${changedFirstLine}\n${secondLine}\n${"\n".repeat(512)}`, "utf8");
+  const second = await parseKimiWire(activePath, { ...options, cursor: first.cursor });
+  assert.equal(second.cursor.fileIdentity, first.cursor.fileIdentity);
+  assert.equal(second.events.length, 2);
+  assert.equal(second.events[0].usage.output, 21);
+  assert.notEqual(second.cursor.usagePrefixDigest, first.cursor.usagePrefixDigest);
+});
+
+test("journal readers discard an oversized line and continue at the next newline", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-journal-line-cap-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "wire.jsonl");
+  const usageLine = JSON.stringify({
+    type: "usage.record",
+    time: "2026-07-19T12:00:01.000Z",
+    model: "kimi-code/kimi-for-coding-highspeed",
+    usage: { inputOther: 12, inputCacheRead: 7, inputCacheCreation: 3, output: 20 },
+    usageScope: "turn"
+  });
+  await fs.writeFile(activePath, `${"x".repeat(MAX_JOURNAL_LINE_BYTES + 1)}\n${usageLine}\n`, "utf8");
+  const parsed = await parseKimiWire(activePath, {
+    stableJournalIdentity: "stable-kimi-session-agent",
+    dedupNamespaceKey
+  });
+  assert.equal(parsed.malformed, 1);
+  assert.equal(parsed.events.length, 1);
+  assert.equal(parsed.cursor.offset, (await fs.stat(activePath)).size);
+});

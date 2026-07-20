@@ -1,0 +1,43 @@
+{
+  "name": "@the-artificial-games/tag-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Privacy-minimal local coding-agent usage plugin for The Artificial Games",
+  "author": "The Artificial Games",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TheFysionX/TAG-Plugin.git"
+  },
+  "homepage": "https://github.com/TheFysionX/TAG-Plugin#readme",
+  "bugs": {
+    "url": "https://github.com/TheFysionX/TAG-Plugin/security/advisories/new"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "tag-plugin": "./src/cli.mjs"
+  },
+  "files": [
+    ".github/workflows/release.yml",
+    "scripts",
+    "src",
+    "test",
+    "README.md",
+    "RELEASING.md",
+    "INSTALL.md",
+    "PRIVACY.md",
+    "SECURITY.md",
+    "THREAT_MODEL.md",
+    "ONE_PROMPT_INSTALL.md",
+    "install-manifest.json",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check src/cli.mjs && node --test",
+    "pack:dry-run": "npm pack --dry-run"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,72 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+
+test("package and install manifest remain dependency-free", async () => {
+  const packageJson = JSON.parse(await fs.readFile(path.join(root, "package.json"), "utf8"));
+  const manifest = JSON.parse(await fs.readFile(path.join(root, "install-manifest.json"), "utf8"));
+  assert.equal(packageJson.name, "@the-artificial-games/tag-plugin");
+  assert.deepEqual(packageJson.bin, { "tag-plugin": "./src/cli.mjs" });
+  assert.equal(packageJson.author, "The Artificial Games");
+  assert.equal(packageJson.repository.url, "git+https://github.com/TheFysionX/TAG-Plugin.git");
+  assert.equal(packageJson.homepage, "https://github.com/TheFysionX/TAG-Plugin#readme");
+  assert.deepEqual(packageJson.dependencies || {}, {});
+  assert.deepEqual(packageJson.devDependencies || {}, {});
+  assert.equal(packageJson.files.includes("test"), true);
+  assert.equal(packageJson.files.includes("scripts"), true);
+  assert.equal(packageJson.files.includes("RELEASING.md"), true);
+  assert.equal(packageJson.files.includes(".github/workflows/release.yml"), true);
+  assert.equal(manifest.releaseArtifact.includesSyntheticTestSuite, true);
+  assert.equal(manifest.product.name, "TAG Plugin");
+  assert.equal(manifest.product.publisher, "The Artificial Games");
+  assert.equal(manifest.product.repository, "https://github.com/TheFysionX/TAG-Plugin");
+  assert.equal(manifest.releaseArtifact.archiveName, "tag-plugin-0.1.0.tgz");
+  assert.match(manifest.releaseArtifact.releaseContract, /@the-artificial-games\/tag-plugin/);
+  assert.equal(manifest.releaseArtifact.testCommand, "npm test");
+  assert.deepEqual(
+    (await fs.readdir(path.join(root, "test", "fixtures"))).sort(),
+    ["claude-project.jsonl", "codex-rollout.jsonl", "kimi-wire.jsonl"]
+  );
+  assert.deepEqual(manifest.runtime.thirdPartyDependencies, []);
+  assert.equal(manifest.scheduler.elevation, false);
+  assert.match(manifest.localState.syncRecovery, /3 events or 2 checkpoints/);
+  assert.match(manifest.localState.syncRecovery, /1000 ingest requests.*heartbeat every 50/i);
+  assert.match(manifest.localState.unresolvedModels, /2000 normalized content-free records/i);
+  assert.match(manifest.localState.eventIdentity, /content-independent source identity/i);
+  assert.match(manifest.localState.operationLock, /owner token.*lease renewed.*live-PID/i);
+  assert.match(manifest.scheduler.postInstall, /immediate signed heartbeat/i);
+  assert.deepEqual(manifest.scheduler.identifiers, {
+    windowsTask: "TAG Plugin",
+    macOSLaunchAgent: "com.theartificialgames.tag-plugin",
+    linuxTimer: "tag-plugin.timer"
+  });
+  assert.match(manifest.localState.cursorReplacementDetection, /rolling prefix digest.*allowlisted/i);
+  assert.match(manifest.permissions.windowsSecretAcl, /before pairing traffic.*before pairing commit/i);
+  assert.equal(manifest.releaseArtifact.installedEntries.includes("RELEASING.md"), true);
+  const onePrompt = await fs.readFile(path.join(root, "ONE_PROMPT_INSTALL.md"), "utf8");
+  assert.match(onePrompt, /<ARCHIVE_SHA256>/);
+  assert.match(onePrompt, /https:\/\/github\.com\/TheFysionX\/TAG-Plugin/);
+  assert.match(onePrompt, /<ARTIFICIAL_GAMES_HTTPS_ORIGIN>/);
+  assert.match(onePrompt, /provider may receive and retain/i);
+  const security = await fs.readFile(path.join(root, "SECURITY.md"), "utf8");
+  assert.doesNotMatch(security, /100 events|32 checkpoints|eligible mixed batches/i);
+  assert.doesNotMatch(security, /heartbeat follows completed catch-up|heartbeat is deliberately deferred|cumulative record identity/i);
+  assert.match(security, /timestamp occurrence ordinal/i);
+  assert.match(security, /queue capped at 2,000/i);
+  const threatModel = await fs.readFile(path.join(root, "THREAT_MODEL.md"), "utf8");
+  assert.match(threatModel, /provider receives and may retain the short-lived credential/i);
+  assert.match(threatModel, /connector-reported evidence/i);
+  assert.doesNotMatch(threatModel, /connector-attested|recommended direct-terminal/i);
+});
+
+test("every GitHub Action reference is pinned to a full commit SHA", async () => {
+  const workflow = await fs.readFile(path.join(root, ".github", "workflows", "release.yml"), "utf8");
+  const references = [...workflow.matchAll(/uses:\s*[^@\s]+@([^\s]+)/g)].map((match) => match[1]);
+  assert.ok(references.length > 0);
+  assert.equal(references.every((reference) => /^[a-f0-9]{40}$/.test(reference)), true);
+  assert.doesNotMatch(workflow, /softprops|Build deterministic/i);
+});

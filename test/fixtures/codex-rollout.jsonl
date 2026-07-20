@@ -1,0 +1,5 @@
+{"timestamp":"2026-07-19T10:00:00.000Z","type":"session_meta","payload":{"id":"00000000-0000-4000-8000-000000000001","instructions":"SECRET_PROMPT_SHOULD_NEVER_LEAVE","cwd":"C:/private/repository","tool_output":"SECRET_TOOL_OUTPUT"}}
+{"timestamp":"2026-07-19T10:00:01.000Z","type":"turn_context","payload":{"model":"gpt-5.6-sol","thread_settings":{"service_tier":"priority"},"user_message":"SECRET_USER_MESSAGE"}}
+{"timestamp":"2026-07-19T10:00:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1000135},"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":5,"output_tokens":30,"reasoning_output_tokens":8,"total_tokens":135}},"response":"SECRET_RESPONSE"}}
+{"timestamp":"2026-07-19T10:00:02.100Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1000135},"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":5,"output_tokens":30,"reasoning_output_tokens":8,"total_tokens":135}},"response":"SECRET_DUPLICATE_RESPONSE"}}
+this is intentionally malformed token_count input

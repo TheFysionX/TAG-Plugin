@@ -1,0 +1,4 @@
+.tag-plugin/
+coverage/
+*.tgz
+node_modules/

@@ -1,0 +1,184 @@
+{
+  "schemaVersion": 4,
+  "product": {
+    "name": "TAG Plugin",
+    "publisher": "The Artificial Games",
+    "repository": "https://github.com/TheFysionX/TAG-Plugin",
+    "package": "@the-artificial-games/tag-plugin"
+  },
+  "connectorVersion": "0.1.0",
+  "runtime": {
+    "name": "Node.js",
+    "minimumMajor": 22,
+    "thirdPartyDependencies": []
+  },
+  "releaseArtifact": {
+    "archiveName": "tag-plugin-0.1.0.tgz",
+    "includesSyntheticTestSuite": true,
+    "testCommand": "npm test",
+    "releaseContract": "require package @the-artificial-games/tag-plugin; reject -local; require tag v<package-version>; require package, runtime constant, and manifest versions to match; require archive tag-plugin-<package-version>.tgz",
+    "installedDestination": "<connector-home>/versions/<connector-version>",
+    "installedEntries": [
+      ".github/workflows/release.yml",
+      "scripts/**",
+      "src/**",
+      "test/**",
+      "package.json",
+      "README.md",
+      "RELEASING.md",
+      "INSTALL.md",
+      "PRIVACY.md",
+      "SECURITY.md",
+      "THREAT_MODEL.md",
+      "ONE_PROMPT_INSTALL.md",
+      "install-manifest.json",
+      "LICENSE"
+    ]
+  },
+  "localReads": [
+    {
+      "provider": "codex",
+      "surface": "codex app-server account/usage/read",
+      "contentFree": true,
+      "default": true
+    },
+    {
+      "provider": "codex",
+      "surface": "~/.codex/sessions/**/*.jsonl",
+      "sensitiveJournal": true,
+      "default": false,
+      "requiresExplicitOptIn": true
+    },
+    {
+      "provider": "claude",
+      "surface": "~/.claude/projects/**/*.jsonl",
+      "sensitiveJournal": true,
+      "default": false,
+      "requiresExplicitOptIn": true
+    },
+    {
+      "provider": "kimi",
+      "surface": "~/.kimi-code/sessions/**/agents/*/wire.jsonl",
+      "verifiedVersion": "0.28",
+      "sensitiveJournal": true,
+      "default": false,
+      "requiresExplicitOptIn": true
+    }
+  ],
+  "localWrites": [
+    "config.json",
+    "state.json",
+    "device-secrets.json",
+    "pending-device-secrets.json (only while pairing or replacing a device)",
+    "connector.log.jsonl",
+    "connector.log.jsonl.1",
+    "connector.lock (ephemeral owner-token lease during state-changing commands)",
+    "versions/<connector-version>/**",
+    "current-user scheduler definition"
+  ],
+  "defaultHome": {
+    "windows": "%LOCALAPPDATA%/The Artificial Games/TAG Plugin",
+    "macOS": "~/Library/Application Support/The Artificial Games/TAG Plugin",
+    "linux": "$XDG_STATE_HOME/the-artificial-games/tag-plugin",
+    "environmentOverride": "TAG_PLUGIN_HOME",
+    "legacyEnvironmentAlias": "TOKENBOARD_CONNECTOR_HOME"
+  },
+  "localState": {
+    "deviceSecrets": [
+      "Ed25519 private/public key",
+      "server-issued account dedup namespace key",
+      "installation-only local path-alias key"
+    ],
+    "pendingDeviceSecrets": "separate unpaired Ed25519 key until exchange succeeds; does not overwrite an active device during replacement",
+    "pairingRecovery": "short-lived code, public key, endpoint, device label, connector version, approved fallbacks, private key, and fixed exchange request are stored only in the restricted pending-secret journal until config-first/state-last commit succeeds",
+    "syncRecovery": "fixed active request plus disjoint chunks of at most 3 events or 2 checkpoints, paced 550 ms apart, until committed; scheduled runs process at most 1000 ingest requests, heartbeat every 50 and once at the end even with backlog",
+    "unresolvedModels": "at most 2000 normalized content-free records with strict source-model token grammar; known records continue, registry updates drain resolvable entries, and queue size/cumulative overflow are visible",
+    "eventIdentity": "account-scoped HMAC over content-independent source identity; Codex and Kimi use session/journal plus timestamp occurrence ordinal when no verified provider record ID exists; token/model/mode changes retain the event ID",
+    "operationLock": "random owner token, open-handle lease renewed every stale-window quarter, live-PID stale-takeover guard, atomic rename/revalidation, and ownership-checked release",
+    "pathPrivacy": "raw paths are not persisted; installation-keyed HMAC aliases are persisted locally as cursor keys",
+    "cursorReplacementDetection": "file metadata, complete-line boundary, and rolling prefix digest over allowlisted usage/model/mode fields only; prompt/tool content is never hashed",
+    "maximumJournalLineBytes": 1048576
+  },
+  "network": {
+    "origin": "pairing argument, HTTPS required except explicit localhost",
+    "routes": [
+      "POST /api/connectors/v1/exchange",
+      "POST /api/connectors/v1/ingest",
+      "POST /api/connectors/v1/heartbeat"
+    ],
+    "redirectOriginsAllowed": false,
+    "queryStringsAllowed": false,
+    "maximumResponseBytes": 1048576,
+    "retry": {
+      "maximumAttempts": 3,
+      "strategy": "exponential backoff with jitter or bounded standards-compliant Retry-After",
+      "retryable": [
+        "network failure",
+        "timeout",
+        "HTTP 429",
+        "HTTP 5xx"
+      ],
+      "permanent4xx": "no blind retry; eligible invalid batches are bisected and isolated invalid events are quarantined"
+    }
+  },
+  "outboundUsageEventFields": [
+    "eventId",
+    "occurredAt",
+    "provider",
+    "modelId",
+    "serviceMode",
+    "inputTokens",
+    "cachedInputTokens",
+    "outputTokens",
+    "reasoningTokens",
+    "surface"
+  ],
+  "neverUploadedPersistedHashedOrLogged": [
+    "prompts",
+    "responses",
+    "tool output",
+    "commands",
+    "repository contents",
+    "browser data",
+    "provider credentials",
+    "passwords",
+    "refresh tokens",
+    "API keys"
+  ],
+  "rawPaths": {
+    "uploaded": false,
+    "persisted": false,
+    "logged": false,
+    "keyedAliasPersistedLocally": true
+  },
+  "scheduler": {
+    "scope": "current user",
+    "cadence": "hourly",
+    "command": "node <connector-home>/versions/<connector-version>/src/cli.mjs scheduled-run --home <connector-home>",
+    "elevation": false,
+    "defaultAction": "dry-run",
+    "applyFlag": "--confirm-install",
+    "removeFlag": "--confirm-uninstall",
+    "postInstall": "send one immediate signed heartbeat to establish continuity before the first hourly trigger",
+    "identifiers": {
+      "windowsTask": "TAG Plugin",
+      "macOSLaunchAgent": "com.theartificialgames.tag-plugin",
+      "linuxTimer": "tag-plugin.timer"
+    }
+  },
+  "permissions": {
+    "posixSecretMode": "0600",
+    "windowsSecretAcl": "before credential creation restrict the connector directory to one inheritable current-user grant; before pairing traffic explicitly harden the pending secret; before pairing commit harden the final secret; before install re-verify the final secret; fail closed on any error"
+  },
+  "uninstall": {
+    "removesScheduler": true,
+    "removesCurrentVersionedRelease": true,
+    "removesLocalState": false
+  },
+  "codingAgentPrompt": {
+    "providerMayReceiveAndRetainPrompt": true,
+    "oneMessageModeIncludesShortLivedPairCode": true,
+    "websiteGeneratedModeDisclosure": "before copying the one-message prompt, disclose that the selected coding-agent provider receives and may retain the short-lived pair code under its normal terms",
+    "saferAlternative": "enter the pair code directly in a local terminal after agent review"
+  }
+}

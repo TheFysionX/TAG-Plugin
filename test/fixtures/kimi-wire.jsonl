@@ -1,0 +1,2 @@
+{"type":"trace","time":"2026-07-19T12:00:00.000Z","payload":"SECRET_KIMI_TRACE","path":"C:/private/kimi.py"}
+{"type":"usage.record","time":"2026-07-19T12:00:01.000Z","model":"kimi-code/kimi-for-coding-highspeed","usage":{"inputOther":12,"inputCacheRead":7,"inputCacheCreation":3,"output":20},"usageScope":"turn","trace":"SECRET_KIMI_CONTENT"}
