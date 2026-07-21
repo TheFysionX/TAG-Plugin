@@ -23,6 +23,13 @@ function assistantSnapshot(record, options, line) {
   const speed = record.message.usage.speed ?? record.message.speed ?? record.speed ?? null;
   const sourceModelId = normalizeModel(record.message.model);
   const resolveModel = options.canonicalModelId || canonicalModelId;
+  const usage = normalizeUsage(record.message.usage, "claude");
+  // Claude writes terminal synthetic assistant records for API failures and
+  // "No response requested.". They have usage metadata but no usage. Keeping
+  // them would create phantom raw-only aggregates and false overlap signals.
+  if (usage.input + usage.cachedInput + usage.cacheWriteInput + usage.output === 0) {
+    return null;
+  }
   return {
     eventId: accountScopedEventId(options.dedupNamespaceKey, "claude", messageId),
     provider: "claude",
@@ -36,7 +43,7 @@ function assistantSnapshot(record, options, line) {
     ].join("\0")),
     observedAt: normalizeTimestamp(record.timestamp),
     mode: normalizeMode({ provider: "claude", serviceTier, speed }),
-    usage: normalizeUsage(record.message.usage, "claude"),
+    usage,
     provenance: {
       collector: "claude_project_jsonl_fallback",
       verification: "connector_attested",

@@ -1,5 +1,9 @@
-export const CONNECTOR_VERSION = "0.1.4";
+export const CONNECTOR_VERSION = "0.1.5";
 export const SCHEMA_VERSION = 1;
+export const CODEX_ACCOUNTING_VERSION = 5;
+export const CLAUDE_ACCOUNTING_VERSION = 5;
+export const KIMI_ACCOUNTING_VERSION = 2;
+export const AGGREGATE_CURSOR_VERSION = 3;
 export const GENESIS_HASH = "0".repeat(64);
 export const MAX_LOG_BYTES = 256 * 1024;
 export const MAX_CURSOR_FILES = 5_000;
@@ -9,11 +13,11 @@ export const MAX_UNRESOLVED_EVENTS = 2_000;
 export const MAX_INGEST_EVENTS = 3;
 export const MAX_INGEST_CHECKPOINTS = 2;
 export const HISTORY_SETTLE_MINUTES = 15;
-// The ingest service quarantines events older than 90 days. Keep the connector's
-// initial import one full day inside that boundary so clock skew cannot turn a
-// useful first sync into guaranteed quarantine work.
+// Collection is intentionally independent from the server's scoring horizon.
+// Coding-agent journals postdate Unix epoch, so this safely means all retained
+// discoverable history without pretending a bounded score window is lifetime.
+export const JOURNAL_HISTORY_START = "1970-01-01T00:00:00.000Z";
 export const SERVER_MAX_AUTO_SCORED_RETROACTIVE_DAYS = 90;
-export const INITIAL_HISTORY_DAYS = SERVER_MAX_AUTO_SCORED_RETROACTIVE_DAYS - 1;
 export const SERVER_MAX_AUTO_SCORED_EVENT_TOKENS = 100_000_000;
 export const MAX_SYNC_OUTBOX_EVENTS = 5_000;
 export const MAX_MIGRATION_EXCLUSIONS = 20_000;

@@ -101,10 +101,12 @@ export async function parseKimiWire(filePath, options) {
     ? options.onEvent
     : null;
   const fileIdentity = sha256([
-    "kimi-journal-file-v1",
+    "kimi-journal-file-v2",
     String(stat.dev),
     String(stat.ino),
-    String(Math.trunc(stat.birthtimeMs))
+    // Preserve the sub-millisecond creation time so a rapid same-path file
+    // replacement cannot reuse the previous journal identity on Windows.
+    String(stat.birthtimeMs)
   ].join("\0"));
   const replaced = typeof savedCursor.fileIdentity === "string"
     && savedCursor.fileIdentity !== fileIdentity;

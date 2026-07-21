@@ -17,7 +17,7 @@ The connector must live in its own **public** GitHub repository with the content
    ```text
    npm run check
    npm run pack:dry-run
-   node scripts/validate-release-contract.mjs v0.1.4
+   node scripts/validate-release-contract.mjs v0.1.5
    ```
 
 3. Commit the exact reviewed source and push the commit to `main`.
@@ -26,8 +26,8 @@ The connector must live in its own **public** GitHub repository with the content
 6. Download the published asset and verify it independently:
 
    ```text
-   gh release download v0.1.4 -R TheFysionX/TAG-Plugin
-   gh attestation verify tag-plugin-0.1.4.tgz -R TheFysionX/TAG-Plugin
+   gh release download v0.1.5 -R TheFysionX/TAG-Plugin
+   gh attestation verify tag-plugin-0.1.5.tgz -R TheFysionX/TAG-Plugin
    ```
 
    Also compute the archive SHA-256 and require it to match `SHA256SUMS`.
@@ -35,9 +35,9 @@ The connector must live in its own **public** GitHub repository with the content
 
    ```text
    CONNECTOR_REPOSITORY_URL=https://github.com/TheFysionX/TAG-Plugin
-   CONNECTOR_RELEASE_TAG=v0.1.4
+   CONNECTOR_RELEASE_TAG=v0.1.5
    CONNECTOR_RELEASE_COMMIT=<full 40-character tag commit SHA>
-   CONNECTOR_RELEASE_ASSET=tag-plugin-0.1.4.tgz
+   CONNECTOR_RELEASE_ASSET=tag-plugin-0.1.5.tgz
    CONNECTOR_RELEASE_SHA256=<64-character SHA-256 from SHA256SUMS>
    ```
 

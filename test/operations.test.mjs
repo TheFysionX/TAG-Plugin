@@ -7,12 +7,13 @@ import { fileURLToPath } from "node:url";
 import { verify } from "node:crypto";
 import { createDeviceSecrets, sha256 } from "../src/crypto.mjs";
 import {
-  INITIAL_HISTORY_DAYS,
+  JOURNAL_HISTORY_START,
   MAX_SYNC_OUTBOX_EVENTS,
   SERVER_MAX_AUTO_SCORED_EVENT_TOKENS,
   SERVER_MAX_AUTO_SCORED_RETROACTIVE_DAYS
 } from "../src/constants.mjs";
 import { parseKimiWire } from "../src/adapters/kimi-wire.mjs";
+import { MAX_JOURNAL_LINE_BYTES } from "../src/adapters/shared.mjs";
 import { discoverJsonlFiles } from "../src/discovery.mjs";
 import {
   chunkSyncPayloads,
@@ -32,9 +33,9 @@ const fixtureDirectory = path.join(path.dirname(fileURLToPath(import.meta.url)),
 const connectorRoot = path.resolve(fixtureDirectory, "..", "..");
 const dedupNamespaceKey = Buffer.alloc(32, 9).toString("base64url");
 
-test("initial history import stays inside the server retroactive scoring policy", () => {
+test("journal collection is independent from the server retroactive scoring policy", () => {
   assert.equal(SERVER_MAX_AUTO_SCORED_RETROACTIVE_DAYS, 90);
-  assert.equal(INITIAL_HISTORY_DAYS, SERVER_MAX_AUTO_SCORED_RETROACTIVE_DAYS - 1);
+  assert.equal(JOURNAL_HISTORY_START, "1970-01-01T00:00:00.000Z");
   assert.equal(SERVER_MAX_AUTO_SCORED_EVENT_TOKENS, 100_000_000);
 });
 
@@ -62,6 +63,17 @@ async function setup() {
 
 function jsonResponse(body) {
   return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+}
+
+function acceptedEventResult(event) {
+  return {
+    eventId: event.eventId,
+    status: "accepted",
+    scoringState: "accepted",
+    ...(event.attribution === "raw_only"
+      ? { rawEligible: true, rawPreserved: true }
+      : {})
+  };
 }
 
 function errorResponse(statusCode, code, message = "Rejected for test") {
@@ -141,22 +153,20 @@ test("pair is idempotent for an existing device on the same endpoint", async (co
     platform: "linux",
     endpoint: "https://artificial-games.example/",
     code: "JKLM-NPQR",
-    fetchImpl: async () => {
-      networkCalls += 1;
-      throw new Error("an idempotent retry must not exchange another code");
-    }
+    fetchImpl
   });
 
-  assert.equal(networkCalls, 1);
+  assert.equal(networkCalls, 2);
   assert.equal(retried.paired, true);
   assert.equal(retried.alreadyPaired, true);
+  assert.equal(retried.authorizationRefreshed, true);
   assert.equal(retried.deviceId, "device_12345678");
   assert.deepEqual(retried.allowedPlatforms, ["codex", "claude"]);
   assert.deepEqual(retried.transcriptFallbacks, { codex: true, claude: true, kimi: false });
   assert.equal(await fs.access(fixture.paths.pendingSecrets).then(() => true).catch(() => false), false);
 });
 
-test("pair reuse applies explicitly requested journals without exchanging another code", async (context) => {
+test("pair reuse exchanges the new code and refreshes server-authorized platforms", async (context) => {
   const fixture = await setup();
   context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
   let networkCalls = 0;
@@ -170,7 +180,7 @@ test("pair reuse applies explicitly requested journals without exchanging anothe
       return jsonResponse({
         device: {
           id: "device_12345678",
-          allowedPlatforms: ["codex", "claude"],
+          allowedPlatforms: ["codex"],
           supportedProviders: ["codex", "claude"]
         },
         dedupNamespaceKey,
@@ -178,6 +188,10 @@ test("pair reuse applies explicitly requested journals without exchanging anothe
       });
     }
   });
+  const activeRuntime = await loadRuntime(fixture.paths);
+  activeRuntime.state.nextSequence = 3380;
+  activeRuntime.state.previousRequestDigest = "a".repeat(43);
+  await saveRuntime(fixture.paths, activeRuntime);
 
   const retried = await pair({
     home: fixture.home,
@@ -187,14 +201,26 @@ test("pair reuse applies explicitly requested journals without exchanging anothe
     enabledFallbacks: { codex: true, claude: true },
     fetchImpl: async () => {
       networkCalls += 1;
-      throw new Error("an active pairing must not exchange another code");
+      return jsonResponse({
+        device: {
+          id: "device_12345678",
+          allowedPlatforms: ["codex", "claude"],
+          supportedProviders: ["codex", "claude"]
+        },
+        dedupNamespaceKey,
+        signing: { nextSequence: 3380, lastRequestDigest: "a".repeat(43) }
+      });
     }
   });
 
-  assert.equal(networkCalls, 1);
+  assert.equal(networkCalls, 2);
   assert.equal(retried.alreadyPaired, true);
+  assert.equal(retried.authorizationRefreshed, true);
+  assert.deepEqual(retried.allowedPlatforms, ["codex", "claude"]);
   assert.deepEqual(retried.transcriptFallbacks, { codex: true, claude: true, kimi: false });
   const after = await loadRuntime(fixture.paths);
+  assert.equal(after.state.nextSequence, 3380);
+  assert.equal(after.state.previousRequestDigest, "a".repeat(43));
   assert.deepEqual(after.config.transcriptFallbacks, { codex: true, claude: true, kimi: false });
 });
 
@@ -548,11 +574,13 @@ test("sync sends only strict allowlisted wire events and advances the request ch
   const calls = [];
   const fetchImpl = async (url, init) => {
     calls.push({ url, init });
+    const request = JSON.parse(init.body);
     return jsonResponse({
-      request: { id: "request-1", sequence: 1, digest: "digest_1234567890abcdef" },
-      accepted: 3,
+      request: { id: `request-${calls.length}`, sequence: calls.length, digest: `digest_${calls.length}_1234567890abcdef` },
+      accepted: request.events.length,
       duplicates: 0,
-      rejected: 0
+      rejected: 0,
+      events: request.events.map(acceptedEventResult)
     });
   };
   const result = await sync({
@@ -563,23 +591,37 @@ test("sync sends only strict allowlisted wire events and advances the request ch
     now: 1_750_000_000_000,
     nonce: "sync-request"
   });
-  assert.equal(result.sent, 3);
-  assert.equal(result.withheld, 1);
-  assert.equal(calls.length, 1);
+  assert.equal(result.sent, 4);
+  assert.equal(result.withheld, 0);
+  assert.equal(calls.length, 2);
   const body = JSON.parse(calls[0].init.body);
   assert.deepEqual(Object.keys(body), ["events", "previousRequestDigest"]);
   assert.equal(body.previousRequestDigest, "");
-  assert.equal(body.events.length, 3);
+  const sentEvents = calls.flatMap((call) => JSON.parse(call.init.body).events);
+  assert.equal(sentEvents.length, 4);
   const allowedEventKeys = new Set([
     "eventId", "occurredAt", "provider", "modelId", "serviceMode",
-    "inputTokens", "cachedInputTokens", "outputTokens", "reasoningTokens", "surface"
+    "inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens", "reasoningTokens", "surface",
+    "attribution"
   ]);
-  for (const event of body.events) {
+  for (const event of sentEvents) {
     assert.equal(Object.keys(event).every((key) => allowedEventKeys.has(key)), true);
     assert.equal(typeof event.inputTokens, "string");
     assert.equal(typeof event.cachedInputTokens, "string");
+    assert.equal(typeof event.cacheWriteInputTokens, "string");
     assert.equal(typeof event.outputTokens, "string");
   }
+  const rawOnly = sentEvents.find((event) => event.attribution === "raw_only");
+  assert.deepEqual({
+    attribution: rawOnly.attribution,
+    modelId: rawOnly.modelId,
+    serviceMode: rawOnly.serviceMode
+  }, {
+    attribution: "raw_only",
+    modelId: "unknown",
+    serviceMode: "unknown"
+  });
+  assert.equal(Object.hasOwn(rawOnly, "sourceModelId"), false);
   assert.doesNotMatch(JSON.stringify(body), /SECRET_|private|repository|source\.ts|kimi\.py/i);
   const signatureValid = verify(
     null,
@@ -598,8 +640,8 @@ test("sync sends only strict allowlisted wire events and advances the request ch
   );
   assert.equal(signatureValid, true);
   const updated = await loadRuntime(fixture.paths);
-  assert.equal(updated.state.nextSequence, 2);
-  assert.equal(updated.state.previousRequestDigest, "digest_1234567890abcdef");
+  assert.equal(updated.state.nextSequence, 3);
+  assert.equal(updated.state.previousRequestDigest, "digest_2_1234567890abcdef");
 
   const second = await sync({
     home: fixture.home,
@@ -611,7 +653,7 @@ test("sync sends only strict allowlisted wire events and advances the request ch
   assert.equal(second.sent, 0);
 });
 
-test("Codex lifetime authority is the first checkpoint in the first ingest request", async (context) => {
+test("Codex checkpoints carry account scope and use lifetime authority as the final commit marker", async (context) => {
   const fixture = await setup();
   context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
   const secrets = createDeviceSecrets();
@@ -656,22 +698,32 @@ test("Codex lifetime authority is the first checkpoint in the first ingest reque
   assert.equal(result.checkpoints, 4);
   assert.equal(bodies.length, 2);
   assert.equal(bodies.every((body) => body.events.length === 0), true);
-  assert.deepEqual(bodies[0].checkpoints[0], {
-    checkpointId: bodies[0].checkpoints[0].checkpointId,
+  const checkpoints = bodies.flatMap((body) => body.checkpoints);
+  assert.equal(checkpoints.every((checkpoint) => checkpoint.sourceScope === "codex_subscription_account"), true);
+  assert.notEqual(checkpoints[0].checkpointId, sha256(JSON.stringify({
+    provider: "codex",
+    source: "codex_app_server_account_usage",
+    periodStart: "2026-07-18T00:00:00.000Z",
+    periodEnd: "2026-07-19T00:00:00.000Z",
+    totalTokens: "100"
+  })));
+  assert.deepEqual(checkpoints.at(-1), {
+    checkpointId: checkpoints.at(-1).checkpointId,
     provider: "codex",
     source: "codex_app_server_account_usage_lifetime",
+    sourceScope: "codex_subscription_account",
     periodStart: "2026-07-20T00:00:00.000Z",
     periodEnd: "2026-07-21T00:00:00.000Z",
     totalTokens: "17772403863"
   });
-  assert.equal(bodies[0].checkpoints[1].source, "codex_app_server_account_usage");
+  assert.equal(checkpoints[0].source, "codex_app_server_account_usage");
   assert.deepEqual(
-    bodies.flatMap((body) => body.checkpoints).map((checkpoint) => checkpoint.source),
+    checkpoints.map((checkpoint) => checkpoint.source),
     [
-      "codex_app_server_account_usage_lifetime",
       "codex_app_server_account_usage",
       "codex_app_server_account_usage",
-      "codex_app_server_account_usage"
+      "codex_app_server_account_usage",
+      "codex_app_server_account_usage_lifetime"
     ]
   );
 });
@@ -775,7 +827,7 @@ test("sync chunks first-history uploads to backend limits and commits after the 
         accepted: body.events.length,
         duplicates: 0,
         rejected: 0,
-        events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+        events: body.events.map(acceptedEventResult)
       });
     }
   });
@@ -830,7 +882,7 @@ test("sync pages first history into a bounded outbox and resumes without losing 
         accepted: body.events.length,
         duplicates: 0,
         rejected: 0,
-        events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+        events: body.events.map(acceptedEventResult)
       });
     }
   });
@@ -852,7 +904,7 @@ test("sync pages first history into a bounded outbox and resumes without losing 
   );
 });
 
-test("aggregate sync emits stable hourly model totals inside the scored history window", async (context) => {
+test("aggregate sync emits stable hourly model totals from retained history", async (context) => {
   const fixture = await setup();
   context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
   const wirePath = path.join(fixture.roots.kimi, "session", "agents", "main", "wire.jsonl");
@@ -904,7 +956,7 @@ test("aggregate sync emits stable hourly model totals inside the scored history 
           accepted: body.events.length,
           duplicates: 0,
           rejected: 0,
-          events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+        events: body.events.map(acceptedEventResult)
         });
       }
     });
@@ -922,8 +974,9 @@ test("aggregate sync emits stable hourly model totals inside the scored history 
   assert.equal(first.uploaded.length, 1);
   assert.deepEqual(first.uploaded, second.uploaded);
   assert.equal(first.uploaded[0].occurredAt, "2026-07-19T12:30:00.000Z");
-  assert.equal(first.uploaded[0].inputTokens, "81");
+  assert.equal(first.uploaded[0].inputTokens, "75");
   assert.equal(first.uploaded[0].cachedInputTokens, "12");
+  assert.equal(first.uploaded[0].cacheWriteInputTokens, "6");
   assert.equal(first.uploaded[0].outputTokens, "30");
   assert.equal(first.result.catchingUp, false);
 });
@@ -1028,7 +1081,7 @@ test("paged aggregate outbox resumes newest-first and commits cursors only after
         accepted: body.events.length,
         duplicates: 0,
         rejected: 0,
-        events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+        events: body.events.map(acceptedEventResult)
       });
     }
   });
@@ -1104,7 +1157,7 @@ test("a missing deferred sync page fails closed without advancing aggregate curs
         accepted: body.events.length,
         duplicates: 0,
         rejected: 0,
-        events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+        events: body.events.map(acceptedEventResult)
       });
     }
   });
@@ -1222,7 +1275,7 @@ test("aggregate through watermarks advance independently and preserve deferred p
         accepted: body.events.length,
         duplicates: 0,
         rejected: 0,
-        events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+        events: body.events.map(acceptedEventResult)
       });
     },
     ...extra
@@ -1297,7 +1350,7 @@ test("aggregate through watermarks advance independently and preserve deferred p
   assert.equal(runtime.state.cursors.aggregate.providers.kimi.through, "2026-07-20T16:00:00.000Z");
 });
 
-test("pre-v4 Claude accounting replays corrected Fast history exactly once", async (context) => {
+test("pre-v5 Claude accounting replays Fast and raw-only history exactly once", async (context) => {
   const fixture = await setup();
   context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
   const secrets = createDeviceSecrets();
@@ -1338,33 +1391,39 @@ test("pre-v4 Claude accounting replays corrected Fast history exactly once", asy
         accepted: body.events.length,
         duplicates: 0,
         rejected: 0,
-        events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+        events: body.events.map(acceptedEventResult)
       });
     }
   });
 
-  assert.equal((await run()).sent, 1);
-  assert.equal(uploaded.length, 1);
+  assert.equal((await run()).sent, 2);
+  assert.equal(uploaded.length, 2);
+  const fastEvent = uploaded.find((event) => event.serviceMode === "fast");
   assert.deepEqual({
-    provider: uploaded[0].provider,
-    occurredAt: uploaded[0].occurredAt,
-    serviceMode: uploaded[0].serviceMode,
-    inputTokens: uploaded[0].inputTokens,
-    cachedInputTokens: uploaded[0].cachedInputTokens,
-    outputTokens: uploaded[0].outputTokens
+    provider: fastEvent.provider,
+    occurredAt: fastEvent.occurredAt,
+    serviceMode: fastEvent.serviceMode,
+    inputTokens: fastEvent.inputTokens,
+    cachedInputTokens: fastEvent.cachedInputTokens,
+    cacheWriteInputTokens: fastEvent.cacheWriteInputTokens,
+    outputTokens: fastEvent.outputTokens
   }, {
     provider: "claude",
     occurredAt: "2026-07-19T11:30:00.000Z",
     serviceMode: "fast",
-    inputTokens: "12",
+    inputTokens: "10",
     cachedInputTokens: "5",
+    cacheWriteInputTokens: "2",
     outputTokens: "25"
   });
+  assert.equal(uploaded.some((event) => event.attribution === "raw_only"
+    && event.modelId === "unknown"
+    && event.serviceMode === "unknown"), true);
   assert.equal((await run()).sent, 0);
-  assert.equal(uploaded.length, 1);
+  assert.equal(uploaded.length, 2);
 
   const updated = await loadRuntime(fixture.paths);
-  assert.equal(updated.state.cursors.claude.accountingVersion, 4);
+  assert.equal(updated.state.cursors.claude.accountingVersion, 5);
   assert.equal(updated.state.cursors.aggregate.providers.claude.through, "2026-07-20T11:00:00.000Z");
   assert.equal(updated.state.providerEvidenceHashes.claude, undefined);
 });
@@ -1404,15 +1463,16 @@ test("hourly aggregation counts duplicate physical Codex journals only once", as
         accepted: body.events.length,
         duplicates: 0,
         rejected: 0,
-        events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+        events: body.events.map(acceptedEventResult)
       });
     }
   });
 
   assert.equal(result.sent, 1);
   assert.equal(uploaded.length, 1);
-  assert.equal(uploaded[0].inputTokens, "65");
+  assert.equal(uploaded[0].inputTokens, "60");
   assert.equal(uploaded[0].cachedInputTokens, "40");
+  assert.equal(uploaded[0].cacheWriteInputTokens, "5");
   assert.equal(uploaded[0].outputTokens, "30");
 });
 
@@ -1455,7 +1515,7 @@ test("aggregation preserves oversized source usage for backend quarantine", asyn
         accepted: body.events.length,
         duplicates: 0,
         rejected: 0,
-        events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+        events: body.events.map(acceptedEventResult)
       });
     }
   });
@@ -1463,12 +1523,13 @@ test("aggregation preserves oversized source usage for backend quarantine", asyn
   assert.equal(result.sent, 1);
   assert.equal(uploaded.length, 1);
   assert.equal(uploaded[0].occurredAt, "2026-07-19T12:30:00.000Z");
-  assert.equal(uploaded[0].inputTokens, "120000001");
+  assert.equal(uploaded[0].inputTokens, "120000000");
   assert.equal(uploaded[0].cachedInputTokens, "2");
+  assert.equal(uploaded[0].cacheWriteInputTokens, "1");
   assert.equal(uploaded[0].outputTokens, "5");
 });
 
-test("initial aggregate import skips guaranteed-quarantine history and preserves source hours", async (context) => {
+test("initial Kimi aggregate import includes all retained history beyond the scoring horizon", async (context) => {
   const fixture = await setup();
   context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
   const wirePath = path.join(fixture.roots.kimi, "session", "agents", "main", "wire.jsonl");
@@ -1512,19 +1573,153 @@ test("initial aggregate import skips guaranteed-quarantine history and preserves
         accepted: body.events.length,
         duplicates: 0,
         rejected: 0,
-        events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+        events: body.events.map(acceptedEventResult)
       });
     }
   });
 
-  assert.equal((await run()).sent, 2);
+  assert.equal((await run()).sent, 3);
   assert.deepEqual(
     uploaded.map((event) => event.occurredAt.slice(0, 13)),
-    ["2026-07-19T13", "2026-07-19T12"]
+    ["2026-07-19T13", "2026-07-19T12", "2026-03-01T12"]
   );
-  assert.deepEqual(uploaded.map((event) => event.inputTokens), ["21", "11"]);
+  assert.deepEqual(uploaded.map((event) => event.inputTokens), ["20", "10", "100"]);
+  assert.deepEqual(uploaded.map((event) => event.cacheWriteInputTokens), ["1", "1", "1"]);
   assert.equal((await run()).sent, 0);
-  assert.equal(uploaded.length, 2);
+  assert.equal(uploaded.length, 3);
+});
+
+test("a raw-only event beyond 90 days commits when the server confirms Raw preservation", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const wirePath = path.join(fixture.roots.kimi, "session", "agents", "main", "wire.jsonl");
+  await fs.writeFile(wirePath, JSON.stringify({
+    type: "usage.record",
+    time: "2026-03-01T12:00:01.000Z",
+    model: "future-unregistered-model",
+    usage: { inputOther: 12, inputCacheRead: 7, inputCacheCreation: 3, output: 20 },
+    usageScope: "turn"
+  }) + "\n", "utf8");
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_old_raw_only";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["kimi"];
+  config.supportedProviders = ["kimi"];
+  config.transcriptFallbacks = { codex: false, claude: false, kimi: true };
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+
+  let uploaded;
+  const first = await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    aggregateHistory: true,
+    now: Date.parse("2026-07-20T12:00:00.000Z"),
+    officialEvidence: false,
+    chunkPaceMs: 0,
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      uploaded = body.events[0];
+      return jsonResponse({
+        request: { digest: "digest_old_raw_only_1234567890" },
+        accepted: 0,
+        quarantined: 1,
+        duplicates: 0,
+        rejected: 0,
+        events: [{
+          eventId: uploaded.eventId,
+          status: "quarantined",
+          scoringState: "quarantined",
+          scoringReasons: ["retroactive_window"],
+          rawEligible: true,
+          rawPreserved: true
+        }]
+      });
+    }
+  });
+
+  assert.equal(first.sent, 1);
+  assert.equal(uploaded.attribution, "raw_only");
+  assert.equal(uploaded.occurredAt, "2026-03-01T12:30:00.000Z");
+  const committed = await loadRuntime(fixture.paths);
+  assert.equal(committed.state.syncOutbox, null);
+  assert.equal(committed.state.cursors.aggregate.providers.kimi.through, "2026-07-20T11:00:00.000Z");
+  const second = await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    aggregateHistory: true,
+    now: Date.parse("2026-07-20T12:00:00.000Z"),
+    officialEvidence: false,
+    fetchImpl: async () => { throw new Error("preserved old Raw usage must not resend"); }
+  });
+  assert.equal(second.sent, 0);
+});
+
+test("initial Claude aggregate import includes retained usage beyond 90 days", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const claudePath = path.join(fixture.roots.claude, "project.jsonl");
+  const record = (id, timestamp, input) => JSON.stringify({
+    type: "assistant",
+    timestamp,
+    message: {
+      id,
+      model: "claude-sonnet-5-20260701",
+      stop_reason: "end_turn",
+      usage: {
+        input_tokens: input,
+        cache_creation_input_tokens: 2,
+        cache_read_input_tokens: 3,
+        output_tokens: 5,
+        speed: "fast"
+      }
+    }
+  });
+  await fs.writeFile(claudePath, [
+    record("msg_retained_old", "2026-03-01T12:05:00.000Z", 100),
+    record("msg_retained_recent", "2026-07-19T12:05:00.000Z", 10)
+  ].join("\n") + "\n", "utf8");
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_claude_retained_history";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["claude"];
+  config.supportedProviders = ["claude"];
+  config.transcriptFallbacks = { codex: false, claude: true, kimi: false };
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+  const uploaded = [];
+  const result = await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    aggregateHistory: true,
+    now: Date.parse("2026-07-20T12:00:00.000Z"),
+    officialEvidence: false,
+    chunkPaceMs: 0,
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      uploaded.push(...body.events);
+      return jsonResponse({
+        request: { digest: "digest_claude_retained_history_1234567890" },
+        accepted: body.events.length,
+        duplicates: 0,
+        rejected: 0,
+        events: body.events.map(acceptedEventResult)
+      });
+    }
+  });
+
+  assert.equal(result.sent, 2);
+  assert.deepEqual(uploaded.map((event) => event.occurredAt.slice(0, 10)), ["2026-07-19", "2026-03-01"]);
+  assert.deepEqual(uploaded.map((event) => event.inputTokens), ["10", "100"]);
+  assert.deepEqual(uploaded.map((event) => event.cacheWriteInputTokens), ["2", "2"]);
 });
 
 test("aggregate sync finalizes settled hours and advances to newly settled usage", async (context) => {
@@ -1569,7 +1764,7 @@ test("aggregate sync finalizes settled hours and advances to newly settled usage
         accepted: body.events.length,
         duplicates: 0,
         rejected: 0,
-        events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+        events: body.events.map(acceptedEventResult)
       });
     }
   });
@@ -1583,9 +1778,82 @@ test("aggregate sync finalizes settled hours and advances to newly settled usage
   assert.equal((await run("2026-07-20T12:20:00.000Z")).sent, 1);
   assert.equal(uploaded.length, 2);
   assert.notEqual(uploaded[0].eventId, uploaded[1].eventId);
-  assert.deepEqual(uploaded.map((event) => event.inputTokens), ["11", "31"]);
+  assert.deepEqual(uploaded.map((event) => event.inputTokens), ["10", "30"]);
   assert.deepEqual(uploaded.map((event) => event.cachedInputTokens), ["2", "2"]);
+  assert.deepEqual(uploaded.map((event) => event.cacheWriteInputTokens), ["1", "1"]);
   assert.deepEqual(uploaded.map((event) => event.outputTokens), ["5", "5"]);
+});
+
+test("parse loss stays visibly partial while later settled usage continues advancing", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const wirePath = path.join(fixture.roots.kimi, "session", "agents", "main", "wire.jsonl");
+  const record = (time, input) => JSON.stringify({
+    type: "usage.record",
+    time,
+    model: "kimi-code/kimi-for-coding",
+    usage: { inputOther: input, inputCacheRead: 2, inputCacheCreation: 1, output: 5 },
+    usageScope: "turn"
+  });
+  await fs.writeFile(wirePath, [
+    "x".repeat(MAX_JOURNAL_LINE_BYTES + 1),
+    record("2026-07-19T12:05:00.000Z", 10)
+  ].join("\n") + "\n", "utf8");
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_partial_coverage";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["kimi"];
+  config.supportedProviders = ["kimi"];
+  config.transcriptFallbacks = { codex: false, claude: false, kimi: true };
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+  let digest = 0;
+  const uploaded = [];
+  const run = (now) => sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    aggregateHistory: true,
+    now: Date.parse(now),
+    officialEvidence: false,
+    chunkPaceMs: 0,
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      uploaded.push(...body.events);
+      digest += 1;
+      return jsonResponse({
+        request: { digest: `digest_partial_coverage_${digest}_1234567890` },
+        accepted: body.events.length,
+        duplicates: 0,
+        rejected: 0,
+        events: body.events.map(acceptedEventResult)
+      });
+    }
+  });
+
+  const first = await run("2026-07-20T12:00:00.000Z");
+  assert.equal(first.sent, 1);
+  assert.equal(first.adapters.kimi.coverage, "partial");
+  assert.equal(first.adapters.kimi.parseLosses, 1);
+  let runtime = await loadRuntime(fixture.paths);
+  assert.equal(runtime.state.cursors.aggregate.providers.kimi.through, "2026-07-20T11:00:00.000Z");
+  assert.deepEqual(runtime.state.rawOnlyBackfill.pendingProviders, ["kimi"]);
+  assert.deepEqual(runtime.state.rawOnlyBackfill.partialCoverage.kimi, {
+    parseLosses: 1,
+    lastObservedAt: "2026-07-20T12:00:00.000Z"
+  });
+
+  await fs.appendFile(wirePath, record("2026-07-20T11:05:00.000Z", 20) + "\n", "utf8");
+  const second = await run("2026-07-20T13:00:00.000Z");
+  assert.equal(second.sent, 1);
+  assert.deepEqual(uploaded.map((event) => event.inputTokens), ["10", "20"]);
+  runtime = await loadRuntime(fixture.paths);
+  assert.equal(runtime.state.cursors.aggregate.providers.kimi.through, "2026-07-20T12:00:00.000Z");
+  assert.deepEqual(runtime.state.rawOnlyBackfill.pendingProviders, ["kimi"]);
+  assert.equal(runtime.state.rawOnlyBackfill.partialCoverage.kimi.parseLosses, 1);
 });
 
 test("sync migrates an oversized released-v1 raw outbox without replaying accepted source IDs", async (context) => {
@@ -1663,7 +1931,7 @@ test("sync migrates an oversized released-v1 raw outbox without replaying accept
         accepted: body.events.length,
         duplicates: 0,
         rejected: 0,
-        events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+        events: body.events.map(acceptedEventResult)
       });
     }
   });
@@ -1727,7 +1995,7 @@ test("sync discards only stale v3 remaining work while preserving the request ch
   assert.equal(updated.state.previousRequestDigest, "digest_before_v3_migration_123456");
   assert.deepEqual(updated.state.cursors.codex.files, {});
   assert.deepEqual(updated.state.cursors.codex.sessions, {});
-  assert.deepEqual(updated.state.cursors.claude, { accountingVersion: 4, seen: {} });
+  assert.deepEqual(updated.state.cursors.claude, { accountingVersion: 5, seen: {} });
   assert.equal(updated.state.cursors.aggregate.providers.claude.through, null);
   assert.equal(updated.state.providerEvidenceHashes.claude, undefined);
   assert.deepEqual(updated.state.cursors.kimi.files.preserved_marker, { lastSeenAt: 2 });
@@ -1788,7 +2056,7 @@ test("sync replays one exact pending v3 request before retiring the old generati
         accepted: body.events.length,
         duplicates: 0,
         rejected: 0,
-        events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+        events: body.events.map(acceptedEventResult)
       });
     }
   });
@@ -1802,8 +2070,8 @@ test("sync replays one exact pending v3 request before retiring the old generati
   assert.equal(updated.state.syncOutbox, null);
   assert.equal(updated.state.nextSequence, 2);
   assert.equal(updated.state.previousRequestDigest, "digest_pending_v3_replay_1234567890");
-  assert.deepEqual(updated.state.cursors.codex, { accountingVersion: 4, files: {}, sessions: {} });
-  assert.deepEqual(updated.state.cursors.claude, { accountingVersion: 4, seen: {} });
+  assert.deepEqual(updated.state.cursors.codex, { accountingVersion: 5, files: {}, sessions: {} });
+  assert.deepEqual(updated.state.cursors.claude, { accountingVersion: 5, seen: {} });
   assert.equal(updated.state.cursors.aggregate.providers.claude.through, null);
   assert.match(await fs.readFile(fixture.paths.log, "utf8"), /replayed_pending_then_retired_v3_outbox/);
 });
@@ -1873,7 +2141,7 @@ test("sync drains an unreleased version-2 aggregate outbox under its original ID
         accepted: body.events.length,
         duplicates: 0,
         rejected: 0,
-        events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+        events: body.events.map(acceptedEventResult)
       });
     }
   });
@@ -1884,7 +2152,7 @@ test("sync drains an unreleased version-2 aggregate outbox under its original ID
   assert.equal(completed.state.cursors.aggregate.providers.kimi.through, "2026-07-20T11:00:00.000Z");
 });
 
-test("sync queues unknown usage without blocking later known usage and resolves it after a registry update", async (context) => {
+test("sync uploads unknown usage immediately as raw-only and never resends it after a registry update", async (context) => {
   const fixture = await setup();
   context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
   const wirePath = path.join(fixture.roots.kimi, "session", "agents", "main", "wire.jsonl");
@@ -1916,41 +2184,48 @@ test("sync queues unknown usage without blocking later known usage and resolves 
   config.transcriptFallbacks = { codex: false, claude: false, kimi: true };
   await saveSecrets(fixture.paths, secrets);
   await saveRuntime(fixture.paths, { state, config });
+  const uploaded = [];
   const first = await sync({
     home: fixture.home,
     roots: fixture.roots,
     officialEvidence: false,
     fetchImpl: async (_url, init) => {
       const body = JSON.parse(init.body);
-      assert.equal(body.events.length, 1);
-      assert.equal(body.events[0].modelId, "kimi-k2.7-code");
+      uploaded.push(...body.events);
       return jsonResponse({
         request: { digest: "digest_known_behind_unknown_123456" },
-        accepted: 1,
+        accepted: body.events.length,
         duplicates: 0,
         rejected: 0,
-        events: [{ eventId: body.events[0].eventId, status: "accepted" }]
+        events: body.events.map(acceptedEventResult)
       });
     }
   });
-  assert.equal(first.sent, 1);
-  assert.equal(first.withheld, 1);
-  assert.equal(first.unresolvedQueued, 1);
+  assert.equal(first.sent, 2);
+  assert.equal(first.withheld, 0);
+  assert.equal(first.unresolvedQueued, 0);
+  const unknown = uploaded.find((event) => event.attribution === "raw_only");
+  assert.deepEqual({
+    attribution: unknown.attribution,
+    modelId: unknown.modelId,
+    serviceMode: unknown.serviceMode,
+    inputTokens: unknown.inputTokens,
+    cachedInputTokens: unknown.cachedInputTokens,
+    cacheWriteInputTokens: unknown.cacheWriteInputTokens,
+    outputTokens: unknown.outputTokens
+  }, {
+    attribution: "raw_only",
+    modelId: "unknown",
+    serviceMode: "unknown",
+    inputTokens: "12",
+    cachedInputTokens: "7",
+    cacheWriteInputTokens: "3",
+    outputTokens: "20"
+  });
+  assert.equal(Object.hasOwn(unknown, "sourceModelId"), false);
   const afterUnknown = await loadRuntime(fixture.paths);
   assert.equal(Object.values(afterUnknown.state.cursors.kimi.files)[0].offset, (await fs.stat(wirePath)).size);
-  assert.equal(afterUnknown.state.unresolvedEvents.length, 1);
-  assert.deepEqual(Object.keys(afterUnknown.state.unresolvedEvents[0]).sort(), [
-    "cachedInputTokens",
-    "eventId",
-    "inputTokens",
-    "occurredAt",
-    "outputTokens",
-    "provider",
-    "serviceMode",
-    "sourceModelId",
-    "surface"
-  ]);
-  let uploaded;
+  assert.equal(afterUnknown.state.unresolvedEvents.length, 0);
   const second = await sync({
     home: fixture.home,
     roots: fixture.roots,
@@ -1958,26 +2233,16 @@ test("sync queues unknown usage without blocking later known usage and resolves 
     canonicalModelId: (_provider, sourceModelId) => sourceModelId === "kimi-future-code"
       ? "kimi-k2.7-code"
       : null,
-    fetchImpl: async (_url, init) => {
-      uploaded = JSON.parse(init.body);
-      return jsonResponse({
-        request: { digest: "digest_model_registry_update_123456" },
-        accepted: 1,
-        duplicates: 0,
-        rejected: 0,
-        events: [{ eventId: JSON.parse(init.body).events[0].eventId, status: "accepted" }]
-      });
-    }
+    fetchImpl: async () => { throw new Error("a later registry mapping must not resend consumed source usage"); }
   });
-  assert.equal(second.sent, 1);
-  assert.equal(uploaded.events[0].modelId, "kimi-k2.7-code");
+  assert.equal(second.sent, 0);
   const recovered = await loadRuntime(fixture.paths);
   assert.equal(Object.values(recovered.state.cursors.kimi.files)[0].offset, (await fs.stat(wirePath)).size);
   assert.equal(recovered.state.unresolvedEvents.length, 0);
   assert.equal(second.unresolvedQueued, 0);
 });
 
-test("unresolved queue cap is explicit in state and status", async (context) => {
+test("raw-only usage drains through bounded pages without a lossy unresolved queue", async (context) => {
   const fixture = await setup();
   context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
   const wirePath = path.join(fixture.roots.kimi, "session", "agents", "main", "wire.jsonl");
@@ -2008,24 +2273,243 @@ test("unresolved queue cap is explicit in state and status", async (context) => 
   config.transcriptFallbacks = { codex: false, claude: false, kimi: true };
   await saveSecrets(fixture.paths, secrets);
   await saveRuntime(fixture.paths, { state, config });
+  const uploaded = [];
+  let requests = 0;
   const result = await sync({
     home: fixture.home,
     roots: fixture.roots,
     officialEvidence: false,
-    unresolvedQueueCap: 2,
     canonicalModelId: () => null,
-    fetchImpl: async () => { throw new Error("unresolved usage must stay local"); }
+    chunkPaceMs: 0,
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      uploaded.push(...body.events);
+      requests += 1;
+      return jsonResponse({
+        request: { digest: `digest_raw_only_page_${requests}_1234567890` },
+        accepted: body.events.length,
+        duplicates: 0,
+        rejected: 0,
+        events: body.events.map(acceptedEventResult)
+      });
+    }
   });
-  assert.equal(result.sent, 0);
-  assert.equal(result.withheld, 4);
-  assert.equal(result.unresolvedQueued, 2);
-  assert.equal(result.unresolvedOverflow, 1);
+  assert.equal(result.sent, 4);
+  assert.equal(result.withheld, 0);
+  assert.equal(result.unresolvedQueued, 0);
+  assert.equal(result.unresolvedOverflow, 0);
+  assert.equal(uploaded.every((event) => event.attribution === "raw_only"
+    && event.modelId === "unknown"
+    && event.serviceMode === "unknown"), true);
+  assert.equal(new Set(uploaded.map((event) => event.eventId)).size, 4);
+  assert.doesNotMatch(JSON.stringify(uploaded), /SECRET PROMPT CONTENT/);
   const connectorStatus = await status({ home: fixture.home });
-  assert.equal(connectorStatus.unresolvedQueued, 2);
-  assert.equal(connectorStatus.unresolvedOverflow.totalDropped, 1);
-  assert.equal(typeof connectorStatus.unresolvedOverflow.lastOverflowAt, "string");
-  assert.equal(connectorStatus.lastScan.adapters.kimi.malformed, 1);
+  assert.equal(connectorStatus.unresolvedQueued, 0);
+  assert.equal(connectorStatus.unresolvedOverflow.totalDropped, 0);
+  assert.deepEqual(connectorStatus.rawOnlyBackfill.pendingProviders, []);
   assert.doesNotMatch(JSON.stringify(await loadRuntime(fixture.paths)), /SECRET PROMPT CONTENT/);
+});
+
+test("the retired unresolved queue migrates once to raw-only without exposing or later resending its source model", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_legacy_unresolved";
+  state.unresolvedEvents = [{
+    eventId: "e".repeat(64),
+    occurredAt: "2026-07-19T12:00:00.000Z",
+    provider: "kimi",
+    sourceModelId: "future-private-model-token",
+    serviceMode: "fast",
+    inputTokens: "11",
+    cachedInputTokens: "7",
+    outputTokens: "13",
+    reasoningTokens: "5",
+    surface: "kimi_code"
+  }];
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["kimi"];
+  config.supportedProviders = ["kimi"];
+  config.transcriptFallbacks = { codex: false, claude: false, kimi: false };
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+
+  let uploaded;
+  const first = await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    officialEvidence: false,
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      uploaded = body.events[0];
+      return jsonResponse({
+        request: { digest: "digest_legacy_raw_only_1234567890" },
+        accepted: 1,
+        duplicates: 0,
+        rejected: 0,
+        events: [{
+          eventId: uploaded.eventId,
+          status: "accepted",
+          scoringState: "accepted",
+          rawEligible: true,
+          rawPreserved: true
+        }]
+      });
+    }
+  });
+
+  assert.equal(first.sent, 1);
+  assert.deepEqual(uploaded, {
+    eventId: "e".repeat(64),
+    occurredAt: "2026-07-19T12:00:00.000Z",
+    provider: "kimi",
+    attribution: "raw_only",
+    modelId: "unknown",
+    serviceMode: "unknown",
+    inputTokens: "11",
+    cachedInputTokens: "7",
+    cacheWriteInputTokens: "0",
+    outputTokens: "13",
+    reasoningTokens: "5",
+    surface: "kimi_code"
+  });
+  assert.doesNotMatch(JSON.stringify(uploaded), /future-private-model-token/);
+  assert.equal((await loadRuntime(fixture.paths)).state.unresolvedEvents.length, 0);
+
+  const second = await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    officialEvidence: false,
+    canonicalModelId: () => "kimi-k2.7-code",
+    fetchImpl: async () => { throw new Error("a migrated raw-only record must not be sent twice"); }
+  });
+  assert.equal(second.sent, 0);
+});
+
+test("an isolated raw-only contract rejection fails closed without committing its source cursor", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const wirePath = path.join(fixture.roots.kimi, "session", "agents", "main", "wire.jsonl");
+  await fs.writeFile(wirePath, JSON.stringify({
+    type: "usage.record",
+    time: "2026-07-19T12:00:01.000Z",
+    model: "future-model",
+    usage: { inputOther: 12, inputCacheRead: 7, inputCacheCreation: 3, output: 20 },
+    usageScope: "turn"
+  }) + "\n", "utf8");
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_raw_only_rejection";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["kimi"];
+  config.supportedProviders = ["kimi"];
+  config.transcriptFallbacks = { codex: false, claude: false, kimi: true };
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+
+  await assert.rejects(() => sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    officialEvidence: false,
+    canonicalModelId: () => null,
+    maxAttempts: 1,
+    fetchImpl: async () => errorResponse(422, "MODEL_NOT_SUPPORTED")
+  }), (error) => error.code === "MODEL_NOT_SUPPORTED");
+
+  const blocked = await loadRuntime(fixture.paths);
+  assert.equal(blocked.state.pendingRequest.permanentFailure.code, "RAW_ONLY_CONTRACT_REJECTED");
+  assert.notEqual(blocked.state.syncOutbox, null);
+  assert.deepEqual(blocked.state.cursors.kimi.files, {});
+});
+
+test("a partial-success response cannot quarantine raw-only usage or commit its source cursor", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const wirePath = path.join(fixture.roots.kimi, "session", "agents", "main", "wire.jsonl");
+  await fs.writeFile(wirePath, JSON.stringify({
+    type: "usage.record",
+    time: "2026-07-19T12:00:01.000Z",
+    model: "future-model",
+    usage: { inputOther: 12, inputCacheRead: 7, inputCacheCreation: 3, output: 20 },
+    usageScope: "turn"
+  }) + "\n", "utf8");
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_raw_only_partial_rejection";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["kimi"];
+  config.supportedProviders = ["kimi"];
+  config.transcriptFallbacks = { codex: false, claude: false, kimi: true };
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+
+  let rejectedId;
+  await assert.rejects(() => sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    officialEvidence: false,
+    canonicalModelId: () => null,
+    chunkPaceMs: 0,
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      rejectedId = body.events[0].eventId;
+      return jsonResponse({
+        request: { digest: "digest_raw_only_partial_1234567890" },
+        accepted: 0,
+        duplicates: 0,
+        rejected: 1,
+        events: [{ eventId: rejectedId, status: "rejected" }]
+      });
+    }
+  }), (error) => error.code === "RAW_ONLY_CONTRACT_REJECTED");
+
+  const blocked = await loadRuntime(fixture.paths);
+  assert.equal(blocked.state.pendingRequest, null);
+  assert.deepEqual(blocked.state.syncOutbox.permanentFailure, {
+    code: "RAW_ONLY_CONTRACT_REJECTED",
+    status: null,
+    rawOnlyEventCount: 1
+  });
+  assert.deepEqual(blocked.state.syncOutbox.quarantinedEventIds, []);
+  assert.deepEqual(blocked.state.cursors.kimi.files, {});
+  assert.equal(blocked.state.nextSequence, 2);
+  assert.equal((await status({ home: fixture.home })).syncOutboxPermanentFailure.code, "RAW_ONLY_CONTRACT_REJECTED");
+
+  await assert.rejects(() => sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    officialEvidence: false,
+    fetchImpl: async () => { throw new Error("a blocked raw-only outbox must not issue another request"); }
+  }), (error) => error.code === "RAW_ONLY_CONTRACT_REJECTED");
+
+  let heartbeatBody;
+  const scheduled = await scheduledRun({
+    home: fixture.home,
+    roots: fixture.roots,
+    officialEvidence: false,
+    fetchImpl: async (url, init) => {
+      assert.equal(url.endsWith("/heartbeat"), true);
+      heartbeatBody = JSON.parse(init.body);
+      return jsonResponse({
+        request: { digest: "digest_blocked_raw_heartbeat_1234567890" },
+        heartbeat: { nextExpectedAt: "2026-07-19T14:00:00.000Z" },
+        device: { continuityState: "continuous" }
+      });
+    }
+  });
+  assert.equal(scheduled.sync.blocked, true);
+  assert.equal(scheduled.heartbeat.sent, true);
+  assert.equal(heartbeatBody.status, "degraded");
 });
 
 test("permanent event conflicts are quarantined without pinning cursors forever", async (context) => {
@@ -2120,7 +2604,7 @@ test("a permanently invalid same-type batch is bisected and only the bad event i
         accepted: body.events.length,
         duplicates: 0,
         rejected: 0,
-        events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+        events: body.events.map(acceptedEventResult)
       });
     }
   });
@@ -2271,7 +2755,7 @@ test("scheduled catch-up interleaves heartbeat through more than 360 events", as
           accepted: body.events.length,
           duplicates: 0,
           rejected: 0,
-          events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+        events: body.events.map(acceptedEventResult)
         });
       }
       heartbeatRequests += 1;
@@ -2364,7 +2848,7 @@ test("a pre-existing very large outbox is bounded while heartbeats keep the same
         accepted: body.events.length,
         duplicates: 0,
         rejected: 0,
-        events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+        events: body.events.map(acceptedEventResult)
       });
     }
   });
@@ -2466,7 +2950,7 @@ test("scheduler mutation is preview-only until the exact confirmation flag", asy
   assert.match(commands[0].join(" "), /SetAccessRuleProtection/);
   assert.match(commands[0].join(" "), /Current-user-only ACL verification failed/);
   assert.equal(commands[1][0], "schtasks.exe");
-  assert.match(commands[1].join(" "), /versions[\\/]0\.1\.4[\\/]src[\\/]cli\.mjs/);
+  assert.match(commands[1].join(" "), /versions[\\/]0\.1\.5[\\/]src[\\/]cli\.mjs/);
   assert.match(commands[1].join(" "), /scheduled-run --home/);
   assert.equal(await fs.access(path.join(installed.installedRelease, "package.json")).then(() => true), true);
   assert.equal(await fs.access(path.join(installed.installedRelease, "RELEASING.md")).then(() => true), true);
@@ -2504,7 +2988,7 @@ test("Windows installation fails closed before copying or scheduling when ACL ha
   }), (error) => error.code === "WINDOWS_ACL_HARDENING_FAILED");
   assert.equal(commands.length, 1);
   assert.match(commands[0][0], /powershell\.exe$/i);
-  const installedPath = path.join(fixture.home, "versions", "0.1.4");
+  const installedPath = path.join(fixture.home, "versions", "0.1.5");
   assert.equal(await fs.access(installedPath).then(() => true).catch(() => false), false);
 });
 

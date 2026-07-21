@@ -72,7 +72,7 @@ test("loading a legacy global aggregate cursor resets every provider watermark",
   const loaded = await loadRuntime(paths);
 
   assert.deepEqual(loaded.state.cursors.aggregate, {
-    version: 2,
+    version: 3,
     providers: {
       codex: { through: null },
       claude: { through: null },
@@ -81,12 +81,12 @@ test("loading a legacy global aggregate cursor resets every provider watermark",
   });
 });
 
-test("loading a v2 aggregate cursor preserves and normalizes provider watermarks independently", async (context) => {
+test("loading a v3 aggregate cursor preserves and normalizes provider watermarks independently", async (context) => {
   const home = await temporaryDirectory(context, "tag-plugin-state-v2-");
   const paths = runtimePaths({ home });
   const state = initialState();
   state.cursors.aggregate = {
-    version: 2,
+    version: 3,
     providers: {
       codex: { through: "2026-07-19T01:02:03Z" },
       claude: { through: "2026-07-19T04:05:06-05:00" },
@@ -98,7 +98,7 @@ test("loading a v2 aggregate cursor preserves and normalizes provider watermarks
   const loaded = await loadRuntime(paths);
 
   assert.deepEqual(loaded.state.cursors.aggregate, {
-    version: 2,
+    version: 3,
     providers: {
       codex: { through: "2026-07-19T01:02:03.000Z" },
       claude: { through: "2026-07-19T09:05:06.000Z" },
@@ -107,7 +107,7 @@ test("loading a v2 aggregate cursor preserves and normalizes provider watermarks
   });
 });
 
-test("loading pre-v4 Codex accounting resets only Codex generation state", async (context) => {
+test("loading pre-v5 Codex accounting resets only Codex generation state", async (context) => {
   const home = await temporaryDirectory(context, "tag-plugin-codex-accounting-v4-");
   const paths = runtimePaths({ home });
   const state = initialState();
@@ -122,7 +122,7 @@ test("loading pre-v4 Codex accounting resets only Codex generation state", async
 
   const loaded = await loadRuntime(paths);
 
-  assert.deepEqual(loaded.state.cursors.codex, { accountingVersion: 4, files: {}, sessions: {} });
+  assert.deepEqual(loaded.state.cursors.codex, { accountingVersion: 5, files: {}, sessions: {} });
   assert.equal(loaded.state.cursors.aggregate.providers.codex.through, null);
   assert.equal(loaded.state.providerEvidenceHashes.codex, undefined);
   assert.equal(loaded.state.cursors.aggregate.providers.claude.through, "2026-07-19T02:00:00.000Z");
@@ -130,7 +130,7 @@ test("loading pre-v4 Codex accounting resets only Codex generation state", async
   assert.equal(loaded.state.providerEvidenceHashes.claude, "preserved-checkpoint");
 });
 
-test("loading pre-v4 Claude accounting resets only Claude generation state", async (context) => {
+test("loading pre-v5 Claude accounting resets only Claude generation state", async (context) => {
   const home = await temporaryDirectory(context, "tag-plugin-claude-accounting-v4-");
   const paths = runtimePaths({ home });
   const state = initialState();
@@ -150,7 +150,7 @@ test("loading pre-v4 Claude accounting resets only Claude generation state", asy
 
   const loaded = await loadRuntime(paths);
 
-  assert.deepEqual(loaded.state.cursors.claude, { accountingVersion: 4, seen: {} });
+  assert.deepEqual(loaded.state.cursors.claude, { accountingVersion: 5, seen: {} });
   assert.equal(loaded.state.cursors.aggregate.providers.claude.through, null);
   assert.equal(loaded.state.providerEvidenceHashes.claude, undefined);
   assert.deepEqual(loaded.state.cursors.codex.files.preserved, { offset: 123, lastSeenAt: 2 });
@@ -159,4 +159,64 @@ test("loading pre-v4 Claude accounting resets only Claude generation state", asy
   assert.equal(loaded.state.cursors.aggregate.providers.kimi.through, "2026-07-19T03:00:00.000Z");
   assert.equal(loaded.state.providerEvidenceHashes.codex, "preserved-codex-checkpoint");
   assert.equal(loaded.state.providerEvidenceHashes.kimi, "preserved-kimi-checkpoint");
+});
+
+test("v5 marks enabled legacy providers for one lossless raw-only backfill", async (context) => {
+  const home = await temporaryDirectory(context, "tag-plugin-raw-only-backfill-");
+  const paths = runtimePaths({ home });
+  const state = initialState();
+  state.cursors.codex = { accountingVersion: 4, files: { old: { offset: 1 } }, sessions: {} };
+  state.cursors.claude = { accountingVersion: 4, seen: { old: { hash: "a".repeat(64), lastSeenAt: 1 } } };
+  state.cursors.kimi = { files: { old: { offset: 1 } } };
+  state.cursors.aggregate = {
+    version: 2,
+    providers: {
+      codex: { through: "2026-07-20T01:00:00.000Z" },
+      claude: { through: "2026-07-20T01:00:00.000Z" },
+      kimi: { through: "2026-07-20T01:00:00.000Z" }
+    }
+  };
+  state.nextSequence = 41;
+  state.previousRequestDigest = "preserved_request_chain_digest";
+  state.providerEvidenceHashes.codex = "legacy_mutable_checkpoint_snapshot";
+  const config = initialConfig();
+  config.transcriptFallbacks = { codex: true, claude: true, kimi: true };
+  await saveRuntime(paths, { state, config });
+
+  const loaded = await loadRuntime(paths);
+
+  assert.deepEqual(loaded.state.cursors.codex, { accountingVersion: 5, files: {}, sessions: {} });
+  assert.deepEqual(loaded.state.cursors.claude, { accountingVersion: 5, seen: {} });
+  assert.deepEqual(loaded.state.cursors.kimi, { accountingVersion: 2, files: {} });
+  assert.deepEqual(loaded.state.cursors.aggregate.providers, {
+    codex: { through: null },
+    claude: { through: null },
+    kimi: { through: null }
+  });
+  assert.deepEqual(loaded.state.rawOnlyBackfill.pendingProviders, ["codex", "claude", "kimi"]);
+  assert.equal(loaded.state.providerEvidenceHashes.codex, undefined);
+  assert.equal(loaded.state.nextSequence, 41);
+  assert.equal(loaded.state.previousRequestDigest, "preserved_request_chain_digest");
+});
+
+test("legacy queue overflow remains pending until its eligible provider is actually rescanned", async (context) => {
+  const home = await temporaryDirectory(context, "tag-plugin-overflow-backfill-");
+  const paths = runtimePaths({ home });
+  const state = initialState();
+  state.cursors.kimi = { files: { legacy: { offset: 1 } } };
+  state.unresolvedOverflow = {
+    totalDropped: 17,
+    lastOverflowAt: "2026-07-19T12:00:00.000Z"
+  };
+  const config = initialConfig();
+  config.allowedPlatforms = ["kimi"];
+  config.supportedProviders = ["kimi"];
+  config.transcriptFallbacks = { codex: false, claude: false, kimi: false };
+  await saveRuntime(paths, { state, config });
+
+  const loaded = await loadRuntime(paths);
+
+  assert.deepEqual(loaded.state.rawOnlyBackfill.pendingProviders, ["kimi"]);
+  assert.equal(loaded.state.rawOnlyBackfill.completedAt, null);
+  assert.equal(loaded.state.unresolvedOverflow.totalDropped, 17);
 });

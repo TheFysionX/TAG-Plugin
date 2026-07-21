@@ -3,11 +3,13 @@ import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  CLAUDE_ACCOUNTING_VERSION,
+  CODEX_ACCOUNTING_VERSION,
   CONNECTOR_VERSION,
   HEARTBEAT_EVERY_INGEST_REQUESTS,
   HISTORY_SETTLE_MINUTES,
-  INITIAL_HISTORY_DAYS,
   INGEST_CHUNK_PACE_MS,
+  JOURNAL_HISTORY_START,
   MAX_INGEST_CHECKPOINTS,
   MAX_INGEST_EVENTS,
   MAX_MIGRATION_EXCLUSIONS,
@@ -16,7 +18,7 @@ import {
   SCHEDULED_MAX_INGEST_REQUESTS
 } from "./constants.mjs";
 import { adapterStatus } from "./adapters/registry.mjs";
-import { aggregatePreview, collectUsage, toWireEvent } from "./collector.mjs";
+import { aggregatePreview, collectUsage, hasRawTokenUsage, toWireEvent } from "./collector.mjs";
 import { createDeviceSecrets, payloadHash, sha256 } from "./crypto.mjs";
 import { discoverJsonlFiles } from "./discovery.mjs";
 import { ConnectorError } from "./errors.mjs";
@@ -58,7 +60,8 @@ const SYNC_BATCH_ID_PATTERN = /^[a-f0-9]{24}$/;
 const MAX_SYNC_PAGE_BYTES = 64 * 1024 * 1024;
 const SYNC_EVENT_KEYS = new Set([
   "eventId", "occurredAt", "provider", "modelId", "serviceMode",
-  "inputTokens", "cachedInputTokens", "outputTokens", "reasoningTokens", "surface"
+  "inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens", "reasoningTokens", "surface",
+  "attribution"
 ]);
 const SYNC_SURFACES = new Set(["codex", "claude_code", "kimi_code"]);
 const BISECTABLE_SYNC_CODES = new Set([
@@ -117,9 +120,11 @@ function assertPaired(state, config, secrets) {
 function safeScanSummary(stats) {
   return Object.fromEntries(Object.entries(stats).map(([provider, value]) => [provider, {
     status: value.status || (value.unavailable ? "unavailable" : "available"),
+    coverage: value.coverage || "unknown",
     files: value.files || 0,
     events: value.events || 0,
     malformed: value.malformed || 0,
+    parseLosses: value.parseLosses || 0,
     duplicateSnapshots: value.duplicateSnapshots || 0,
     cumulativeResets: value.cumulativeResets || 0,
     cumulativeMismatches: value.cumulativeMismatches || 0,
@@ -149,9 +154,8 @@ function floorUtcHour(milliseconds) {
 
 function aggregateHistoryWindow(now) {
   const settledThroughMs = floorUtcHour(now - HISTORY_SETTLE_MINUTES * 60 * 1_000);
-  const windowStartMs = floorUtcHour(now - INITIAL_HISTORY_DAYS * 24 * 60 * 60 * 1_000);
   return {
-    windowStart: new Date(windowStartMs).toISOString(),
+    windowStart: JOURNAL_HISTORY_START,
     settledThrough: new Date(settledThroughMs).toISOString()
   };
 }
@@ -214,7 +218,7 @@ function migrateOversizedReleasedV1Outbox(runtime, historyRange) {
 }
 
 function resetCodexAccountingGeneration(state) {
-  state.cursors.codex = { accountingVersion: 4, files: {}, sessions: {} };
+  state.cursors.codex = { accountingVersion: CODEX_ACCOUNTING_VERSION, files: {}, sessions: {} };
   if (state.cursors.aggregate?.providers?.codex) {
     state.cursors.aggregate.providers.codex.through = null;
   }
@@ -222,7 +226,7 @@ function resetCodexAccountingGeneration(state) {
 }
 
 function resetClaudeAccountingGeneration(state) {
-  state.cursors.claude = { accountingVersion: 4, seen: {} };
+  state.cursors.claude = { accountingVersion: CLAUDE_ACCOUNTING_VERSION, seen: {} };
   if (state.cursors.aggregate?.providers?.claude) {
     state.cursors.aggregate.providers.claude.through = null;
   }
@@ -254,28 +258,6 @@ async function discardStaleAggregateV3Outbox(runtime, paths) {
   return migration;
 }
 
-function toUnresolvedEvent(event) {
-  if (!event?.eventId
-    || !event?.observedAt
-    || event?.mode?.classified === false
-    || typeof event?.sourceModelId !== "string"
-    || !SOURCE_MODEL_PATTERN.test(event.sourceModelId)) return null;
-  return {
-    eventId: event.eventId,
-    occurredAt: event.observedAt,
-    provider: event.provider,
-    sourceModelId: event.sourceModelId,
-    serviceMode: event.mode.fast ? "fast" : "standard",
-    inputTokens: String(event.usage.input + event.usage.cacheWriteInput),
-    cachedInputTokens: String(event.usage.cachedInput),
-    outputTokens: String(event.usage.output),
-    ...(event.usage.reasoningOutput > 0
-      ? { reasoningTokens: String(event.usage.reasoningOutput) }
-      : {}),
-    surface: event.provenance.surface
-  };
-}
-
 function isNormalizedUnresolvedEvent(event) {
   if (!event || typeof event !== "object" || Array.isArray(event)) return false;
   if (!Object.keys(event).every((key) => UNRESOLVED_EVENT_KEYS.includes(key))) return false;
@@ -294,12 +276,35 @@ function isNormalizedUnresolvedEvent(event) {
     || (typeof event.reasoningTokens === "string" && TOKEN_COUNT_PATTERN.test(event.reasoningTokens));
 }
 
-function resolveUnresolvedEvent(event, resolveModel) {
-  const modelId = resolveModel(event.provider, event.sourceModelId);
-  if (!modelId) return null;
-  const wireEvent = { ...event };
-  delete wireEvent.sourceModelId;
-  return { ...wireEvent, modelId };
+function legacyUnresolvedToRawOnlyWireEvent(event) {
+  if (!isNormalizedUnresolvedEvent(event)) return null;
+  const rawOnly = {
+    eventId: event.eventId,
+    occurredAt: event.occurredAt,
+    provider: event.provider,
+    attribution: "raw_only",
+    modelId: "unknown",
+    serviceMode: "unknown",
+    inputTokens: event.inputTokens,
+    cachedInputTokens: event.cachedInputTokens,
+    // Retired queue records predate the canonical cache-write field. Their old
+    // inputTokens value already contains cache creation, so zero preserves the
+    // exact raw total without inventing an unrecoverable component split.
+    cacheWriteInputTokens: "0",
+    outputTokens: event.outputTokens,
+    ...(event.reasoningTokens !== undefined ? { reasoningTokens: event.reasoningTokens } : {}),
+    surface: event.surface
+  };
+  return hasRawTokenUsage(rawOnly) ? rawOnly : null;
+}
+
+function forceRawOnlyWireEvent(event) {
+  return {
+    ...event,
+    attribution: "raw_only",
+    modelId: "unknown",
+    serviceMode: "unknown"
+  };
 }
 
 export function boundedUnresolvedQueue(existing, additions, maximum = MAX_UNRESOLVED_EVENTS) {
@@ -339,6 +344,38 @@ function allowedFallbacks(requested, allowedPlatforms) {
   ]));
 }
 
+function stagedRawOnlyBackfill(state, providerScans, nextUnresolvedEvents, scannedAt) {
+  const pending = new Set(state.rawOnlyBackfill?.pendingProviders || []);
+  const hadPendingProviders = pending.size > 0;
+  const partialCoverage = structuredClone(state.rawOnlyBackfill?.partialCoverage || {});
+  for (const [provider, scan] of Object.entries(providerScans || {})) {
+    const fullRetainedHistoryScan = scan?.range?.start === JOURNAL_HISTORY_START;
+    if (scan?.progressComplete === true && Number(scan.parseLosses) > 0) {
+      pending.add(provider);
+      partialCoverage[provider] = {
+        parseLosses: Math.max(
+          Number(partialCoverage[provider]?.parseLosses) || 0,
+          Number(scan.parseLosses) || 0
+        ),
+        lastObservedAt: scannedAt
+      };
+    } else if (fullRetainedHistoryScan && scan?.complete === true) {
+      pending.delete(provider);
+      delete partialCoverage[provider];
+    }
+  }
+  for (const event of nextUnresolvedEvents) pending.add(event.provider);
+  const pendingProviders = [...pending].sort();
+  return {
+    version: 1,
+    pendingProviders,
+    partialCoverage,
+    completedAt: pendingProviders.length === 0 && Object.keys(partialCoverage).length === 0
+      ? (state.rawOnlyBackfill?.completedAt || (hadPendingProviders ? scannedAt : null))
+      : null
+  };
+}
+
 function normalizePairCode(value) {
   if (typeof value !== "string") {
     return null;
@@ -356,6 +393,7 @@ function checkpointForBucket(bucket) {
   const seed = {
     provider: "codex",
     source: "codex_app_server_account_usage",
+    sourceScope: "codex_subscription_account",
     periodStart: start.toISOString(),
     periodEnd: end.toISOString(),
     totalTokens: String(bucket.tokens)
@@ -379,6 +417,7 @@ function lifetimeCodexCheckpoint(codexEvidence, dailyCheckpoints) {
   const seed = {
     provider: "codex",
     source: "codex_app_server_account_usage_lifetime",
+    sourceScope: "codex_subscription_account",
     periodStart: latestObservation.periodStart,
     periodEnd: latestObservation.periodEnd,
     totalTokens: String(lifetimeTokens)
@@ -397,7 +436,9 @@ function codexCheckpoints(providerEvidence) {
     .map(checkpointForBucket)
     .filter(Boolean);
   const lifetimeCheckpoint = lifetimeCodexCheckpoint(providerEvidence.codex, dailyCheckpoints);
-  return lifetimeCheckpoint ? [lifetimeCheckpoint, ...dailyCheckpoints] : dailyCheckpoints;
+  // Daily observations are staged first. The lifetime authority is last and is
+  // therefore the snapshot commit marker for this signed request sequence.
+  return lifetimeCheckpoint ? [...dailyCheckpoints, lifetimeCheckpoint] : dailyCheckpoints;
 }
 
 function acceptedRequestDigest(response) {
@@ -413,18 +454,47 @@ function applyAcceptedRequest(state, response) {
   state.nextSequence += 1;
 }
 
+function rawOnlyResponseFailure(chunk, response) {
+  const rawOnlyEvents = chunk.events.filter((event) => event.attribution === "raw_only");
+  if (rawOnlyEvents.length === 0) return null;
+  const results = new Map((Array.isArray(response.events) ? response.events : [])
+    .filter((event) => typeof event?.eventId === "string")
+    .map((event) => [event.eventId, event]));
+  const unconfirmed = rawOnlyEvents.filter((event) => {
+    const result = results.get(event.eventId);
+    // Status and scoring state are informational: accepted, quarantined,
+    // duplicate, or even an older superseded revision may all coexist with an
+    // active Raw projection. Only this backend-computed invariant authorizes a
+    // source-cursor commit.
+    return result?.rawPreserved !== true;
+  });
+  return unconfirmed.length > 0 ? unconfirmed.length : null;
+}
+
 function isWireEvent(event) {
   if (!event || typeof event !== "object" || Array.isArray(event)) return false;
   if (!Object.keys(event).every((key) => SYNC_EVENT_KEYS.has(key))) return false;
   if (typeof event.eventId !== "string" || !/^[a-f0-9]{64}$/.test(event.eventId)) return false;
   if (typeof event.occurredAt !== "string" || !Number.isFinite(Date.parse(event.occurredAt))) return false;
   if (!["codex", "claude", "kimi"].includes(event.provider)) return false;
-  if (typeof event.modelId !== "string" || event.modelId.length < 1 || event.modelId.length > 80) return false;
-  if (!['standard', 'fast'].includes(event.serviceMode)) return false;
+  const rawOnly = event.attribution === "raw_only";
+  if (event.attribution !== undefined && !rawOnly) return false;
+  if (rawOnly) {
+    if (event.modelId !== "unknown" || event.serviceMode !== "unknown") return false;
+  } else {
+    if (typeof event.modelId !== "string"
+      || event.modelId.length < 1
+      || event.modelId.length > 80
+      || event.modelId === "unknown") return false;
+    if (!['standard', 'fast'].includes(event.serviceMode)) return false;
+  }
   if (!SYNC_SURFACES.has(event.surface)) return false;
   for (const key of ["inputTokens", "cachedInputTokens", "outputTokens"]) {
     if (typeof event[key] !== "string" || !TOKEN_COUNT_PATTERN.test(event[key])) return false;
   }
+  if (event.cacheWriteInputTokens !== undefined
+    && (typeof event.cacheWriteInputTokens !== "string"
+      || !TOKEN_COUNT_PATTERN.test(event.cacheWriteInputTokens))) return false;
   return !Object.hasOwn(event, "reasoningTokens")
     || (typeof event.reasoningTokens === "string" && TOKEN_COUNT_PATTERN.test(event.reasoningTokens));
 }
@@ -653,6 +723,8 @@ async function advanceCompletedOutbox(runtime, paths) {
   runtime.state.unresolvedEvents = Array.isArray(outbox.commit.nextUnresolvedEvents)
     ? outbox.commit.nextUnresolvedEvents
     : runtime.state.unresolvedEvents;
+  runtime.state.rawOnlyBackfill = outbox.commit.nextRawOnlyBackfill
+    || runtime.state.rawOnlyBackfill;
   runtime.state.unresolvedOverflow = outbox.commit.unresolvedOverflow
     || runtime.state.unresolvedOverflow;
   runtime.state.lastSyncAt = outbox.commit.scannedAt;
@@ -698,6 +770,19 @@ async function finalizePending(runtime, response, paths) {
     outbox.accepted += Number.isSafeInteger(response.accepted) ? response.accepted : 0;
     outbox.duplicates += Number.isSafeInteger(response.duplicates) ? response.duplicates : 0;
     outbox.rejected += rejected;
+    const rawOnlyFailureCount = rawOnlyResponseFailure(outbox.chunks[outbox.index], response);
+    if (rawOnlyFailureCount !== null) {
+      // The signed request sequence was accepted, but the raw-only record was
+      // not. Preserve the entire active chunk and staged cursors so a repaired
+      // connector/backend can resend the same stable event ID on a new sequence.
+      outbox.permanentFailure = {
+        code: "RAW_ONLY_CONTRACT_REJECTED",
+        status: null,
+        rawOnlyEventCount: rawOnlyFailureCount
+      };
+      runtime.state.pendingRequest = null;
+      return { pending, cleanupBatchId: null, blocked: true };
+    }
     outbox.quarantinedEventIds = [...outbox.quarantinedEventIds, ...rejectedIds].slice(-2_000);
     outbox.quarantinedCount = (outbox.quarantinedCount || 0) + rejectedIds.length;
     outbox.processedEvents = (outbox.processedEvents || 0) + outbox.chunks[outbox.index].events.length;
@@ -736,6 +821,13 @@ async function replayPending(runtime, secrets, paths, options) {
   const finalized = await finalizePending(runtime, response, paths);
   const committed = finalized.pending;
   await saveFinalizedRuntime(paths, runtime, finalized.cleanupBatchId);
+  if (finalized.blocked) {
+    throw new ConnectorError(
+      "RAW_ONLY_CONTRACT_REJECTED",
+      "The server did not preserve a raw-only usage event; its source cursor remains uncommitted.",
+      { retryable: false }
+    );
+  }
   await safeLog(paths.log, {
     action: committed.kind,
     status: "recovered",
@@ -766,6 +858,16 @@ function assertPendingCanReplay(runtime) {
   );
 }
 
+function assertSyncOutboxCanProceed(outbox) {
+  const failure = outbox?.permanentFailure;
+  if (!failure) return;
+  throw new ConnectorError(
+    failure.code || "SYNC_OUTBOX_PERMANENT_FAILURE",
+    "A permanent server rejection is blocking this sync outbox without committing its source cursors.",
+    { status: failure.status, retryable: false }
+  );
+}
+
 async function markPendingPermanentFailure(runtime, paths, error) {
   if (!(error instanceof ConnectorError) || error.retryable || !runtime.state.pendingRequest) return;
   runtime.state.pendingRequest.permanentFailure = {
@@ -784,7 +886,9 @@ async function sendHeartbeatRequest(runtime, secrets, paths, options) {
   }
   const observedAt = new Date(options.now ?? Date.now()).toISOString();
   const sequence = runtime.state.nextSequence;
-  const adapterHealth = Object.values(runtime.state.lastScan?.adapters || {});
+  const stagedCommit = runtime.state.syncOutbox?.commit;
+  const adapterHealth = Object.values(stagedCommit?.scanSummary || runtime.state.lastScan?.adapters || {});
+  const effectiveBackfill = stagedCommit?.nextRawOnlyBackfill || runtime.state.rawOnlyBackfill;
   const degraded = adapterHealth.some((adapter) =>
     adapter.status === "unavailable"
     || adapter.status === "truncated"
@@ -792,7 +896,9 @@ async function sendHeartbeatRequest(runtime, secrets, paths, options) {
     || (adapter.cumulativeMismatches || 0) > 0
     || (adapter.cumulativeResets || 0) > 0
   ) || runtime.state.unresolvedEvents.length > 0
-    || runtime.state.unresolvedOverflow.totalDropped > 0;
+    || runtime.state.unresolvedOverflow.totalDropped > 0
+    || (effectiveBackfill?.pendingProviders?.length || 0) > 0
+    || Boolean(runtime.state.syncOutbox?.permanentFailure);
   const body = {
     observedAt,
     status: runtime.state.paused ? "paused" : (degraded ? "degraded" : "healthy"),
@@ -891,6 +997,14 @@ async function handlePermanentSyncError(runtime, paths, error) {
   }
   const chunk = outbox.chunks[outbox.index];
   const split = bisectChunk(chunk);
+  if (!split && chunk.events.some((event) => event.attribution === "raw_only")) {
+    // Raw-only records are the sole lossless representation of unattributed
+    // usage. Never quarantine one and advance its source cursor merely because
+    // a server has not implemented the raw-only union correctly.
+    pending.permanentFailure = { code: "RAW_ONLY_CONTRACT_REJECTED", status: error.status };
+    await saveRuntime(paths, runtime);
+    return false;
+  }
   runtime.state.pendingRequest = null;
   let cleanupBatchId = null;
   if (split) {
@@ -917,6 +1031,7 @@ async function processSyncOutbox(runtime, secrets, paths, options) {
     return null;
   }
   assertActiveSyncPage(initial);
+  assertSyncOutboxCanProceed(initial);
   if (!runtime.state.pendingRequest && initial.index >= initial.chunks.length) {
     const cleanupBatchId = await advanceCompletedOutbox(runtime, paths);
     await saveFinalizedRuntime(paths, runtime, cleanupBatchId);
@@ -951,6 +1066,7 @@ async function processSyncOutbox(runtime, secrets, paths, options) {
   };
 
   while (runtime.state.syncOutbox && ingestRequests < maxIngestRequests) {
+    assertSyncOutboxCanProceed(runtime.state.syncOutbox);
     if (runtime.state.pendingRequest) {
       if (runtime.state.pendingRequest.kind !== "sync") {
         throw new ConnectorError("PENDING_REQUEST_CONFLICT", "A non-sync request is pending before the sync outbox.");
@@ -1013,6 +1129,9 @@ async function processSyncOutbox(runtime, secrets, paths, options) {
     }
     const finalized = await finalizePending(runtime, response, paths);
     await saveFinalizedRuntime(paths, runtime, finalized.cleanupBatchId);
+    if (finalized.blocked) {
+      assertSyncOutboxCanProceed(runtime.state.syncOutbox);
+    }
     await afterIngestRequest();
   }
   const sent = (initial.processedEvents || 0) - initialProcessedEvents;
@@ -1118,6 +1237,70 @@ export async function pair(options = {}) {
       const activeSecrets = await loadSecrets(paths);
       assertPaired(runtime.state, runtime.config, activeSecrets);
       await hardenWindowsSecrets(paths.secrets, options);
+      const refreshCode = options.code === undefined ? null : normalizePairCode(options.code);
+      if (options.code !== undefined && !refreshCode) {
+        throw new ConnectorError("INVALID_PAIR_CODE", "Pairing requires the eight-character code shown by The Artificial Games.");
+      }
+      if (refreshCode) {
+        const deviceLabel = typeof options.deviceLabel === "string" ? options.deviceLabel.trim() : "TAG Plugin";
+        if (!/^[A-Za-z0-9 ._-]{1,40}$/.test(deviceLabel)) {
+          throw new ConnectorError("INVALID_DEVICE_LABEL", "The device label must be 1-40 simple characters.");
+        }
+        const response = await signedPost(configuredEndpoint + "/api/connectors/v1/exchange", {
+          code: refreshCode,
+          publicKey: activeSecrets.publicKeyRawBase64Url,
+          deviceLabel,
+          connectorVersion: CONNECTOR_VERSION
+        }, {
+          deviceId: "",
+          sequence: 0,
+          privateKeyPem: activeSecrets.privateKeyPem
+        }, { ...options, nonce: randomBytes(18).toString("base64url") });
+        const refreshedDeviceId = response?.device?.id;
+        if (refreshedDeviceId !== runtime.state.deviceId) {
+          throw new ConnectorError(
+            "PAIR_DEVICE_CHANGED",
+            "The authorization refresh did not return the currently paired device."
+          );
+        }
+        const allowedPlatforms = (response.allowedPlatforms || response.device?.allowedPlatforms || [])
+          .filter((platform) => PLATFORM_IDS.has(platform));
+        const supportedProviders = (response.supportedProviders || response.device?.supportedProviders || [])
+          .filter((provider) => PLATFORM_IDS.has(provider));
+        if (allowedPlatforms.length === 0 || supportedProviders.length === 0) {
+          throw new ConnectorError("INVALID_SERVER_RESPONSE", "The authorization refresh returned no supported platforms.");
+        }
+        if (response.dedupNamespaceKey !== activeSecrets.dedupNamespaceKey) {
+          throw new ConnectorError(
+            "ACCOUNT_NAMESPACE_CHANGED",
+            "The account deduplication namespace changed during authorization refresh."
+          );
+        }
+        if (response?.signing?.nextSequence !== runtime.state.nextSequence
+          || response?.signing?.lastRequestDigest !== runtime.state.previousRequestDigest) {
+          throw new ConnectorError(
+            "REQUEST_CHAIN_DIVERGED",
+            "The server and local request chain differ; authorization was not applied locally."
+          );
+        }
+        runtime.config.allowedPlatforms = allowedPlatforms;
+        runtime.config.supportedProviders = supportedProviders;
+        runtime.config.transcriptFallbacks = allowedFallbacks(
+          requestedFallbacks(options.enabledFallbacks ?? runtime.config.transcriptFallbacks),
+          allowedPlatforms
+        );
+        await saveRuntime(paths, runtime);
+        await safeLog(paths.log, { action: "pair", status: "authorization_refreshed" });
+        return {
+          paired: true,
+          alreadyPaired: true,
+          authorizationRefreshed: true,
+          deviceId: runtime.state.deviceId,
+          allowedPlatforms,
+          supportedProviders,
+          transcriptFallbacks: runtime.config.transcriptFallbacks
+        };
+      }
       if (options.enabledFallbacks !== undefined) {
         runtime.config.transcriptFallbacks = allowedFallbacks(
           requestedFallbacks(options.enabledFallbacks),
@@ -1408,7 +1591,7 @@ export async function sync(options = {}) {
     });
     if (historyRanges) {
       for (const [provider, range] of Object.entries(historyRanges)) {
-        if (collection.providerScans?.[provider]?.complete) {
+        if (collection.providerScans?.[provider]?.progressComplete) {
           collection.nextCursors.aggregate.providers[provider].through = range.end;
         }
       }
@@ -1418,58 +1601,59 @@ export async function sync(options = {}) {
       allowedProviderSet.has(event.provider) && supportedProviderSet.has(event.provider)
     );
     const currentWireEvents = eligibleEvents.map(toWireEvent).filter(Boolean);
-    const currentUnresolved = [];
-    for (const event of eligibleEvents.filter((candidate) =>
-      !candidate.modelId && candidate.mode?.classified !== false
-    )) {
-      const normalized = toUnresolvedEvent(event);
-      if (normalized) {
-        currentUnresolved.push(normalized);
-      } else if (collection.stats[event.provider]) {
-        collection.stats[event.provider].malformed += 1;
-      }
-    }
     const scanSummary = safeScanSummary(collection.stats);
     const collectionPending = Object.values(collection.stats).some((adapter) => adapter.pending === true);
     const retainedUnresolved = [];
-    const resolvedQueuedEvents = [];
+    const legacyRawOnlyEvents = [];
     for (const event of runtime.state.unresolvedEvents || []) {
       const providerStillEligible = allowedProviderSet.has(event.provider)
         && supportedProviderSet.has(event.provider);
-      const resolved = providerStillEligible
-        ? resolveUnresolvedEvent(event, resolveModel)
+      const rawOnly = providerStillEligible
+        ? legacyUnresolvedToRawOnlyWireEvent(event)
         : null;
-      if (resolved) {
-        resolvedQueuedEvents.push(resolved);
+      if (rawOnly) {
+        legacyRawOnlyEvents.push(rawOnly);
       } else {
         retainedUnresolved.push(event);
       }
     }
     const unresolvedQueue = boundedUnresolvedQueue(
       retainedUnresolved,
-      currentUnresolved,
+      [],
       options.unresolvedQueueCap
     );
+    const nextRawOnlyBackfill = stagedRawOnlyBackfill(
+      runtime.state,
+      collection.providerScans,
+      unresolvedQueue.events,
+      scannedAt
+    );
     const priorOverflow = runtime.state.unresolvedOverflow || { totalDropped: 0, lastOverflowAt: null };
-    const unresolvedOverflow = {
-      totalDropped: priorOverflow.totalDropped + unresolvedQueue.dropped,
-      lastOverflowAt: unresolvedQueue.dropped > 0 ? scannedAt : priorOverflow.lastOverflowAt
-    };
+    const backfillComplete = nextRawOnlyBackfill.pendingProviders.length === 0
+      && unresolvedQueue.events.length === 0
+      && (priorOverflow.totalDropped === 0 || nextRawOnlyBackfill.completedAt !== null);
+    const unresolvedOverflow = backfillComplete
+      ? { totalDropped: 0, lastOverflowAt: null }
+      : {
+          totalDropped: priorOverflow.totalDropped + unresolvedQueue.dropped,
+          lastOverflowAt: unresolvedQueue.dropped > 0 ? scannedAt : priorOverflow.lastOverflowAt
+        };
     const eventsById = new Map();
-    for (const event of [...resolvedQueuedEvents, ...currentWireEvents]) {
-      eventsById.set(event.eventId, event);
+    for (const event of currentWireEvents) eventsById.set(event.eventId, event);
+    // Once usage was observed without complete attribution it remains raw-only,
+    // even if a later registry recognizes its source token. When the v5 repair
+    // scan finds the same stable ID, prefer its exact cache-write split over the
+    // retired queue's necessarily folded legacy counters.
+    for (const event of legacyRawOnlyEvents) {
+      const rescanned = eventsById.get(event.eventId);
+      eventsById.set(event.eventId, rescanned ? forceRawOnlyWireEvent(rescanned) : event);
     }
     const events = [...eventsById.values()].sort((a, b) => {
       const timeOrder = a.occurredAt.localeCompare(b.occurredAt);
       return (aggregateHistory ? -timeOrder : timeOrder) || a.eventId.localeCompare(b.eventId);
     });
     const withheld = collection.events.length - currentWireEvents.length;
-    const unknownModels = [...new Map(
-      unresolvedQueue.events.map((event) => [event.provider + "\0" + event.sourceModelId, {
-        provider: event.provider,
-        sourceModelId: event.sourceModelId
-      }])
-    ).values()];
+    const unknownModels = [];
     const checkpoints = allowedProviderSet.has("codex") && supportedProviderSet.has("codex")
       ? codexCheckpoints(collection.providerEvidence)
       : [];
@@ -1481,6 +1665,7 @@ export async function sync(options = {}) {
       runtime.state.cursors = collection.nextCursors;
       runtime.state.unresolvedEvents = unresolvedQueue.events;
       runtime.state.unresolvedOverflow = unresolvedOverflow;
+      runtime.state.rawOnlyBackfill = nextRawOnlyBackfill;
       runtime.state.lastScan = {
         at: scannedAt,
         adapters: scanSummary,
@@ -1520,7 +1705,8 @@ export async function sync(options = {}) {
         unknownModels,
         collectionPending,
         nextUnresolvedEvents: unresolvedQueue.events,
-        unresolvedOverflow
+        unresolvedOverflow,
+        nextRawOnlyBackfill
       },
       options
     );
@@ -1558,12 +1744,26 @@ export async function heartbeat(options = {}) {
 }
 
 export async function scheduledRun(options = {}) {
-  const syncResult = await sync({
-    ...options,
-    maxIngestRequests: options.maxIngestRequests ?? SCHEDULED_MAX_INGEST_REQUESTS,
-    heartbeatEveryIngestRequests: options.heartbeatEveryIngestRequests
-      ?? HEARTBEAT_EVERY_INGEST_REQUESTS
-  });
+  let syncResult;
+  try {
+    syncResult = await sync({
+      ...options,
+      maxIngestRequests: options.maxIngestRequests ?? SCHEDULED_MAX_INGEST_REQUESTS,
+      heartbeatEveryIngestRequests: options.heartbeatEveryIngestRequests
+        ?? HEARTBEAT_EVERY_INGEST_REQUESTS
+    });
+  } catch (error) {
+    if (!(error instanceof ConnectorError) || error.code !== "RAW_ONLY_CONTRACT_REJECTED") throw error;
+    // This response already advanced the signed request chain, so liveness can
+    // continue while the lossless Raw outbox remains visibly blocked. A 4xx
+    // pending request cannot take this path because its sequence is unresolved.
+    syncResult = {
+      sent: 0,
+      blocked: true,
+      code: error.code,
+      catchingUp: true
+    };
+  }
   const heartbeatResult = await heartbeat(options);
   return { sync: syncResult, heartbeat: heartbeatResult };
 }
@@ -1595,8 +1795,11 @@ export async function status(options = {}) {
     pendingChunks: state.syncOutbox
       ? remainingSyncChunks(state.syncOutbox)
       : 0,
+    syncOutboxPermanentFailure: state.syncOutbox?.permanentFailure || null,
     unresolvedQueued: Array.isArray(state.unresolvedEvents) ? state.unresolvedEvents.length : 0,
     unresolvedOverflow: state.unresolvedOverflow || { totalDropped: 0, lastOverflowAt: null },
+    rawOnlyBackfill: state.syncOutbox?.commit?.nextRawOnlyBackfill || state.rawOnlyBackfill
+      || { version: 1, pendingProviders: [], partialCoverage: {}, completedAt: null },
     quarantinedEventCount: quarantinedEventIds.size,
     nextSequence: state.nextSequence,
     lastSyncAt: state.lastSyncAt,

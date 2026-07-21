@@ -9,7 +9,7 @@ import { parseClaudeProject } from "../src/adapters/claude-project.mjs";
 import { parseKimiWire } from "../src/adapters/kimi-wire.mjs";
 import { MAX_JOURNAL_LINE_BYTES, normalizeMode } from "../src/adapters/shared.mjs";
 import { canonicalModelId as resolveCanonicalModel } from "../src/model-registry.mjs";
-import { collectUsage, toWireEvent } from "../src/collector.mjs";
+import { collectUsage, hasRawTokenUsage, toWireEvent } from "../src/collector.mjs";
 
 const fixtureDirectory = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const aliasKey = Buffer.alloc(32, 7).toString("base64");
@@ -42,6 +42,38 @@ test("Codex fallback extracts only allowlisted final-turn usage", async () => {
   assert.equal(parsed.duplicateSnapshots, 1);
   assert.equal(parsed.cumulativeMismatches, 0);
   assert.doesNotMatch(serialized(parsed), /SECRET_|private|repository/i);
+});
+
+test("zero-token source observations never become ledger events", () => {
+  const zeroObservation = {
+    eventId: "zero-observation",
+    provider: "claude",
+    modelId: null,
+    observedAt: "2026-07-19T10:00:00.000Z",
+    mode: { fast: false, classified: false },
+    usage: {
+      input: 0,
+      cachedInput: 0,
+      cacheWriteInput: 0,
+      output: 0,
+      reasoningOutput: 0,
+      total: 0,
+    },
+    provenance: { surface: "claude_code" },
+  };
+  assert.equal(toWireEvent(zeroObservation), null);
+  assert.equal(hasRawTokenUsage({
+    inputTokens: "0",
+    cachedInputTokens: "0",
+    cacheWriteInputTokens: "0",
+    outputTokens: "0",
+  }), false);
+  assert.equal(hasRawTokenUsage({
+    inputTokens: "1",
+    cachedInputTokens: "0",
+    cacheWriteInputTokens: "0",
+    outputTokens: "0",
+  }), true);
 });
 
 test("Codex treats both fast and priority service tiers as classified Fast", async (context) => {
@@ -316,6 +348,37 @@ test("Claude fallback deduplicates message snapshots using the maximum/final usa
   assert.doesNotMatch(serialized(parsed), /SECRET_|private|source\.ts/i);
 });
 
+test("Claude drops synthetic terminal records that contain no usage", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-claude-zero-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const projectPath = path.join(temporary, "00000000-0000-4000-8000-0000000000c1.jsonl");
+  const assistant = (id, timestamp, usage, content) => ({
+    type: "assistant",
+    timestamp,
+    message: {
+      id,
+      model: "claude-sonnet-5-20260701",
+      stop_reason: "end_turn",
+      usage,
+      content: [{ type: "text", text: content }],
+    },
+  });
+  await fs.writeFile(projectPath, [
+    assistant("msg_zero_api_error", "2026-07-19T10:00:00.000Z", {
+      input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0,
+    }, "API Error"),
+    assistant("msg_zero_no_response", "2026-07-19T10:01:00.000Z", {
+      input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0,
+    }, "No response requested."),
+    assistant("msg_real_usage_0001", "2026-07-19T10:02:00.000Z", {
+      input_tokens: 10, cache_read_input_tokens: 20, cache_creation_input_tokens: 5, output_tokens: 3,
+    }, "real response"),
+  ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+  const parsed = await parseClaudeProject(projectPath, { dedupNamespaceKey });
+  assert.equal(parsed.events.length, 1);
+  assert.equal(parsed.events[0].usage.total, 38);
+});
+
 test("Claude classifies speed only from message usage evidence", async (context) => {
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-claude-speed-test-"));
   context.after(() => fs.rm(temporary, { recursive: true, force: true }));
@@ -351,7 +414,19 @@ test("Claude classifies speed only from message usage evidence", async (context)
   assert.equal(unclassified.mode.fast, false);
   assert.equal(unclassified.mode.classified, false);
   assert.equal(toWireEvent(standard)?.serviceMode, "standard");
-  assert.equal(toWireEvent(unclassified), null);
+  assert.deepEqual({
+    attribution: toWireEvent(unclassified)?.attribution,
+    modelId: toWireEvent(unclassified)?.modelId,
+    serviceMode: toWireEvent(unclassified)?.serviceMode
+  }, {
+    attribution: "raw_only",
+    modelId: "unknown",
+    serviceMode: "unknown"
+  });
+  const missingMode = { ...standard };
+  delete missingMode.mode;
+  assert.equal(toWireEvent(missingMode)?.attribution, "raw_only");
+  assert.equal(toWireEvent({ ...standard, modelId: "unknown" })?.attribution, "raw_only");
 });
 
 test("Kimi v0.28 fallback prefilters usage.record and maps HighSpeed to fast", async () => {
@@ -725,6 +800,59 @@ test("Codex IDs distinguish separate eligible token records at the same timestam
   const parsed = await parseCodexRollout(activePath, { dedupNamespaceKey });
   assert.equal(parsed.events.length, 2);
   assert.notEqual(parsed.events[0].eventId, parsed.events[1].eventId);
+});
+
+test("Codex cumulative resets start a deterministic new logical-session epoch", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-codex-reset-epoch-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "rollout-00000000-0000-4000-8000-000000000001.jsonl");
+  const usageRecord = (timestamp, cumulativeTotal, lastTotal) => ({
+    timestamp,
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: {
+        total_token_usage: { total_tokens: cumulativeTotal },
+        last_token_usage: {
+          input_tokens: lastTotal,
+          output_tokens: 0,
+          total_tokens: lastTotal
+        }
+      }
+    }
+  });
+  await fs.writeFile(activePath, [
+    { type: "session_meta", payload: { id: "00000000-0000-4000-8000-000000000001" } },
+    { type: "turn_context", payload: { model: "gpt-5.6-sol", service_tier: "fast" } },
+    usageRecord("2026-07-19T10:00:01.000Z", 100, 100),
+    usageRecord("2026-07-19T10:00:02.000Z", 150, 50),
+    usageRecord("2026-07-19T10:00:03.000Z", 20, 20),
+    usageRecord("2026-07-19T10:00:04.000Z", 50, 30)
+  ].map(JSON.stringify).join("\n") + "\n", "utf8");
+
+  const firstSessions = {};
+  const first = await parseCodexRollout(activePath, {
+    dedupNamespaceKey,
+    logicalSessions: firstSessions
+  });
+  const second = await parseCodexRollout(activePath, {
+    dedupNamespaceKey,
+    logicalSessions: {}
+  });
+
+  assert.equal(first.cumulativeResets, 1);
+  assert.equal(first.events.length, 4);
+  assert.equal(new Set(first.events.map((event) => event.eventId)).size, 4);
+  assert.deepEqual(
+    second.events.map((event) => event.eventId),
+    first.events.map((event) => event.eventId)
+  );
+  assert.equal(first.cursor.logicalEpoch, 1);
+  assert.deepEqual(firstSessions[first.cursor.logicalSessionAlias], {
+    epoch: 1,
+    highWatermark: 50,
+    lastSeenAt: firstSessions[first.cursor.logicalSessionAlias].lastSeenAt
+  });
 });
 
 test("Codex IDs survive replacement that changes only a non-usage header", async (context) => {

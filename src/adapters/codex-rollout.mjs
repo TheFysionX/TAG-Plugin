@@ -176,12 +176,21 @@ function safeEpoch(entry) {
   return Number.isSafeInteger(entry?.epoch) && entry.epoch >= 0 ? entry.epoch : 0;
 }
 
-function updateLogicalSession(logicalSessions, alias, highWatermark, now) {
+function updateLogicalSession(logicalSessions, alias, highWatermark, now, epoch = null) {
   if (!alias) return;
   const current = logicalSessions[alias] || {};
   logicalSessions[alias] = {
-    epoch: safeEpoch(current),
+    epoch: Number.isSafeInteger(epoch) && epoch >= 0 ? epoch : safeEpoch(current),
     highWatermark: Math.max(safeHighWatermark(current) || 0, highWatermark || 0),
+    lastSeenAt: now
+  };
+}
+
+function resetLogicalSessionEpoch(logicalSessions, alias, epoch, now) {
+  if (!alias) return;
+  logicalSessions[alias] = {
+    epoch,
+    highWatermark: 0,
     lastSeenAt: now
   };
 }
@@ -229,10 +238,13 @@ export async function parseCodexRollout(filePath, options) {
     ? options.onEvent
     : null;
   const fileIdentity = sha256([
-    "codex-journal-file-v1",
+    "codex-journal-file-v2",
     String(stat.dev),
     String(stat.ino),
-    String(Math.trunc(stat.birthtimeMs))
+    // Windows exposes sub-millisecond creation times here. Truncating them
+    // allowed a delete-and-rename replacement created in the same millisecond
+    // to collide with the old journal identity.
+    String(stat.birthtimeMs)
   ].join("\0"));
   const replaced = typeof savedCursor.fileIdentity === "string"
     && savedCursor.fileIdentity !== fileIdentity;
@@ -258,7 +270,8 @@ export async function parseCodexRollout(filePath, options) {
         logicalSessions,
         savedCursor.logicalSessionAlias,
         savedCursor.logicalHighWatermark,
-        scanNow
+        scanNow,
+        savedCursor.logicalEpoch
       );
     }
     return {
@@ -338,8 +351,13 @@ export async function parseCodexRollout(filePath, options) {
   let sessionAlias = reset
     ? logicalSessionAlias(options.aliasKey, null, filenameIdentity)
     : (savedCursor.logicalSessionAlias || logicalSessionAlias(options.aliasKey, null, filenameIdentity));
+  let logicalEpoch = reset
+    ? 0
+    : (Number.isSafeInteger(savedCursor.logicalEpoch) && savedCursor.logicalEpoch >= 0
+      ? savedCursor.logicalEpoch
+      : safeEpoch(logicalSessions[sessionAlias]));
   if (!reset && !hasExternalLogicalSessions && safeHighWatermark(logicalSessions[sessionAlias]) === null) {
-    updateLogicalSession(logicalSessions, sessionAlias, savedCursor.logicalHighWatermark, scanNow);
+    updateLogicalSession(logicalSessions, sessionAlias, savedCursor.logicalHighWatermark, scanNow, logicalEpoch);
   }
   const events = [];
   let emittedEvents = 0;
@@ -400,7 +418,8 @@ export async function parseCodexRollout(filePath, options) {
             logicalSessions,
             sessionAlias,
             Math.max(existingHighWatermark, preludeMax),
-            scanNow
+            scanNow,
+            logicalEpoch
           );
         }
         liveBoundaryEstablished = true;
@@ -479,6 +498,12 @@ export async function parseCodexRollout(filePath, options) {
       ambiguousLineage += 1;
     } else {
       const cumulativeTotal = usageRecord.cumulativeTotal;
+      const validatedReset = cumulativeReset
+        && cumulativeTotal >= normalizedUsage.total;
+      if (validatedReset) {
+        logicalEpoch += 1;
+        resetLogicalSessionEpoch(logicalSessions, sessionAlias, logicalEpoch, scanNow);
+      }
       const highWatermark = safeHighWatermark(logicalSessions[sessionAlias]);
       const inferredBaseline = cumulativeTotal >= normalizedUsage.total
         ? cumulativeTotal - normalizedUsage.total
@@ -489,22 +514,22 @@ export async function parseCodexRollout(filePath, options) {
           ambiguousLineage += 1;
         } else {
           if (inferredBaseline > 0) inheritedSnapshots += 1;
-          updateLogicalSession(logicalSessions, sessionAlias, cumulativeTotal, scanNow);
+          updateLogicalSession(logicalSessions, sessionAlias, cumulativeTotal, scanNow, logicalEpoch);
         }
       } else if (cumulativeTotal <= highWatermark) {
         shouldEmit = false;
         inheritedSnapshots += 1;
-        updateLogicalSession(logicalSessions, sessionAlias, highWatermark, scanNow);
+        updateLogicalSession(logicalSessions, sessionAlias, highWatermark, scanNow, logicalEpoch);
       } else if (inferredBaseline !== null && highWatermark <= inferredBaseline) {
         if (highWatermark < inferredBaseline) inheritedSnapshots += 1;
-        updateLogicalSession(logicalSessions, sessionAlias, cumulativeTotal, scanNow);
+        updateLogicalSession(logicalSessions, sessionAlias, cumulativeTotal, scanNow, logicalEpoch);
       } else {
         // A prior high-watermark cuts through the reported last-turn usage.
         // Partial allocation would invent provider/category totals, so advance
         // past the ambiguity without uploading it.
         shouldEmit = false;
         ambiguousLineage += 1;
-        updateLogicalSession(logicalSessions, sessionAlias, cumulativeTotal, scanNow);
+        updateLogicalSession(logicalSessions, sessionAlias, cumulativeTotal, scanNow, logicalEpoch);
       }
     }
     if (observedAt && Date.parse(observedAt) < minimumObservedAtInclusive) {
@@ -518,7 +543,7 @@ export async function parseCodexRollout(filePath, options) {
     const stableRecordIdentity = [
       sessionIdentityHash,
       "cumulative-v2",
-      String(safeEpoch(logicalSessions[sessionAlias])),
+      String(logicalEpoch),
       String(usageRecord.cumulativeTotal)
     ].join("\0");
     const mode = normalizeMode({ provider: "codex", serviceTier: context.serviceTier });
@@ -578,6 +603,7 @@ export async function parseCodexRollout(filePath, options) {
       sessionIdentityHash,
       sessionMetaSeen,
       logicalSessionAlias: sessionAlias,
+      logicalEpoch,
       logicalHighWatermark: safeHighWatermark(logicalSessions[sessionAlias]),
       usagePrefixVersion: 2,
       usagePrefixDigest,

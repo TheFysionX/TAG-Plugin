@@ -1,4 +1,11 @@
-import { MAX_CLAUDE_SEEN_EVENTS, MAX_CODEX_LOGICAL_SESSIONS, MAX_CURSOR_FILES } from "./constants.mjs";
+import {
+  CLAUDE_ACCOUNTING_VERSION,
+  CODEX_ACCOUNTING_VERSION,
+  KIMI_ACCOUNTING_VERSION,
+  MAX_CLAUDE_SEEN_EVENTS,
+  MAX_CODEX_LOGICAL_SESSIONS,
+  MAX_CURSOR_FILES
+} from "./constants.mjs";
 import { accountScopedEventId, hmacAlias, payloadHash, sha256 } from "./crypto.mjs";
 import { discoverJsonlFiles } from "./discovery.mjs";
 import { codexRolloutSortKey, parseCodexRollout } from "./adapters/codex-rollout.mjs";
@@ -8,6 +15,17 @@ import path from "node:path";
 import { parseKimiWire } from "./adapters/kimi-wire.mjs";
 
 const AGGREGATE_USAGE_FIELDS = ["input", "cachedInput", "cacheWriteInput", "output", "reasoningOutput"];
+const WIRE_RAW_USAGE_FIELDS = ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens"];
+
+export function hasRawTokenUsage(event) {
+  let total = 0n;
+  for (const field of WIRE_RAW_USAGE_FIELDS) {
+    const value = event?.[field] ?? "0";
+    if (typeof value !== "string" || !/^(?:0|[1-9][0-9]{0,15})$/.test(value)) return false;
+    total += BigInt(value);
+  }
+  return total > 0n;
+}
 
 function modeLabel(event) {
   if (event?.mode?.classified === false) return "unclassified";
@@ -158,6 +176,27 @@ function boundedSeen(events, previousSeen) {
   return newestEntries(next, MAX_CLAUDE_SEEN_EVENTS, "lastSeenAt");
 }
 
+function finalizeProviderCoverage(result, provider) {
+  const scan = result.providerScans[provider];
+  const stats = result.stats[provider];
+  if (!scan || !stats) return;
+  const parseLosses = Number.isSafeInteger(stats.malformed) ? stats.malformed : 0;
+  scan.parseLosses = parseLosses;
+  scan.progressComplete = Boolean(scan.discoveryComplete && !stats.pending);
+  scan.complete = Boolean(scan.progressComplete && parseLosses === 0);
+  scan.coverage = !scan.enabled
+    ? "disabled"
+    : (scan.complete ? "complete" : "partial");
+  if (scan.discoveryComplete && stats.pending) {
+    scan.reason = "event_limit";
+  } else if (scan.progressComplete && parseLosses > 0) {
+    scan.reason = "parse_loss";
+    stats.status = "partial";
+  }
+  stats.coverage = scan.coverage;
+  stats.parseLosses = parseLosses;
+}
+
 export async function collectUsage(options) {
   const { roots, state, secrets } = options;
   const now = options.now ?? Date.now();
@@ -174,15 +213,20 @@ export async function collectUsage(options) {
         excludedEventIds: new Set(options.excludedEventIds || [])
       })
     : null;
-  const nextCursors = structuredClone(state.cursors || { codex: { accountingVersion: 4, files: {}, sessions: {} }, claude: { accountingVersion: 4, seen: {} }, kimi: { files: {} } });
-  nextCursors.codex = nextCursors.codex || { accountingVersion: 4, files: {}, sessions: {} };
-  nextCursors.codex.accountingVersion = 4;
+  const nextCursors = structuredClone(state.cursors || {
+    codex: { accountingVersion: CODEX_ACCOUNTING_VERSION, files: {}, sessions: {} },
+    claude: { accountingVersion: CLAUDE_ACCOUNTING_VERSION, seen: {} },
+    kimi: { accountingVersion: KIMI_ACCOUNTING_VERSION, files: {} }
+  });
+  nextCursors.codex = nextCursors.codex || { accountingVersion: CODEX_ACCOUNTING_VERSION, files: {}, sessions: {} };
+  nextCursors.codex.accountingVersion = CODEX_ACCOUNTING_VERSION;
   nextCursors.codex.files = nextCursors.codex.files || {};
   nextCursors.codex.sessions = nextCursors.codex.sessions || {};
-  nextCursors.claude = nextCursors.claude || { accountingVersion: 4, seen: {} };
-  nextCursors.claude.accountingVersion = 4;
+  nextCursors.claude = nextCursors.claude || { accountingVersion: CLAUDE_ACCOUNTING_VERSION, seen: {} };
+  nextCursors.claude.accountingVersion = CLAUDE_ACCOUNTING_VERSION;
   nextCursors.claude.seen = nextCursors.claude.seen || {};
-  nextCursors.kimi = nextCursors.kimi || { files: {} };
+  nextCursors.kimi = nextCursors.kimi || { accountingVersion: KIMI_ACCOUNTING_VERSION, files: {} };
+  nextCursors.kimi.accountingVersion = KIMI_ACCOUNTING_VERSION;
   nextCursors.kimi.files = nextCursors.kimi.files || {};
   const result = {
     events: [],
@@ -217,6 +261,7 @@ export async function collectUsage(options) {
   result.stats.codex.truncated = codexDiscovery.truncated;
   result.providerScans.codex = {
     enabled: Boolean(enabledFallbacks.codex),
+    discoveryComplete: Boolean(enabledFallbacks.codex && !codexDiscovery.unavailable && !codexDiscovery.truncated),
     complete: Boolean(enabledFallbacks.codex && !codexDiscovery.unavailable && !codexDiscovery.truncated),
     reason: !enabledFallbacks.codex
       ? "disabled"
@@ -289,6 +334,7 @@ export async function collectUsage(options) {
   result.stats.claude.truncated = claudeDiscovery.truncated;
   result.providerScans.claude = {
     enabled: Boolean(enabledFallbacks.claude),
+    discoveryComplete: Boolean(enabledFallbacks.claude && !claudeDiscovery.unavailable && !claudeDiscovery.truncated),
     complete: Boolean(enabledFallbacks.claude && !claudeDiscovery.unavailable && !claudeDiscovery.truncated),
     reason: !enabledFallbacks.claude
       ? "disabled"
@@ -352,6 +398,7 @@ export async function collectUsage(options) {
   result.stats.kimi.truncated = kimiDiscovery.truncated;
   result.providerScans.kimi = {
     enabled: Boolean(enabledFallbacks.kimi),
+    discoveryComplete: Boolean(enabledFallbacks.kimi && !kimiDiscovery.unavailable && !kimiDiscovery.truncated),
     complete: Boolean(enabledFallbacks.kimi && !kimiDiscovery.unavailable && !kimiDiscovery.truncated),
     reason: !enabledFallbacks.kimi
       ? "disabled"
@@ -404,6 +451,10 @@ export async function collectUsage(options) {
   }
   nextCursors.kimi.files = newestEntries(nextCursors.kimi.files, MAX_CURSOR_FILES, "lastSeenAt");
 
+  for (const provider of ["codex", "claude", "kimi"]) {
+    finalizeProviderCoverage(result, provider);
+  }
+
   if (aggregator) {
     const aggregation = aggregator.finish();
     result.events = result.events.concat(aggregation.events);
@@ -425,21 +476,38 @@ export async function collectUsage(options) {
 }
 
 export function toWireEvent(event) {
-  if (!event.modelId || !event.observedAt || event.mode?.classified === false) {
+  if (!event?.eventId || !event?.provider || !event?.observedAt || !event?.usage || !event?.provenance?.surface) {
     return null;
   }
-  return {
+  const usage = {
+    inputTokens: String(event.usage.input || 0),
+    cachedInputTokens: String(event.usage.cachedInput || 0),
+    cacheWriteInputTokens: String(event.usage.cacheWriteInput || 0),
+    outputTokens: String(event.usage.output || 0),
+    ...(event.usage.reasoningOutput > 0 ? { reasoningTokens: String(event.usage.reasoningOutput) } : {})
+  };
+  const common = {
     eventId: event.eventId,
     occurredAt: event.observedAt,
     provider: event.provider,
-    modelId: event.modelId,
-    serviceMode: event.mode.fast ? "fast" : "standard",
-    inputTokens: String(event.usage.input + event.usage.cacheWriteInput),
-    cachedInputTokens: String(event.usage.cachedInput),
-    outputTokens: String(event.usage.output),
-    ...(event.usage.reasoningOutput > 0 ? { reasoningTokens: String(event.usage.reasoningOutput) } : {}),
+    ...usage,
     surface: event.provenance.surface
   };
+  if (!event.modelId || event.modelId === "unknown" || event.mode?.classified !== true) {
+    const rawOnly = {
+      ...common,
+      attribution: "raw_only",
+      modelId: "unknown",
+      serviceMode: "unknown"
+    };
+    return hasRawTokenUsage(rawOnly) ? rawOnly : null;
+  }
+  const attributed = {
+    ...common,
+    modelId: event.modelId,
+    serviceMode: event.mode?.fast ? "fast" : "standard"
+  };
+  return hasRawTokenUsage(attributed) ? attributed : null;
 }
 
 export function aggregatePreview(collection) {

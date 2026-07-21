@@ -24,7 +24,7 @@ test("package and install manifest remain dependency-free", async () => {
   assert.equal(manifest.product.name, "TAG Plugin");
   assert.equal(manifest.product.publisher, "The Artificial Games");
   assert.equal(manifest.product.repository, "https://github.com/TheFysionX/TAG-Plugin");
-  assert.equal(manifest.releaseArtifact.archiveName, "tag-plugin-0.1.4.tgz");
+  assert.equal(manifest.releaseArtifact.archiveName, "tag-plugin-0.1.5.tgz");
   assert.match(manifest.releaseArtifact.releaseContract, /@the-artificial-games\/tag-plugin/);
   assert.equal(manifest.releaseArtifact.testCommand, "npm test");
   assert.deepEqual(
@@ -35,7 +35,8 @@ test("package and install manifest remain dependency-free", async () => {
   assert.equal(manifest.scheduler.elevation, false);
   assert.match(manifest.localState.syncRecovery, /3 events or 2 checkpoints/);
   assert.match(manifest.localState.syncRecovery, /1000 ingest requests.*heartbeat every 50/i);
-  assert.match(manifest.localState.unresolvedModels, /2000 normalized content-free records/i);
+  assert.match(manifest.localState.unresolvedModels, /raw-only.*without a local queue/i);
+  assert.match(manifest.network.rawOnlyCommit, /rawPreserved true.*source cursor/i);
   assert.match(manifest.localState.eventIdentity, /content-independent source identity/i);
   assert.match(manifest.localState.operationLock, /owner token.*lease renewed.*live-PID/i);
   assert.match(manifest.scheduler.postInstall, /immediate allowlisted usage sync and signed heartbeat/i);
@@ -56,7 +57,7 @@ test("package and install manifest remain dependency-free", async () => {
   assert.doesNotMatch(security, /100 events|32 checkpoints|eligible mixed batches/i);
   assert.doesNotMatch(security, /heartbeat follows completed catch-up|heartbeat is deliberately deferred/i);
   assert.match(security, /first owner session identity plus lineage epoch and cumulative endpoint/i);
-  assert.match(security, /queue capped at 2,000/i);
+  assert.match(security, /raw-only/i);
   const threatModel = await fs.readFile(path.join(root, "THREAT_MODEL.md"), "utf8");
   assert.match(threatModel, /provider receives and may retain the short-lived credential/i);
   assert.match(threatModel, /connector-reported evidence/i);

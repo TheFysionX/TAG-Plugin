@@ -1,7 +1,16 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
-import { MAX_CODEX_LOGICAL_SESSIONS, MAX_MIGRATION_EXCLUSIONS, MAX_UNRESOLVED_EVENTS, SCHEMA_VERSION } from "./constants.mjs";
+import {
+  AGGREGATE_CURSOR_VERSION,
+  CLAUDE_ACCOUNTING_VERSION,
+  CODEX_ACCOUNTING_VERSION,
+  KIMI_ACCOUNTING_VERSION,
+  MAX_CODEX_LOGICAL_SESSIONS,
+  MAX_MIGRATION_EXCLUSIONS,
+  MAX_UNRESOLVED_EVENTS,
+  SCHEMA_VERSION
+} from "./constants.mjs";
 
 const UNRESOLVED_EVENT_KEYS = new Set([
   "eventId",
@@ -21,17 +30,17 @@ const AGGREGATE_PROVIDERS = ["codex", "claude", "kimi"];
 
 function initialAggregateCursors() {
   return {
-    version: 2,
+    version: AGGREGATE_CURSOR_VERSION,
     providers: Object.fromEntries(AGGREGATE_PROVIDERS.map((provider) => [provider, { through: null }]))
   };
 }
 
 function normalizedAggregateCursors(value) {
-  if (value?.version !== 2 || !value.providers || typeof value.providers !== "object") {
+  if (value?.version !== AGGREGATE_CURSOR_VERSION || !value.providers || typeof value.providers !== "object") {
     return initialAggregateCursors();
   }
   return {
-    version: 2,
+    version: AGGREGATE_CURSOR_VERSION,
     providers: Object.fromEntries(AGGREGATE_PROVIDERS.map((provider) => {
       const through = value.providers?.[provider]?.through;
       return [provider, {
@@ -96,11 +105,12 @@ export function initialState() {
     migrationExcludedEvents: [],
     unresolvedEvents: [],
     unresolvedOverflow: { totalDropped: 0, lastOverflowAt: null },
+    rawOnlyBackfill: { version: 1, pendingProviders: [], partialCoverage: {}, completedAt: null },
     providerEvidenceHashes: {},
     cursors: {
-      codex: { accountingVersion: 4, files: {}, sessions: {} },
-      claude: { accountingVersion: 4, seen: {} },
-      kimi: { files: {} },
+      codex: { accountingVersion: CODEX_ACCOUNTING_VERSION, files: {}, sessions: {} },
+      claude: { accountingVersion: CLAUDE_ACCOUNTING_VERSION, seen: {} },
+      kimi: { accountingVersion: KIMI_ACCOUNTING_VERSION, files: {} },
       aggregate: initialAggregateCursors()
     },
     lastSyncAt: null,
@@ -141,8 +151,12 @@ export async function loadRuntime(paths) {
     readJson(paths.config, initialConfig)
   ]);
   state.cursors = state.cursors || initialState().cursors;
+  const requiresRawOnlyBackfill = state.cursors.codex?.accountingVersion !== CODEX_ACCOUNTING_VERSION
+    || state.cursors.claude?.accountingVersion !== CLAUDE_ACCOUNTING_VERSION
+    || state.cursors.kimi?.accountingVersion !== KIMI_ACCOUNTING_VERSION
+    || state.cursors.aggregate?.version !== AGGREGATE_CURSOR_VERSION;
   state.providerEvidenceHashes = state.providerEvidenceHashes || {};
-  state.cursors.codex = state.cursors.codex || { files: {}, sessions: {} };
+  state.cursors.codex = state.cursors.codex || { accountingVersion: CODEX_ACCOUNTING_VERSION, files: {}, sessions: {} };
   state.cursors.codex.files = state.cursors.codex.files
     && typeof state.cursors.codex.files === "object"
     && !Array.isArray(state.cursors.codex.files)
@@ -150,30 +164,38 @@ export async function loadRuntime(paths) {
     : {};
   state.cursors.codex.sessions = normalizedCodexSessions(state.cursors.codex.sessions);
   state.cursors.claude = state.cursors.claude || { seen: {} };
-  state.cursors.kimi = state.cursors.kimi || { files: {} };
+  state.cursors.kimi = state.cursors.kimi || { accountingVersion: KIMI_ACCOUNTING_VERSION, files: {} };
   state.cursors.aggregate = normalizedAggregateCursors(state.cursors.aggregate);
-  if (state.cursors.codex.accountingVersion !== 4) {
-    // v4 changes both physical replay detection and logical session identity.
-    // Old completed cursors must not short-circuit the one corrected rescan.
-    state.cursors.codex = { accountingVersion: 4, files: {}, sessions: {} };
+  if (state.cursors.codex.accountingVersion !== CODEX_ACCOUNTING_VERSION) {
+    // v5 performs one stable-ID rescan so usage withheld by the retired
+    // unresolved-model/mode queue is uploaded as raw-only instead of lost.
+    state.cursors.codex = { accountingVersion: CODEX_ACCOUNTING_VERSION, files: {}, sessions: {} };
     state.cursors.aggregate.providers.codex.through = null;
     delete state.providerEvidenceHashes.codex;
   } else {
-    state.cursors.codex.accountingVersion = 4;
+    state.cursors.codex.accountingVersion = CODEX_ACCOUNTING_VERSION;
   }
-  if (state.cursors.claude.accountingVersion !== 4) {
-    // v4 separates explicit Claude speed evidence from routing/billing tiers.
-    // Recollect the corrected generation once so legacy v3 Standard projections
-    // cannot suppress the authoritative Fast/Standard replay.
-    state.cursors.claude = { accountingVersion: 4, seen: {} };
+  if (state.cursors.claude.accountingVersion !== CLAUDE_ACCOUNTING_VERSION) {
+    state.cursors.claude = { accountingVersion: CLAUDE_ACCOUNTING_VERSION, seen: {} };
     state.cursors.aggregate.providers.claude.through = null;
     delete state.providerEvidenceHashes.claude;
   } else {
-    state.cursors.claude.accountingVersion = 4;
+    state.cursors.claude.accountingVersion = CLAUDE_ACCOUNTING_VERSION;
     state.cursors.claude.seen = state.cursors.claude.seen
       && typeof state.cursors.claude.seen === "object"
       && !Array.isArray(state.cursors.claude.seen)
       ? state.cursors.claude.seen
+      : {};
+  }
+  if (state.cursors.kimi.accountingVersion !== KIMI_ACCOUNTING_VERSION) {
+    state.cursors.kimi = { accountingVersion: KIMI_ACCOUNTING_VERSION, files: {} };
+    state.cursors.aggregate.providers.kimi.through = null;
+  } else {
+    state.cursors.kimi.accountingVersion = KIMI_ACCOUNTING_VERSION;
+    state.cursors.kimi.files = state.cursors.kimi.files
+      && typeof state.cursors.kimi.files === "object"
+      && !Array.isArray(state.cursors.kimi.files)
+      ? state.cursors.kimi.files
       : {};
   }
   config.transcriptFallbacks = {
@@ -183,6 +205,53 @@ export async function loadRuntime(paths) {
   };
   config.allowedPlatforms = Array.isArray(config.allowedPlatforms) ? config.allowedPlatforms : [];
   config.supportedProviders = Array.isArray(config.supportedProviders) ? config.supportedProviders : [];
+  const priorBackfillProviders = Array.isArray(state.rawOnlyBackfill?.pendingProviders)
+    ? state.rawOnlyBackfill.pendingProviders.filter((provider) => AGGREGATE_PROVIDERS.includes(provider))
+    : [];
+  const priorPartialCoverage = state.rawOnlyBackfill?.partialCoverage
+    && typeof state.rawOnlyBackfill.partialCoverage === "object"
+    && !Array.isArray(state.rawOnlyBackfill.partialCoverage)
+    ? Object.fromEntries(Object.entries(state.rawOnlyBackfill.partialCoverage)
+        .filter(([provider, value]) => AGGREGATE_PROVIDERS.includes(provider)
+          && Number.isSafeInteger(value?.parseLosses)
+          && value.parseLosses > 0)
+        .map(([provider, value]) => [provider, {
+          parseLosses: value.parseLosses,
+          lastObservedAt: typeof value.lastObservedAt === "string"
+            && Number.isFinite(Date.parse(value.lastObservedAt))
+            ? new Date(value.lastObservedAt).toISOString()
+            : null
+        }]))
+    : {};
+  const migrationProviders = requiresRawOnlyBackfill
+    ? AGGREGATE_PROVIDERS.filter((provider) => config.transcriptFallbacks[provider])
+    : [];
+  const queuedProviders = (Array.isArray(state.unresolvedEvents) ? state.unresolvedEvents : [])
+    .map((event) => event?.provider)
+    .filter((provider) => AGGREGATE_PROVIDERS.includes(provider));
+  const legacyOverflowProviders = requiresRawOnlyBackfill
+    && Number.isSafeInteger(state.unresolvedOverflow?.totalDropped)
+    && state.unresolvedOverflow.totalDropped > 0
+    ? AGGREGATE_PROVIDERS.filter((provider) =>
+        config.allowedPlatforms.includes(provider)
+        && config.supportedProviders.includes(provider)
+      )
+    : [];
+  state.rawOnlyBackfill = {
+    version: 1,
+    pendingProviders: [...new Set([
+      ...priorBackfillProviders,
+      ...Object.keys(priorPartialCoverage),
+      ...migrationProviders,
+      ...queuedProviders,
+      ...legacyOverflowProviders
+    ])],
+    partialCoverage: priorPartialCoverage,
+    completedAt: typeof state.rawOnlyBackfill?.completedAt === "string"
+      && Number.isFinite(Date.parse(state.rawOnlyBackfill.completedAt))
+      ? new Date(state.rawOnlyBackfill.completedAt).toISOString()
+      : null
+  };
   // Pre-release builds briefly stored this account-scoped secret in config.json.
   // Never trust or migrate it from that lower-assurance location; a re-pair is explicit and safe.
   delete config.dedupNamespaceKey;
