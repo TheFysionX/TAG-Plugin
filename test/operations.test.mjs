@@ -1297,6 +1297,78 @@ test("aggregate through watermarks advance independently and preserve deferred p
   assert.equal(runtime.state.cursors.aggregate.providers.kimi.through, "2026-07-20T16:00:00.000Z");
 });
 
+test("pre-v4 Claude accounting replays corrected Fast history exactly once", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_claude_v4_replay";
+  delete state.cursors.claude.accountingVersion;
+  state.cursors.claude.seen.legacy_standard_projection = {
+    hash: "f".repeat(64),
+    lastSeenAt: 1
+  };
+  state.cursors.aggregate.providers.claude.through = "2026-07-20T11:00:00.000Z";
+  state.providerEvidenceHashes.claude = "legacy-claude-evidence";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["claude"];
+  config.supportedProviders = ["claude"];
+  config.transcriptFallbacks = { codex: false, claude: true, kimi: false };
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+
+  const uploaded = [];
+  let digest = 0;
+  const run = () => sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    aggregateHistory: true,
+    now: Date.parse("2026-07-20T12:00:00.000Z"),
+    officialEvidence: false,
+    chunkPaceMs: 0,
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      uploaded.push(...body.events);
+      digest += 1;
+      return jsonResponse({
+        request: { digest: `digest_claude_v4_replay_${digest}_1234567890` },
+        accepted: body.events.length,
+        duplicates: 0,
+        rejected: 0,
+        events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+      });
+    }
+  });
+
+  assert.equal((await run()).sent, 1);
+  assert.equal(uploaded.length, 1);
+  assert.deepEqual({
+    provider: uploaded[0].provider,
+    occurredAt: uploaded[0].occurredAt,
+    serviceMode: uploaded[0].serviceMode,
+    inputTokens: uploaded[0].inputTokens,
+    cachedInputTokens: uploaded[0].cachedInputTokens,
+    outputTokens: uploaded[0].outputTokens
+  }, {
+    provider: "claude",
+    occurredAt: "2026-07-19T11:30:00.000Z",
+    serviceMode: "fast",
+    inputTokens: "12",
+    cachedInputTokens: "5",
+    outputTokens: "25"
+  });
+  assert.equal((await run()).sent, 0);
+  assert.equal(uploaded.length, 1);
+
+  const updated = await loadRuntime(fixture.paths);
+  assert.equal(updated.state.cursors.claude.accountingVersion, 4);
+  assert.equal(updated.state.cursors.aggregate.providers.claude.through, "2026-07-20T11:00:00.000Z");
+  assert.equal(updated.state.providerEvidenceHashes.claude, undefined);
+});
+
 test("hourly aggregation counts duplicate physical Codex journals only once", async (context) => {
   const fixture = await setup();
   context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
@@ -1614,6 +1686,9 @@ test("sync discards only stale v3 remaining work while preserving the request ch
   state.nextSequence = 17;
   state.previousRequestDigest = "digest_before_v3_migration_123456";
   state.cursors.codex.files.committed_marker = { lastSeenAt: 1 };
+  state.cursors.claude.seen.committed_marker = { hash: "d".repeat(64), lastSeenAt: 2 };
+  state.cursors.aggregate.providers.claude.through = "2026-07-19T02:00:00.000Z";
+  state.providerEvidenceHashes.claude = "legacy-claude-evidence";
   state.cursors.kimi.files.preserved_marker = { lastSeenAt: 2 };
   const batchId = "a".repeat(24);
   state.syncOutbox = {
@@ -1652,6 +1727,9 @@ test("sync discards only stale v3 remaining work while preserving the request ch
   assert.equal(updated.state.previousRequestDigest, "digest_before_v3_migration_123456");
   assert.deepEqual(updated.state.cursors.codex.files, {});
   assert.deepEqual(updated.state.cursors.codex.sessions, {});
+  assert.deepEqual(updated.state.cursors.claude, { accountingVersion: 4, seen: {} });
+  assert.equal(updated.state.cursors.aggregate.providers.claude.through, null);
+  assert.equal(updated.state.providerEvidenceHashes.claude, undefined);
   assert.deepEqual(updated.state.cursors.kimi.files.preserved_marker, { lastSeenAt: 2 });
   assert.equal(
     await fs.access(path.join(fixture.paths.syncPages, batchId)).then(() => true).catch(() => false),
@@ -1690,6 +1768,10 @@ test("sync replays one exact pending v3 request before retiring the old generati
   }), /could not be reached/);
   const stranded = await loadRuntime(fixture.paths);
   stranded.state.syncOutbox.version = 3;
+  stranded.state.syncOutbox.commit.nextCursors.claude = {
+    seen: { legacy_commit: { hash: "e".repeat(64), lastSeenAt: 3 } }
+  };
+  stranded.state.syncOutbox.commit.nextCursors.aggregate.providers.claude.through = "2026-07-19T03:00:00.000Z";
   await saveRuntime(fixture.paths, stranded);
 
   const retries = [];
@@ -1721,6 +1803,8 @@ test("sync replays one exact pending v3 request before retiring the old generati
   assert.equal(updated.state.nextSequence, 2);
   assert.equal(updated.state.previousRequestDigest, "digest_pending_v3_replay_1234567890");
   assert.deepEqual(updated.state.cursors.codex, { accountingVersion: 4, files: {}, sessions: {} });
+  assert.deepEqual(updated.state.cursors.claude, { accountingVersion: 4, seen: {} });
+  assert.equal(updated.state.cursors.aggregate.providers.claude.through, null);
   assert.match(await fs.readFile(fixture.paths.log, "utf8"), /replayed_pending_then_retired_v3_outbox/);
 });
 
@@ -2382,7 +2466,7 @@ test("scheduler mutation is preview-only until the exact confirmation flag", asy
   assert.match(commands[0].join(" "), /SetAccessRuleProtection/);
   assert.match(commands[0].join(" "), /Current-user-only ACL verification failed/);
   assert.equal(commands[1][0], "schtasks.exe");
-  assert.match(commands[1].join(" "), /versions[\\/]0\.1\.3[\\/]src[\\/]cli\.mjs/);
+  assert.match(commands[1].join(" "), /versions[\\/]0\.1\.4[\\/]src[\\/]cli\.mjs/);
   assert.match(commands[1].join(" "), /scheduled-run --home/);
   assert.equal(await fs.access(path.join(installed.installedRelease, "package.json")).then(() => true), true);
   assert.equal(await fs.access(path.join(installed.installedRelease, "RELEASING.md")).then(() => true), true);
@@ -2420,7 +2504,7 @@ test("Windows installation fails closed before copying or scheduling when ACL ha
   }), (error) => error.code === "WINDOWS_ACL_HARDENING_FAILED");
   assert.equal(commands.length, 1);
   assert.match(commands[0][0], /powershell\.exe$/i);
-  const installedPath = path.join(fixture.home, "versions", "0.1.3");
+  const installedPath = path.join(fixture.home, "versions", "0.1.4");
   assert.equal(await fs.access(installedPath).then(() => true).catch(() => false), false);
 });
 

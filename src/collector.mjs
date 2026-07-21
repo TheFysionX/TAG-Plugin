@@ -174,12 +174,13 @@ export async function collectUsage(options) {
         excludedEventIds: new Set(options.excludedEventIds || [])
       })
     : null;
-  const nextCursors = structuredClone(state.cursors || { codex: { accountingVersion: 4, files: {}, sessions: {} }, claude: { seen: {} }, kimi: { files: {} } });
+  const nextCursors = structuredClone(state.cursors || { codex: { accountingVersion: 4, files: {}, sessions: {} }, claude: { accountingVersion: 4, seen: {} }, kimi: { files: {} } });
   nextCursors.codex = nextCursors.codex || { accountingVersion: 4, files: {}, sessions: {} };
   nextCursors.codex.accountingVersion = 4;
   nextCursors.codex.files = nextCursors.codex.files || {};
   nextCursors.codex.sessions = nextCursors.codex.sessions || {};
-  nextCursors.claude = nextCursors.claude || { seen: {} };
+  nextCursors.claude = nextCursors.claude || { accountingVersion: 4, seen: {} };
+  nextCursors.claude.accountingVersion = 4;
   nextCursors.claude.seen = nextCursors.claude.seen || {};
   nextCursors.kimi = nextCursors.kimi || { files: {} };
   nextCursors.kimi.files = nextCursors.kimi.files || {};

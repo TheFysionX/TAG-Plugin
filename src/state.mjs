@@ -99,7 +99,7 @@ export function initialState() {
     providerEvidenceHashes: {},
     cursors: {
       codex: { accountingVersion: 4, files: {}, sessions: {} },
-      claude: { seen: {} },
+      claude: { accountingVersion: 4, seen: {} },
       kimi: { files: {} },
       aggregate: initialAggregateCursors()
     },
@@ -160,6 +160,21 @@ export async function loadRuntime(paths) {
     delete state.providerEvidenceHashes.codex;
   } else {
     state.cursors.codex.accountingVersion = 4;
+  }
+  if (state.cursors.claude.accountingVersion !== 4) {
+    // v4 separates explicit Claude speed evidence from routing/billing tiers.
+    // Recollect the corrected generation once so legacy v3 Standard projections
+    // cannot suppress the authoritative Fast/Standard replay.
+    state.cursors.claude = { accountingVersion: 4, seen: {} };
+    state.cursors.aggregate.providers.claude.through = null;
+    delete state.providerEvidenceHashes.claude;
+  } else {
+    state.cursors.claude.accountingVersion = 4;
+    state.cursors.claude.seen = state.cursors.claude.seen
+      && typeof state.cursors.claude.seen === "object"
+      && !Array.isArray(state.cursors.claude.seen)
+      ? state.cursors.claude.seen
+      : {};
   }
   config.transcriptFallbacks = {
     codex: Boolean(config.transcriptFallbacks?.codex),

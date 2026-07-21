@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { parseCodexRollout } from "../src/adapters/codex-rollout.mjs";
 import { parseClaudeProject } from "../src/adapters/claude-project.mjs";
 import { parseKimiWire } from "../src/adapters/kimi-wire.mjs";
-import { MAX_JOURNAL_LINE_BYTES } from "../src/adapters/shared.mjs";
+import { MAX_JOURNAL_LINE_BYTES, normalizeMode } from "../src/adapters/shared.mjs";
 import { canonicalModelId as resolveCanonicalModel } from "../src/model-registry.mjs";
 import { collectUsage, toWireEvent } from "../src/collector.mjs";
 
@@ -42,6 +42,83 @@ test("Codex fallback extracts only allowlisted final-turn usage", async () => {
   assert.equal(parsed.duplicateSnapshots, 1);
   assert.equal(parsed.cumulativeMismatches, 0);
   assert.doesNotMatch(serialized(parsed), /SECRET_|private|repository/i);
+});
+
+test("Codex treats both fast and priority service tiers as classified Fast", async (context) => {
+  assert.deepEqual(normalizeMode({ provider: "codex", serviceTier: " FAST " }), {
+    serviceTier: "fast",
+    speed: null,
+    fast: true,
+    classified: true
+  });
+  assert.deepEqual(normalizeMode({ provider: "codex", serviceTier: "priority" }), {
+    serviceTier: "priority",
+    speed: null,
+    fast: true,
+    classified: true
+  });
+  assert.deepEqual(normalizeMode({ provider: "codex", serviceTier: "standard" }), {
+    serviceTier: "standard",
+    speed: null,
+    fast: false,
+    classified: true
+  });
+  assert.equal(normalizeMode({ provider: "codex", serviceTier: "unknown-tier" }).classified, false);
+
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-codex-fast-tier-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "rollout-00000000-0000-4000-8000-0000000000f1.jsonl");
+  await fs.writeFile(activePath, [
+    {
+      timestamp: "2026-07-19T10:00:00.000Z",
+      type: "session_meta",
+      payload: { id: "00000000-0000-4000-8000-0000000000f1" }
+    },
+    {
+      timestamp: "2026-07-19T10:00:01.000Z",
+      type: "event_msg",
+      payload: {
+        type: "thread_settings_applied",
+        thread_settings: { model: "gpt-5.6-sol", service_tier: "fast" }
+      }
+    },
+    {
+      timestamp: "2026-07-19T10:00:02.000Z",
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: { total_tokens: 15 },
+          last_token_usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 }
+        }
+      }
+    },
+    {
+      timestamp: "2026-07-19T10:01:01.000Z",
+      type: "event_msg",
+      payload: {
+        type: "thread_settings_applied",
+        thread_settings: { model: "gpt-5.6-sol", service_tier: "priority" }
+      }
+    },
+    {
+      timestamp: "2026-07-19T10:01:02.000Z",
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: { total_tokens: 30 },
+          last_token_usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 }
+        }
+      }
+    }
+  ].map(JSON.stringify).join("\n") + "\n", "utf8");
+
+  const parsed = await parseCodexRollout(activePath, { dedupNamespaceKey });
+  assert.deepEqual(parsed.events.map((event) => event.mode.serviceTier), ["fast", "priority"]);
+  assert.ok(parsed.events.every((event) => event.mode.fast && event.mode.classified));
+  assert.deepEqual(parsed.events.map((event) => toWireEvent(event)?.serviceMode), ["fast", "fast"]);
+  assert.equal(parsed.unclassifiedModes, 0);
 });
 
 test("Codex lineage suppresses resumed, forked, and re-timestamped inherited usage", async (context) => {

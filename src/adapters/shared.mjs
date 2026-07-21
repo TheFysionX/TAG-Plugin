@@ -135,10 +135,10 @@ export function normalizeMode({ provider, serviceTier, speed } = {}) {
     : null;
   const fast = provider === "claude"
     ? safeSpeed === "fast"
-    : (safeServiceTier === "priority" || safeSpeed === "fast");
+    : (["fast", "priority"].includes(safeServiceTier) || safeSpeed === "fast");
   const classified = provider === "claude"
     ? ["fast", "standard"].includes(safeSpeed)
-    : (["priority", "default", "standard"].includes(safeServiceTier)
+    : (["fast", "priority", "default", "standard"].includes(safeServiceTier)
       || ["fast", "standard"].includes(safeSpeed));
   return {
     serviceTier: safeServiceTier,

@@ -6,14 +6,14 @@
     "repository": "https://github.com/TheFysionX/TAG-Plugin",
     "package": "@the-artificial-games/tag-plugin"
   },
-  "connectorVersion": "0.1.3",
+  "connectorVersion": "0.1.4",
   "runtime": {
     "name": "Node.js",
     "minimumMajor": 22,
     "thirdPartyDependencies": []
   },
   "releaseArtifact": {
-    "archiveName": "tag-plugin-0.1.3.tgz",
+    "archiveName": "tag-plugin-0.1.4.tgz",
     "includesSyntheticTestSuite": true,
     "testCommand": "npm test",
     "releaseContract": "require package @the-artificial-games/tag-plugin; reject -local; require tag v<package-version>; require package, runtime constant, and manifest versions to match; require archive tag-plugin-<package-version>.tgz",

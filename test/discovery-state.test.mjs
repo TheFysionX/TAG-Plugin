@@ -129,3 +129,34 @@ test("loading pre-v4 Codex accounting resets only Codex generation state", async
   assert.deepEqual(loaded.state.cursors.claude.seen.preserved, { hash: "b".repeat(64), lastSeenAt: 2 });
   assert.equal(loaded.state.providerEvidenceHashes.claude, "preserved-checkpoint");
 });
+
+test("loading pre-v4 Claude accounting resets only Claude generation state", async (context) => {
+  const home = await temporaryDirectory(context, "tag-plugin-claude-accounting-v4-");
+  const paths = runtimePaths({ home });
+  const state = initialState();
+  delete state.cursors.claude.accountingVersion;
+  state.cursors.claude.seen.legacy = { hash: "a".repeat(64), lastSeenAt: 1 };
+  state.cursors.codex.files.preserved = { offset: 123, lastSeenAt: 2 };
+  state.cursors.kimi.files.preserved = { offset: 456, lastSeenAt: 3 };
+  state.cursors.aggregate.providers.codex.through = "2026-07-19T01:00:00.000Z";
+  state.cursors.aggregate.providers.claude.through = "2026-07-19T02:00:00.000Z";
+  state.cursors.aggregate.providers.kimi.through = "2026-07-19T03:00:00.000Z";
+  state.providerEvidenceHashes = {
+    codex: "preserved-codex-checkpoint",
+    claude: "legacy-claude-checkpoint",
+    kimi: "preserved-kimi-checkpoint"
+  };
+  await saveRuntime(paths, { state, config: initialConfig() });
+
+  const loaded = await loadRuntime(paths);
+
+  assert.deepEqual(loaded.state.cursors.claude, { accountingVersion: 4, seen: {} });
+  assert.equal(loaded.state.cursors.aggregate.providers.claude.through, null);
+  assert.equal(loaded.state.providerEvidenceHashes.claude, undefined);
+  assert.deepEqual(loaded.state.cursors.codex.files.preserved, { offset: 123, lastSeenAt: 2 });
+  assert.deepEqual(loaded.state.cursors.kimi.files.preserved, { offset: 456, lastSeenAt: 3 });
+  assert.equal(loaded.state.cursors.aggregate.providers.codex.through, "2026-07-19T01:00:00.000Z");
+  assert.equal(loaded.state.cursors.aggregate.providers.kimi.through, "2026-07-19T03:00:00.000Z");
+  assert.equal(loaded.state.providerEvidenceHashes.codex, "preserved-codex-checkpoint");
+  assert.equal(loaded.state.providerEvidenceHashes.kimi, "preserved-kimi-checkpoint");
+});

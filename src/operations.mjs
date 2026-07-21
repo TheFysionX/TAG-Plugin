@@ -221,6 +221,19 @@ function resetCodexAccountingGeneration(state) {
   delete state.providerEvidenceHashes.codex;
 }
 
+function resetClaudeAccountingGeneration(state) {
+  state.cursors.claude = { accountingVersion: 4, seen: {} };
+  if (state.cursors.aggregate?.providers?.claude) {
+    state.cursors.aggregate.providers.claude.through = null;
+  }
+  delete state.providerEvidenceHashes.claude;
+}
+
+function resetCorrectedAccountingGenerations(state) {
+  resetCodexAccountingGeneration(state);
+  resetClaudeAccountingGeneration(state);
+}
+
 async function discardStaleAggregateV3Outbox(runtime, paths) {
   const outbox = runtime.state.syncOutbox;
   const migration = {
@@ -231,10 +244,11 @@ async function discardStaleAggregateV3Outbox(runtime, paths) {
   };
   // The request chain is independent from the local collection outbox. With no
   // pending request, removing only the stale v3 work preserves pairing,
-  // sequence, prior digest, and committed non-Codex cursors. Codex's accounting
-  // generation is reset deliberately so completed v3 files are recollected.
+  // sequence, prior digest, and committed Kimi cursors. Corrected Codex and
+  // Claude generations are reset deliberately so completed v3 work is
+  // recollected without allowing its cursors to suppress the v4 replay.
   runtime.state.syncOutbox = null;
-  resetCodexAccountingGeneration(runtime.state);
+  resetCorrectedAccountingGenerations(runtime.state);
   await saveRuntime(paths, runtime);
   if (migration.batchId) await cleanupSyncBatch(paths, migration.batchId);
   return migration;
@@ -1309,8 +1323,9 @@ export async function sync(options = {}) {
         discarded = await discardStaleAggregateV3Outbox(runtime, paths);
       } else if (!runtime.state.pendingRequest && !runtime.state.syncOutbox) {
         // The exact pending request was the final v3 chunk and finalized its old
-        // commit. Force the corrected Codex generation to rescan on the next run.
-        resetCodexAccountingGeneration(runtime.state);
+        // commit. Force both corrected generations to rescan on the next run;
+        // the legacy commit may otherwise restore pre-v4 Claude cursors.
+        resetCorrectedAccountingGenerations(runtime.state);
         await saveRuntime(paths, runtime);
       }
       await safeLog(paths.log, {
