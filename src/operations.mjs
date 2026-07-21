@@ -5,7 +5,9 @@ import { fileURLToPath } from "node:url";
 import {
   CLAUDE_ACCOUNTING_VERSION,
   CODEX_ACCOUNTING_VERSION,
+  CODEX_SNAPSHOT_STATE_VERSION,
   CONNECTOR_VERSION,
+  GENESIS_HASH,
   HEARTBEAT_EVERY_INGEST_REQUESTS,
   HISTORY_SETTLE_MINUTES,
   INGEST_CHUNK_PACE_MS,
@@ -36,6 +38,7 @@ import {
   loadPendingSecrets,
   loadRuntime,
   loadSecrets,
+  normalizeCodexCheckpointSnapshot,
   removePendingSecrets,
   saveRuntime,
   saveSecrets,
@@ -385,19 +388,31 @@ function normalizePairCode(value) {
   return /^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{8}$/.test(normalized) ? normalized : null;
 }
 
-function checkpointForBucket(bucket) {
+function checkpointPeriod(bucket) {
   const start = new Date(bucket.startDate + "T00:00:00.000Z");
-  if (!Number.isFinite(start.getTime())) {
+  if (!Number.isFinite(start.getTime()) || start.toISOString().slice(0, 10) !== bucket.startDate) {
     return null;
   }
   const end = new Date(start.getTime() + 24 * 60 * 60 * 1_000);
+  return {
+    usageDate: bucket.startDate,
+    periodStart: start.toISOString(),
+    periodEnd: end.toISOString(),
+    totalTokens: String(bucket.tokens)
+  };
+}
+
+function dailyCodexCheckpoint(period, generation) {
   const seed = {
     provider: "codex",
     source: "codex_app_server_account_usage",
     sourceScope: "codex_subscription_account",
-    periodStart: start.toISOString(),
-    periodEnd: end.toISOString(),
-    totalTokens: String(bucket.tokens)
+    periodStart: period.periodStart,
+    periodEnd: period.periodEnd,
+    totalTokens: period.totalTokens,
+    snapshotGenerationId: generation.generationId,
+    parentGenerationId: generation.parentGenerationId,
+    snapshotRole: "daily_delta"
   };
   return {
     checkpointId: sha256(JSON.stringify(seed)),
@@ -405,23 +420,26 @@ function checkpointForBucket(bucket) {
   };
 }
 
-function lifetimeCodexCheckpoint(codexEvidence, dailyCheckpoints) {
+function lifetimeCodexCheckpoint(codexEvidence, latestPeriod, generation, deltaCount) {
   const lifetimeTokens = codexEvidence?.summary?.lifetimeTokens;
-  if (!Number.isSafeInteger(lifetimeTokens) || lifetimeTokens < 0 || dailyCheckpoints.length === 0) {
+  if (!Number.isSafeInteger(lifetimeTokens) || lifetimeTokens < 0 || !latestPeriod) {
     return null;
   }
   // The source names the cumulative semantics. The period is the observation
   // day (not the lifetime coverage span), keeping the wire contract's bounded
   // checkpoint-period invariant while allowing latest-observation selection.
-  const latestObservation = [...dailyCheckpoints]
-    .sort((left, right) => right.periodStart.localeCompare(left.periodStart))[0];
   const seed = {
     provider: "codex",
     source: "codex_app_server_account_usage_lifetime",
     sourceScope: "codex_subscription_account",
-    periodStart: latestObservation.periodStart,
-    periodEnd: latestObservation.periodEnd,
-    totalTokens: String(lifetimeTokens)
+    periodStart: latestPeriod.periodStart,
+    periodEnd: latestPeriod.periodEnd,
+    totalTokens: String(lifetimeTokens),
+    snapshotGenerationId: generation.generationId,
+    parentGenerationId: generation.parentGenerationId,
+    snapshotRole: "commit",
+    snapshotDigest: generation.snapshotDigest,
+    deltaCount
   };
   return {
     checkpointId: sha256(JSON.stringify(seed)),
@@ -429,17 +447,64 @@ function lifetimeCodexCheckpoint(codexEvidence, dailyCheckpoints) {
   };
 }
 
-function codexCheckpoints(providerEvidence) {
+function codexCheckpointPlan(providerEvidence, committedSnapshot) {
   if (providerEvidence?.codex?.status !== "available" || !Array.isArray(providerEvidence.codex.dailyUsageBuckets)) {
-    return [];
+    return { checkpoints: [], nextSnapshot: null };
   }
-  const dailyCheckpoints = providerEvidence.codex.dailyUsageBuckets
-    .map(checkpointForBucket)
-    .filter(Boolean);
-  const lifetimeCheckpoint = lifetimeCodexCheckpoint(providerEvidence.codex, dailyCheckpoints);
-  // Daily observations are staged first. The lifetime authority is last and is
-  // therefore the snapshot commit marker for this signed request sequence.
-  return lifetimeCheckpoint ? [...dailyCheckpoints, lifetimeCheckpoint] : dailyCheckpoints;
+  const observedPeriods = [...new Map(providerEvidence.codex.dailyUsageBuckets
+    .map(checkpointPeriod)
+    .filter(Boolean)
+    .map((period) => [period.usageDate, period])).values()]
+    .sort((left, right) => left.periodStart.localeCompare(right.periodStart));
+  const lifetimeTokens = providerEvidence.codex.summary?.lifetimeTokens;
+  if (observedPeriods.length === 0 || !Number.isSafeInteger(lifetimeTokens) || lifetimeTokens < 0) {
+    return { checkpoints: [], nextSnapshot: null };
+  }
+  const previousDaily = committedSnapshot?.dailyValues || {};
+  const dailyValues = {
+    ...previousDaily,
+    ...Object.fromEntries(observedPeriods.map((period) => [period.usageDate, period.totalTokens]))
+  };
+  const canonicalDailyValues = Object.fromEntries(
+    Object.entries(dailyValues).sort(([left], [right]) => left.localeCompare(right))
+  );
+  const snapshotDigest = payloadHash({
+    provider: "codex",
+    sourceScope: "codex_subscription_account",
+    lifetimeTokens: String(lifetimeTokens),
+    dailyValues: canonicalDailyValues
+  });
+  if (committedSnapshot?.snapshotDigest === snapshotDigest) {
+    return { checkpoints: [], nextSnapshot: null };
+  }
+  const parentGenerationId = committedSnapshot?.generationId || GENESIS_HASH;
+  const generationId = sha256(parentGenerationId + "\0" + snapshotDigest);
+  const generation = { generationId, parentGenerationId, snapshotDigest };
+  const changedPeriods = observedPeriods
+    .filter((period) => previousDaily[period.usageDate] !== period.totalTokens)
+    .sort((left, right) => left.periodStart.localeCompare(right.periodStart));
+  const dailyCheckpoints = changedPeriods.map((period) => dailyCodexCheckpoint(period, generation));
+  const latestPeriod = [...observedPeriods]
+    .sort((left, right) => right.periodStart.localeCompare(left.periodStart))[0];
+  const lifetimeCheckpoint = lifetimeCodexCheckpoint(
+    providerEvidence.codex,
+    latestPeriod,
+    generation,
+    dailyCheckpoints.length
+  );
+  if (!lifetimeCheckpoint) return { checkpoints: [], nextSnapshot: null };
+  return {
+    // The final lifetime authority is the generation commit marker. Local
+    // snapshot state is staged with the outbox and cannot commit before it.
+    checkpoints: [...dailyCheckpoints, lifetimeCheckpoint],
+    nextSnapshot: {
+      version: CODEX_SNAPSHOT_STATE_VERSION,
+      generationId,
+      snapshotDigest,
+      lifetimeTokens: String(lifetimeTokens),
+      dailyValues: canonicalDailyValues
+    }
+  };
 }
 
 function acceptedRequestDigest(response) {
@@ -455,21 +520,138 @@ function applyAcceptedRequest(state, response) {
   state.nextSequence += 1;
 }
 
-function rawOnlyResponseFailure(chunk, response) {
-  const rawOnlyEvents = chunk.events.filter((event) => event.attribution === "raw_only");
-  if (rawOnlyEvents.length === 0) return null;
-  const results = new Map((Array.isArray(response.events) ? response.events : [])
-    .filter((event) => typeof event?.eventId === "string")
-    .map((event) => [event.eventId, event]));
-  const unconfirmed = rawOnlyEvents.filter((event) => {
-    const result = results.get(event.eventId);
-    // Status and scoring state are informational: accepted, quarantined,
-    // duplicate, or even an older superseded revision may all coexist with an
-    // active Raw projection. Only this backend-computed invariant authorizes a
-    // source-cursor commit.
-    return result?.rawPreserved !== true;
+function remoteCodexCheckpointSnapshot(response, localSnapshot) {
+  const providerSnapshots = response?.providerSnapshots;
+  if (!providerSnapshots
+    || typeof providerSnapshots !== "object"
+    || Array.isArray(providerSnapshots)
+    || !Object.hasOwn(providerSnapshots, "codex")) {
+    throw new ConnectorError(
+      "INVALID_SERVER_SNAPSHOT_STATUS",
+      "The server did not return an authoritative Codex checkpoint snapshot status."
+    );
+  }
+  if (providerSnapshots.codex === null) {
+    return normalizeCodexCheckpointSnapshot(null);
+  }
+  const value = providerSnapshots.codex;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ConnectorError(
+      "INVALID_SERVER_SNAPSHOT_STATUS",
+      "The server returned an invalid Codex checkpoint snapshot status."
+    );
+  }
+  if (value.status === "current") {
+    if (localSnapshot?.generationId === null
+      || value.generationId !== localSnapshot?.generationId
+      || value.snapshotDigest !== localSnapshot?.snapshotDigest) {
+      throw new ConnectorError(
+        "INVALID_SERVER_SNAPSHOT_STATUS",
+        "The server returned a compact Codex snapshot acknowledgement that does not match local state."
+      );
+    }
+    return localSnapshot;
+  }
+  if (value.status !== undefined && value.status !== "snapshot") {
+    throw new ConnectorError(
+      "INVALID_SERVER_SNAPSHOT_STATUS",
+      "The server returned an unknown Codex checkpoint snapshot status."
+    );
+  }
+  const normalized = normalizeCodexCheckpointSnapshot({
+    version: CODEX_SNAPSHOT_STATE_VERSION,
+    generationId: value.generationId,
+    snapshotDigest: value.snapshotDigest,
+    lifetimeTokens: value.lifetimeTokens,
+    dailyValues: value.dailyValues
   });
-  return unconfirmed.length > 0 ? unconfirmed.length : null;
+  if (normalized.generationId === null) {
+    throw new ConnectorError(
+      "INVALID_SERVER_SNAPSHOT_STATUS",
+      "The server returned a Codex checkpoint snapshot that failed integrity validation."
+    );
+  }
+  return normalized;
+}
+
+function eventResponseFailure(chunk, response) {
+  if (chunk.events.length === 0) return null;
+  const results = new Map();
+  for (const result of Array.isArray(response.events) ? response.events : []) {
+    if (typeof result?.eventId !== "string") continue;
+    const matches = results.get(result.eventId) || [];
+    matches.push(result);
+    results.set(result.eventId, matches);
+  }
+  let unacknowledged = 0;
+  let rawOnlyUnpreserved = 0;
+  for (const event of chunk.events) {
+    const matches = results.get(event.eventId) || [];
+    const result = matches.length === 1 ? matches[0] : null;
+    // The backend must explicitly attest either that this submitted logical
+    // event's exact revision is active, or that its exact observation is the
+    // canonical content duplicate under another logical event. Status/count
+    // fields alone never authorize a source-cursor commit.
+    if (result?.submittedRevisionActive !== true
+      && result?.submittedObservationCanonical !== true) {
+      unacknowledged += 1;
+    }
+    if (event.attribution === "raw_only" && result?.rawPreserved !== true) {
+      rawOnlyUnpreserved += 1;
+    }
+  }
+  if (unacknowledged > 0) {
+    return { code: "EVENT_ACKNOWLEDGEMENT_REJECTED", eventCount: unacknowledged };
+  }
+  if (rawOnlyUnpreserved > 0) {
+    return { code: "RAW_ONLY_CONTRACT_REJECTED", eventCount: rawOnlyUnpreserved };
+  }
+  return null;
+}
+
+function checkpointResponseFailure(chunk, response) {
+  if (chunk.checkpoints.length === 0) return null;
+  const results = new Map();
+  for (const result of Array.isArray(response.checkpoints) ? response.checkpoints : []) {
+    if (typeof result?.checkpointId !== "string") continue;
+    const matches = results.get(result.checkpointId) || [];
+    matches.push(result);
+    results.set(result.checkpointId, matches);
+  }
+  let unacknowledged = 0;
+  let inactiveCommits = 0;
+  let staleParentCommits = 0;
+  for (const checkpoint of chunk.checkpoints) {
+    const matches = results.get(checkpoint.checkpointId) || [];
+    const result = matches.length === 1 ? matches[0] : null;
+    // A 2xx response is only request-chain acceptance. Cursor/snapshot state
+    // can advance solely after the backend proves the exact submitted
+    // checkpoint digest is canonical. Duplicate response rows are ambiguous
+    // and therefore fail closed just like a missing row.
+    if (result?.submittedCheckpointCanonical !== true) {
+      unacknowledged += 1;
+      continue;
+    }
+    // Daily deltas are immutable staged evidence. A commit marker additionally
+    // has to be the currently active generation after this request. An exact
+    // but stale/superseded duplicate must never commit local generation state.
+    if (checkpoint.snapshotRole === "commit"
+      && result?.submittedGenerationActive !== true) {
+      inactiveCommits += 1;
+      if (result?.activationReason === "stale_parent") staleParentCommits += 1;
+    }
+  }
+  if (unacknowledged > 0) {
+    return { code: "CHECKPOINT_ACKNOWLEDGEMENT_REJECTED", itemCount: unacknowledged };
+  }
+  if (inactiveCommits > 0) {
+    return {
+      code: "CHECKPOINT_GENERATION_NOT_ACTIVE",
+      itemCount: inactiveCommits,
+      recoverableStaleParent: staleParentCommits === inactiveCommits
+    };
+  }
+  return null;
 }
 
 function isWireEvent(event) {
@@ -718,8 +900,11 @@ async function advanceCompletedOutbox(runtime, paths) {
   }
   const cleanupBatchId = isPagedSyncOutbox(outbox) ? outbox.batchId : null;
   runtime.state.cursors = outbox.commit.nextCursors;
-  if (outbox.commit.checkpointHash) {
-    runtime.state.providerEvidenceHashes.codex = outbox.commit.checkpointHash;
+  if (outbox.commit.codexCheckpointSnapshot) {
+    runtime.state.codexCheckpointSnapshot = outbox.commit.codexCheckpointSnapshot;
+    // Retire the v0.1.6 all-checkpoint hash only after the first coherent
+    // generation commits. It cannot safely stand in for generation state.
+    delete runtime.state.providerEvidenceHashes.codex;
   }
   runtime.state.unresolvedEvents = Array.isArray(outbox.commit.nextUnresolvedEvents)
     ? outbox.commit.nextUnresolvedEvents
@@ -755,12 +940,34 @@ async function finalizePending(runtime, response, paths) {
   if (pending.sequence !== runtime.state.nextSequence) {
     throw new ConnectorError("PENDING_SEQUENCE_MISMATCH", "The pending request does not match the local request sequence.");
   }
-  applyAcceptedRequest(runtime.state, response);
+  const hydratedCodexSnapshot = pending.kind === "heartbeat" && pending.commit?.hydrateCodexSnapshot === true
+    ? remoteCodexCheckpointSnapshot(response, runtime.state.codexCheckpointSnapshot)
+    : null;
+  let syncOutbox = null;
+  let activeChunk = null;
+  let responseFailure = null;
+  let staleParentSnapshot = null;
   if (pending.kind === "sync") {
-    const outbox = runtime.state.syncOutbox;
-    if (!outbox || outbox.index >= outbox.chunks.length) {
+    syncOutbox = runtime.state.syncOutbox;
+    if (!syncOutbox || syncOutbox.index >= syncOutbox.chunks.length) {
       throw new ConnectorError("MISSING_SYNC_OUTBOX", "The pending sync request has no matching local outbox.");
     }
+    activeChunk = syncOutbox.chunks[syncOutbox.index];
+    responseFailure = eventResponseFailure(activeChunk, response)
+      || checkpointResponseFailure(activeChunk, response);
+    if (responseFailure?.recoverableStaleParent) {
+      staleParentSnapshot = remoteCodexCheckpointSnapshot(response, runtime.state.codexCheckpointSnapshot);
+      if (staleParentSnapshot.generationId === null) {
+        throw new ConnectorError(
+          "INVALID_SERVER_SNAPSHOT_STATUS",
+          "A stale-parent response did not include the active Codex generation."
+        );
+      }
+    }
+  }
+  applyAcceptedRequest(runtime.state, response);
+  if (pending.kind === "sync") {
+    const outbox = syncOutbox;
     const rejected = Number.isSafeInteger(response.rejected) ? response.rejected : 0;
     const rejectedIds = Array.isArray(response.events)
       ? response.events
@@ -771,15 +978,34 @@ async function finalizePending(runtime, response, paths) {
     outbox.accepted += Number.isSafeInteger(response.accepted) ? response.accepted : 0;
     outbox.duplicates += Number.isSafeInteger(response.duplicates) ? response.duplicates : 0;
     outbox.rejected += rejected;
-    const rawOnlyFailureCount = rawOnlyResponseFailure(outbox.chunks[outbox.index], response);
-    if (rawOnlyFailureCount !== null) {
-      // The signed request sequence was accepted, but the raw-only record was
-      // not. Preserve the entire active chunk and staged cursors so a repaired
-      // connector/backend can resend the same stable event ID on a new sequence.
+    if (responseFailure) {
+      if (responseFailure.recoverableStaleParent) {
+        // The backend accepted this signed request but another device won the
+        // lineage race. Hydrate the winner and retire only this checkpoint
+        // generation. The same durable outbox and page files continue draining
+        // all already-collected events before their source cursors commit.
+        // Account evidence is queried independently on the next sync, where a
+        // fresh generation will extend this hydrated parent.
+        outbox.generationRebased = true;
+        outbox.commit.codexCheckpointSnapshot = null;
+        runtime.state.codexCheckpointSnapshot = staleParentSnapshot;
+        delete runtime.state.providerEvidenceHashes.codex;
+        outbox.processedCheckpoints = (outbox.processedCheckpoints || 0) + activeChunk.checkpoints.length;
+        outbox.processedChunks = (outbox.processedChunks || 0) + 1;
+        outbox.index += 1;
+        const cleanupBatchId = await advanceCompletedOutbox(runtime, paths);
+        runtime.state.pendingRequest = null;
+        return { pending, cleanupBatchId, blocked: false, generationRebased: true };
+      }
+      // The signed request sequence was accepted, but the backend did not prove
+      // that every submitted observation is canonical. Preserve the entire
+      // active chunk and all staged cursors rather than silently losing usage.
       outbox.permanentFailure = {
-        code: "RAW_ONLY_CONTRACT_REJECTED",
+        code: responseFailure.code,
         status: null,
-        rawOnlyEventCount: rawOnlyFailureCount
+        ...(responseFailure.eventCount === undefined
+          ? { itemCount: responseFailure.itemCount }
+          : { eventCount: responseFailure.eventCount })
       };
       runtime.state.pendingRequest = null;
       return { pending, cleanupBatchId: null, blocked: true };
@@ -795,6 +1021,12 @@ async function finalizePending(runtime, response, paths) {
     return { pending, cleanupBatchId };
   } else if (pending.kind === "heartbeat") {
     runtime.state.lastHeartbeatAt = pending.commit.observedAt;
+    if (pending.commit?.hydrateCodexSnapshot === true) {
+      runtime.state.codexCheckpointSnapshot = hydratedCodexSnapshot;
+      if (hydratedCodexSnapshot.generationId !== null) {
+        delete runtime.state.providerEvidenceHashes.codex;
+      }
+    }
   }
   runtime.state.pendingRequest = null;
   return { pending, cleanupBatchId: null };
@@ -819,13 +1051,21 @@ async function replayPending(runtime, secrets, paths, options) {
     await markPendingPermanentFailure(runtime, paths, error);
     throw error;
   }
-  const finalized = await finalizePending(runtime, response, paths);
+  let finalized;
+  try {
+    finalized = await finalizePending(runtime, response, paths);
+  } catch (error) {
+    await markPendingPermanentFailure(runtime, paths, error);
+    throw error;
+  }
   const committed = finalized.pending;
   await saveFinalizedRuntime(paths, runtime, finalized.cleanupBatchId);
   if (finalized.blocked) {
+    const failureCode = runtime.state.syncOutbox?.permanentFailure?.code
+      || "EVENT_ACKNOWLEDGEMENT_REJECTED";
     throw new ConnectorError(
-      "RAW_ONLY_CONTRACT_REJECTED",
-      "The server did not preserve a raw-only usage event; its source cursor remains uncommitted.",
+      failureCode,
+      "The server did not acknowledge every submitted usage revision; its source cursor remains uncommitted.",
       { retryable: false }
     );
   }
@@ -904,14 +1144,31 @@ async function sendHeartbeatRequest(runtime, secrets, paths, options) {
     observedAt,
     status: runtime.state.paused ? "paused" : (degraded ? "degraded" : "healthy"),
     connectorVersion: CONNECTOR_VERSION,
-    previousRequestDigest: runtime.state.previousRequestDigest
+    previousRequestDigest: runtime.state.previousRequestDigest,
+    ...((options.hydrateCodexSnapshot === true
+      || ((runtime.config.allowedPlatforms || []).includes("codex")
+        && (runtime.config.supportedProviders || []).includes("codex")))
+      ? {
+          providerSnapshotHeads: {
+            codex: runtime.state.codexCheckpointSnapshot.generationId === null
+              ? null
+              : {
+                  generationId: runtime.state.codexCheckpointSnapshot.generationId,
+                  snapshotDigest: runtime.state.codexCheckpointSnapshot.snapshotDigest
+                }
+          }
+        }
+      : {})
   };
   runtime.state.pendingRequest = pendingRequest(
     "heartbeat",
     "/api/connectors/v1/heartbeat",
     sequence,
     body,
-    { observedAt }
+    {
+      observedAt,
+      ...(options.hydrateCodexSnapshot === true ? { hydrateCodexSnapshot: true } : {})
+    }
   );
   await saveRuntime(paths, runtime);
   let response;
@@ -925,14 +1182,22 @@ async function sendHeartbeatRequest(runtime, secrets, paths, options) {
     await markPendingPermanentFailure(runtime, paths, error);
     throw error;
   }
-  await finalizePending(runtime, response, paths);
+  try {
+    await finalizePending(runtime, response, paths);
+  } catch (error) {
+    await markPendingPermanentFailure(runtime, paths, error);
+    throw error;
+  }
   await saveRuntime(paths, runtime);
   await safeLog(paths.log, { action: "heartbeat", status: "success", sequence });
   return {
     sent: true,
     sequence,
     nextExpectedAt: response?.heartbeat?.nextExpectedAt || null,
-    continuityState: response?.device?.continuityState || null
+    continuityState: response?.device?.continuityState || null,
+    ...(options.hydrateCodexSnapshot === true
+      ? { codexSnapshotHydrated: true }
+      : {})
   };
 }
 
@@ -998,31 +1263,23 @@ async function handlePermanentSyncError(runtime, paths, error) {
   }
   const chunk = outbox.chunks[outbox.index];
   const split = bisectChunk(chunk);
-  if (!split && chunk.events.some((event) => event.attribution === "raw_only")) {
-    // Raw-only records are the sole lossless representation of unattributed
-    // usage. Never quarantine one and advance its source cursor merely because
-    // a server has not implemented the raw-only union correctly.
-    pending.permanentFailure = { code: "RAW_ONLY_CONTRACT_REJECTED", status: error.status };
+  if (!split) {
+    // An isolated item rejected before an exact backend acknowledgement cannot
+    // be skipped. Advancing the cursor would turn a payload/contract defect
+    // into silent data loss (including for attributed usage and checkpoints).
+    pending.permanentFailure = {
+      code: chunk.events.some((event) => event.attribution === "raw_only")
+        ? "RAW_ONLY_CONTRACT_REJECTED"
+        : "SYNC_ITEM_UNACKNOWLEDGED",
+      status: error.status
+    };
     await saveRuntime(paths, runtime);
     return false;
   }
   runtime.state.pendingRequest = null;
-  let cleanupBatchId = null;
-  if (split) {
-    outbox.chunks.splice(outbox.index, 1, ...split);
-    outbox.totalChunks = (outbox.totalChunks || outbox.chunks.length - 1) + 1;
-  } else {
-    outbox.rejected += chunk.events.length + chunk.checkpoints.length;
-    const rejectedIds = chunk.events.map((event) => event.eventId);
-    outbox.quarantinedEventIds = [...outbox.quarantinedEventIds, ...rejectedIds].slice(-2_000);
-    outbox.quarantinedCount = (outbox.quarantinedCount || 0) + rejectedIds.length;
-    outbox.processedEvents = (outbox.processedEvents || 0) + chunk.events.length;
-    outbox.processedCheckpoints = (outbox.processedCheckpoints || 0) + chunk.checkpoints.length;
-    outbox.processedChunks = (outbox.processedChunks || 0) + 1;
-    outbox.index += 1;
-    cleanupBatchId = await advanceCompletedOutbox(runtime, paths);
-  }
-  await saveFinalizedRuntime(paths, runtime, cleanupBatchId);
+  outbox.chunks.splice(outbox.index, 1, ...split);
+  outbox.totalChunks = (outbox.totalChunks || outbox.chunks.length - 1) + 1;
+  await saveRuntime(paths, runtime);
   return true;
 }
 
@@ -1128,7 +1385,13 @@ async function processSyncOutbox(runtime, secrets, paths, options) {
       }
       throw error;
     }
-    const finalized = await finalizePending(runtime, response, paths);
+    let finalized;
+    try {
+      finalized = await finalizePending(runtime, response, paths);
+    } catch (error) {
+      await markPendingPermanentFailure(runtime, paths, error);
+      throw error;
+    }
     await saveFinalizedRuntime(paths, runtime, finalized.cleanupBatchId);
     if (finalized.blocked) {
       assertSyncOutboxCanProceed(runtime.state.syncOutbox);
@@ -1138,7 +1401,10 @@ async function processSyncOutbox(runtime, secrets, paths, options) {
   const sent = (initial.processedEvents || 0) - initialProcessedEvents;
   const checkpoints = (initial.processedCheckpoints || 0) - initialProcessedCheckpoints;
   const chunksProcessed = (initial.processedChunks || 0) - initialProcessedChunks;
-  const catchingUp = Boolean(runtime.state.syncOutbox) || Boolean(initial.commit.collectionPending);
+  const generationRebased = initial.generationRebased === true;
+  const catchingUp = generationRebased
+    || Boolean(runtime.state.syncOutbox)
+    || Boolean(initial.commit.collectionPending);
   await safeLog(paths.log, {
     action: "sync",
     status: catchingUp ? "catching_up" : (initial.rejected > 0 ? "partial" : "success"),
@@ -1162,6 +1428,7 @@ async function processSyncOutbox(runtime, secrets, paths, options) {
     chunksProcessed,
     ingestRequests,
     interleavedHeartbeats,
+    generationRebased,
     catchingUp,
     remainingChunks: remainingSyncChunks(runtime.state.syncOutbox),
     nextSequence: runtime.state.nextSequence,
@@ -1657,12 +1924,24 @@ export async function sync(options = {}) {
     });
     const withheld = collection.events.length - currentWireEvents.length;
     const unknownModels = [];
-    const checkpoints = allowedProviderSet.has("codex") && supportedProviderSet.has("codex")
-      ? codexCheckpoints(collection.providerEvidence)
-      : [];
-    const checkpointHash = checkpoints.length > 0 ? payloadHash(checkpoints) : null;
-    const checkpointsChanged = Boolean(checkpointHash && runtime.state.providerEvidenceHashes.codex !== checkpointHash);
-    const checkpointsToSend = checkpointsChanged ? checkpoints : [];
+    const codexCheckpointEligible = allowedProviderSet.has("codex")
+      && supportedProviderSet.has("codex")
+      && collection.providerEvidence?.codex?.status === "available"
+      && Array.isArray(collection.providerEvidence.codex.dailyUsageBuckets);
+    if (codexCheckpointEligible) {
+      // Checkpoint generations form one account lineage shared by every paired
+      // device. Hydrate the signed server head immediately before planning so
+      // a second device or a reinstalled connector extends the active parent
+      // instead of producing a blind GENESIS or sibling generation.
+      await sendHeartbeatRequest(runtime, secrets, paths, {
+        ...options,
+        hydrateCodexSnapshot: true
+      });
+    }
+    const checkpointPlan = allowedProviderSet.has("codex") && supportedProviderSet.has("codex")
+      ? codexCheckpointPlan(collection.providerEvidence, runtime.state.codexCheckpointSnapshot)
+      : { checkpoints: [], nextSnapshot: null };
+    const checkpointsToSend = checkpointPlan.checkpoints;
 
     if (events.length === 0 && checkpointsToSend.length === 0) {
       runtime.state.cursors = collection.nextCursors;
@@ -1701,7 +1980,7 @@ export async function sync(options = {}) {
       checkpointsToSend,
       {
         nextCursors: collection.nextCursors,
-        checkpointHash,
+        codexCheckpointSnapshot: checkpointPlan.nextSnapshot,
         scannedAt,
         scanSummary,
         withheld,

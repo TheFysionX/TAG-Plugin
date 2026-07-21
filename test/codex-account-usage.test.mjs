@@ -57,7 +57,10 @@ test("Codex app-server adapter uses initialize then account/usage/read", async (
             id: 1,
             result: {
               summary: { lifetimeTokens: 900, peakDailyTokens: 500, currentStreakDays: 2 },
-              dailyUsageBuckets: [{ startDate: "2026-07-19", tokens: 500 }]
+              dailyUsageBuckets: [
+                { startDate: "2026-02-31", tokens: 400 },
+                { startDate: "2026-07-19", tokens: 500 }
+              ]
             }
           }) + "\n"));
         }
@@ -68,5 +71,6 @@ test("Codex app-server adapter uses initialize then account/usage/read", async (
   const result = await readCodexAccountUsage({ spawnImpl, timeoutMs: 500 });
   assert.equal(result.status, "available");
   assert.equal(result.summary.lifetimeTokens, 900);
+  assert.deepEqual(result.dailyUsageBuckets, [{ startDate: "2026-07-19", tokens: 500 }]);
   assert.deepEqual(requests.map((request) => request.method), ["initialize", "initialized", "account/usage/read"]);
 });

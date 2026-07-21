@@ -5,6 +5,7 @@ import {
   AGGREGATE_CURSOR_VERSION,
   CLAUDE_ACCOUNTING_VERSION,
   CODEX_ACCOUNTING_VERSION,
+  CODEX_SNAPSHOT_STATE_VERSION,
   DEFAULT_LOCK_STALE_MS,
   KIMI_ACCOUNTING_VERSION,
   MAX_CODEX_LOGICAL_SESSIONS,
@@ -13,6 +14,7 @@ import {
   SCHEMA_VERSION
 } from "./constants.mjs";
 import { ConnectorError } from "./errors.mjs";
+import { payloadHash } from "./crypto.mjs";
 
 const UNRESOLVED_EVENT_KEYS = new Set([
   "eventId",
@@ -29,6 +31,12 @@ const UNRESOLVED_EVENT_KEYS = new Set([
 const SOURCE_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,119}$/;
 const TOKEN_COUNT_PATTERN = /^\d{1,30}$/;
 const AGGREGATE_PROVIDERS = ["codex", "claude", "kimi"];
+
+function isCanonicalUtcDate(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value || "")) return false;
+  const parsed = new Date(value + "T00:00:00.000Z");
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
 const ROOT_ATOMIC_JSON_TEMP_PATTERN = /^\.(config\.json|state\.json|device-secrets\.json|pending-device-secrets\.json)\.([1-9]\d*)\.([a-f0-9]{12})\.tmp$/;
 const SYNC_BATCH_DIRECTORY_PATTERN = /^[a-f0-9]{24}$/;
 const SYNC_PAGE_ATOMIC_JSON_TEMP_PATTERN = /^\.(\d{6,})\.json\.([1-9]\d*)\.([a-f0-9]{12})\.tmp$/;
@@ -252,6 +260,54 @@ function normalizedAggregateCursors(value) {
   };
 }
 
+function initialCodexSnapshot() {
+  return {
+    version: CODEX_SNAPSHOT_STATE_VERSION,
+    generationId: null,
+    snapshotDigest: null,
+    lifetimeTokens: null,
+    dailyValues: {}
+  };
+}
+
+export function normalizeCodexCheckpointSnapshot(value) {
+  if (value?.version !== CODEX_SNAPSHOT_STATE_VERSION
+    || !value.dailyValues
+    || typeof value.dailyValues !== "object"
+    || Array.isArray(value.dailyValues)) {
+    return initialCodexSnapshot();
+  }
+  const entries = Object.entries(value.dailyValues);
+  const empty = value.generationId === null
+    && value.snapshotDigest === null
+    && value.lifetimeTokens === null
+    && entries.length === 0;
+  if (empty) return initialCodexSnapshot();
+  if (!/^[a-f0-9]{64}$/.test(value.generationId || "")
+    || !/^[a-f0-9]{64}$/.test(value.snapshotDigest || "")
+    || !TOKEN_COUNT_PATTERN.test(value.lifetimeTokens || "")
+    || !entries.every(([usageDate, tokens]) => isCanonicalUtcDate(usageDate)
+      && typeof tokens === "string"
+      && TOKEN_COUNT_PATTERN.test(tokens))) {
+    return initialCodexSnapshot();
+  }
+  const dailyValues = Object.fromEntries(entries.sort(([left], [right]) => left.localeCompare(right)));
+  const expectedDigest = payloadHash({
+    provider: "codex",
+    sourceScope: "codex_subscription_account",
+    lifetimeTokens: value.lifetimeTokens,
+    dailyValues
+  });
+  if (value.snapshotDigest !== expectedDigest) return initialCodexSnapshot();
+  return {
+    version: CODEX_SNAPSHOT_STATE_VERSION,
+    generationId: value.generationId,
+    snapshotDigest: value.snapshotDigest,
+    lifetimeTokens: value.lifetimeTokens,
+    dailyValues
+  };
+}
+
 function normalizedCodexSessions(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   return Object.fromEntries(Object.entries(value)
@@ -307,6 +363,7 @@ export function initialState() {
     unresolvedOverflow: { totalDropped: 0, lastOverflowAt: null },
     rawOnlyBackfill: { version: 1, pendingProviders: [], partialCoverage: {}, completedAt: null },
     providerEvidenceHashes: {},
+    codexCheckpointSnapshot: initialCodexSnapshot(),
     cursors: {
       codex: { accountingVersion: CODEX_ACCOUNTING_VERSION, files: {}, sessions: {} },
       claude: { accountingVersion: CLAUDE_ACCOUNTING_VERSION, seen: {} },
@@ -356,6 +413,7 @@ export async function loadRuntime(paths) {
     || state.cursors.kimi?.accountingVersion !== KIMI_ACCOUNTING_VERSION
     || state.cursors.aggregate?.version !== AGGREGATE_CURSOR_VERSION;
   state.providerEvidenceHashes = state.providerEvidenceHashes || {};
+  state.codexCheckpointSnapshot = normalizeCodexCheckpointSnapshot(state.codexCheckpointSnapshot);
   state.cursors.codex = state.cursors.codex || { accountingVersion: CODEX_ACCOUNTING_VERSION, files: {}, sessions: {} };
   state.cursors.codex.files = state.cursors.codex.files
     && typeof state.cursors.codex.files === "object"

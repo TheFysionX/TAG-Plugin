@@ -4,8 +4,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { parseKimiWire } from "../src/adapters/kimi-wire.mjs";
-import { collectUsage } from "../src/collector.mjs";
-import { sha256 } from "../src/crypto.mjs";
+import { collectUsage, toWireEvent } from "../src/collector.mjs";
+import { payloadHash, sha256 } from "../src/crypto.mjs";
 
 const localAliasKey = Buffer.alloc(32, 7).toString("base64");
 const firstDedupNamespaceKey = Buffer.alloc(32, 9).toString("base64url");
@@ -45,7 +45,7 @@ function usageRecord(recordId, time, multiplier) {
   };
 }
 
-test("unchanged Kimi aggregate v3 identity stays stable across partial replay and resolver drift", async (context) => {
+test("unchanged Kimi aggregate v3 identity stays stable across accounting metadata, partial replay, and classification drift", async (context) => {
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-aggregate-v3-id-test-"));
   context.after(() => fs.rm(temporary, { recursive: true, force: true }));
 
@@ -70,12 +70,15 @@ test("unchanged Kimi aggregate v3 identity stays stable across partial replay an
 
   async function collect(records, {
     dedupNamespaceKey = firstDedupNamespaceKey,
-    resolvedModel = "kimi-k2.7-code"
+    resolvedModel = "kimi-k2.7-code",
+    accountingVersion = 2
   } = {}) {
     await fs.writeFile(journalPath, records.map(JSON.stringify).join("\n") + "\n", "utf8");
+    const state = freshState();
+    state.cursors.kimi.accountingVersion = accountingVersion;
     return collectUsage({
       roots,
-      state: freshState(),
+      state,
       secrets: { localAliasKey },
       dedupNamespaceKey,
       enabledFallbacks: { codex: false, claude: false, kimi: true },
@@ -88,8 +91,12 @@ test("unchanged Kimi aggregate v3 identity stays stable across partial replay an
 
   const baseline = await collect([sourceA, sourceB]);
   const partialReplay = await collect([sourceA, sourceB, sourceC]);
+  const accountingMetadataDrift = await collect([sourceA, sourceB], { accountingVersion: 1 });
   const resolverDrift = await collect([sourceA, sourceB], {
     resolvedModel: "kimi-k2.7-code-next"
+  });
+  const rawClassification = await collect([sourceA, sourceB], {
+    resolvedModel: null
   });
   const otherAccount = await collect([sourceA, sourceB], {
     dedupNamespaceKey: secondDedupNamespaceKey
@@ -97,22 +104,40 @@ test("unchanged Kimi aggregate v3 identity stays stable across partial replay an
 
   assert.equal(baseline.events.length, 1);
   assert.equal(partialReplay.events.length, 1);
+  assert.equal(accountingMetadataDrift.events.length, 1);
   assert.equal(resolverDrift.events.length, 1);
+  assert.equal(rawClassification.events.length, 1);
   assert.equal(otherAccount.events.length, 1);
 
   const [baselineAggregate] = baseline.events;
   const [partialReplayAggregate] = partialReplay.events;
+  const [accountingMetadataDriftAggregate] = accountingMetadataDrift.events;
   const [resolverDriftAggregate] = resolverDrift.events;
+  const [rawClassificationAggregate] = rawClassification.events;
   const [otherAccountAggregate] = otherAccount.events;
 
   assert.equal(baselineAggregate.provenance.collector, "session_hour_usage_aggregate_v3");
   assert.equal(baselineAggregate.usage.total, 60);
   assert.equal(partialReplayAggregate.usage.total, 120);
   assert.equal(partialReplayAggregate.eventId, baselineAggregate.eventId);
+  assert.equal(accountingMetadataDriftAggregate.eventId, baselineAggregate.eventId);
+  assert.notEqual(
+    payloadHash(toWireEvent(partialReplayAggregate)),
+    payloadHash(toWireEvent(baselineAggregate))
+  );
 
   assert.equal(resolverDriftAggregate.modelId, "kimi-k2.7-code-next");
   assert.equal(resolverDriftAggregate.usage.total, baselineAggregate.usage.total);
   assert.equal(resolverDriftAggregate.eventId, baselineAggregate.eventId);
+
+  assert.equal(rawClassificationAggregate.modelId, null);
+  assert.equal(rawClassificationAggregate.eventId, baselineAggregate.eventId);
+  assert.equal(toWireEvent(rawClassificationAggregate).attribution, "raw_only");
+  assert.equal(toWireEvent(baselineAggregate).attribution, undefined);
+  assert.notEqual(
+    payloadHash(toWireEvent(rawClassificationAggregate)),
+    payloadHash(toWireEvent(baselineAggregate))
+  );
 
   assert.notEqual(otherAccountAggregate.eventId, baselineAggregate.eventId);
 

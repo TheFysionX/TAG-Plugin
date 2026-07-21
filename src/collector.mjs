@@ -16,6 +16,12 @@ import { parseKimiWire } from "./adapters/kimi-wire.mjs";
 
 const AGGREGATE_USAGE_FIELDS = ["input", "cachedInput", "cacheWriteInput", "output", "reasoningOutput"];
 const WIRE_RAW_USAGE_FIELDS = ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens"];
+const LOGICAL_AGGREGATE_IDENTITY_SCHEMA = Object.freeze({
+  codex: "session-hour-aggregate-v4",
+  claude: "session-hour-aggregate-v4",
+  kimi: "session-hour-aggregate-v3"
+});
+const AGGREGATE_COLLECTOR_GENERATION = Object.freeze({ codex: 4, claude: 4, kimi: 3 });
 
 export function hasRawTokenUsage(event) {
   let total = 0n;
@@ -82,9 +88,13 @@ function createHourlyAggregator(options) {
     const rawModelToken = event.sourceModelId || "unknown";
     const rawModeToken = event.aggregationModeToken
       || sha256("normalized-mode-fallback\0" + modeLabel(event));
-    const aggregateVersion = event.provider === "kimi" ? 3 : 4;
+    // The wire collector version is provenance, not logical identity. Keep the
+    // released v3 Kimi and v4 Codex/Claude identity domains stable while parser,
+    // accounting, canonical-model, and raw/attributed projections evolve.
+    const logicalIdentitySchema = LOGICAL_AGGREGATE_IDENTITY_SCHEMA[event.provider];
+    const aggregateVersion = AGGREGATE_COLLECTOR_GENERATION[event.provider];
     const key = payloadHash({
-      schema: `session-hour-aggregate-v${aggregateVersion}`,
+      schema: logicalIdentitySchema,
       hour: new Date(hourStartMs).toISOString(),
       provider: event.provider,
       aggregationScope,

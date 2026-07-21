@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { discoverJsonlFiles } from "../src/discovery.mjs";
+import { payloadHash } from "../src/crypto.mjs";
 import { runtimePaths } from "../src/paths.mjs";
 import { initialConfig, initialState, loadRuntime, saveRuntime } from "../src/state.mjs";
 
@@ -104,6 +105,67 @@ test("loading a v3 aggregate cursor preserves and normalizes provider watermarks
       claude: { through: "2026-07-19T09:05:06.000Z" },
       kimi: { through: "2026-07-20T00:00:00.250Z" }
     }
+  });
+});
+
+test("loading preserves only a complete canonical Codex checkpoint generation snapshot", async (context) => {
+  const home = await temporaryDirectory(context, "tag-plugin-codex-snapshot-state-");
+  const paths = runtimePaths({ home });
+  const state = initialState();
+  const dailyValues = {
+    "2026-07-18": "100",
+    "2026-07-19": "200"
+  };
+  const snapshotDigest = payloadHash({
+    provider: "codex",
+    sourceScope: "codex_subscription_account",
+    lifetimeTokens: "1234",
+    dailyValues
+  });
+  state.codexCheckpointSnapshot = {
+    version: 1,
+    generationId: "a".repeat(64),
+    snapshotDigest,
+    lifetimeTokens: "1234",
+    dailyValues
+  };
+  await saveRuntime(paths, { state, config: initialConfig() });
+
+  const loaded = await loadRuntime(paths);
+
+  assert.deepEqual(loaded.state.codexCheckpointSnapshot, {
+    version: 1,
+    generationId: "a".repeat(64),
+    snapshotDigest,
+    lifetimeTokens: "1234",
+    dailyValues: {
+      "2026-07-18": "100",
+      "2026-07-19": "200"
+    }
+  });
+});
+
+test("loading discards a torn Codex checkpoint snapshot instead of inventing lineage", async (context) => {
+  const home = await temporaryDirectory(context, "tag-plugin-codex-snapshot-torn-");
+  const paths = runtimePaths({ home });
+  const state = initialState();
+  state.codexCheckpointSnapshot = {
+    version: 1,
+    generationId: "a".repeat(64),
+    snapshotDigest: "b".repeat(64),
+    lifetimeTokens: "1234",
+    dailyValues: { "2026-07-19": "200" }
+  };
+  await saveRuntime(paths, { state, config: initialConfig() });
+
+  const loaded = await loadRuntime(paths);
+
+  assert.deepEqual(loaded.state.codexCheckpointSnapshot, {
+    version: 1,
+    generationId: null,
+    snapshotDigest: null,
+    lifetimeTokens: null,
+    dailyValues: {}
   });
 });
 

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { verify } from "node:crypto";
-import { createDeviceSecrets, sha256 } from "../src/crypto.mjs";
+import { createDeviceSecrets, payloadHash, sha256 } from "../src/crypto.mjs";
 import {
   JOURNAL_HISTORY_START,
   MAX_SYNC_OUTBOX_EVENTS,
@@ -71,9 +71,61 @@ function acceptedEventResult(event) {
     eventId: event.eventId,
     status: "accepted",
     scoringState: "accepted",
+    submittedRevisionActive: true,
     ...(event.attribution === "raw_only"
       ? { rawEligible: true, rawPreserved: true }
       : {})
+  };
+}
+
+function acceptedCheckpointResults(checkpoints, options = {}) {
+  return (checkpoints || []).map((checkpoint) => ({
+    checkpointId: checkpoint.checkpointId,
+    status: options.status || "accepted",
+    submittedCheckpointCanonical: true,
+    ...(checkpoint.snapshotRole === "commit"
+      ? { submittedGenerationActive: options.submittedGenerationActive !== false }
+      : {})
+  }));
+}
+
+function codexSnapshotHeartbeat(digest, codex = null, options = {}) {
+  const responseSnapshot = codex === null
+    ? null
+    : options.compact === true
+      ? {
+          status: "current",
+          generationId: codex.generationId,
+          snapshotDigest: codex.snapshotDigest
+        }
+      : {
+          status: "snapshot",
+          generationId: codex.generationId,
+          snapshotDigest: codex.snapshotDigest,
+          lifetimeTokens: codex.lifetimeTokens,
+          dailyValues: codex.dailyValues
+        };
+  return jsonResponse({
+    request: { digest },
+    heartbeat: { nextExpectedAt: "2026-07-21T01:00:00.000Z" },
+    providerSnapshots: { codex: responseSnapshot }
+  });
+}
+
+function codexSnapshotRecord(generationId, lifetimeTokens, dailyValues) {
+  const canonicalDailyValues = Object.fromEntries(
+    Object.entries(dailyValues).sort(([left], [right]) => left.localeCompare(right))
+  );
+  return {
+    generationId,
+    snapshotDigest: payloadHash({
+      provider: "codex",
+      sourceScope: "codex_subscription_account",
+      lifetimeTokens: String(lifetimeTokens),
+      dailyValues: canonicalDailyValues
+    }),
+    lifetimeTokens: String(lifetimeTokens),
+    dailyValues: canonicalDailyValues
   };
 }
 
@@ -684,14 +736,18 @@ test("Codex checkpoints carry account scope and use lifetime authority as the fi
     roots: fixture.roots,
     readCodexAccountUsage: async () => evidence,
     chunkPaceMs: 0,
-    fetchImpl: async (_url, init) => {
+    fetchImpl: async (url, init) => {
+      if (url.endsWith("/heartbeat")) {
+        return codexSnapshotHeartbeat("digest_lifetime_hydration_1234567890");
+      }
       const body = JSON.parse(init.body);
       bodies.push(body);
       return jsonResponse({
         request: { digest: `digest_lifetime_checkpoint_${bodies.length}_1234567890` },
         accepted: 0,
         duplicates: 0,
-        rejected: 0
+        rejected: 0,
+        checkpoints: acceptedCheckpointResults(body.checkpoints)
       });
     }
   });
@@ -715,7 +771,12 @@ test("Codex checkpoints carry account scope and use lifetime authority as the fi
     sourceScope: "codex_subscription_account",
     periodStart: "2026-07-20T00:00:00.000Z",
     periodEnd: "2026-07-21T00:00:00.000Z",
-    totalTokens: "17772403863"
+    totalTokens: "17772403863",
+    snapshotGenerationId: checkpoints.at(-1).snapshotGenerationId,
+    parentGenerationId: "0".repeat(64),
+    snapshotRole: "commit",
+    snapshotDigest: checkpoints.at(-1).snapshotDigest,
+    deltaCount: 3
   });
   assert.equal(checkpoints[0].source, "codex_app_server_account_usage");
   assert.deepEqual(
@@ -727,6 +788,677 @@ test("Codex checkpoints carry account scope and use lifetime authority as the fi
       "codex_app_server_account_usage_lifetime"
     ]
   );
+});
+
+test("Codex v0.1.6 bootstrap and snapshot generations send only daily deltas and distinguish A to B to A", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_snapshot_generations";
+  state.providerEvidenceHashes.codex = "legacy_v0_1_6_checkpoint_hash";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["codex"];
+  config.supportedProviders = ["codex"];
+  config.transcriptFallbacks = { codex: false, claude: false, kimi: false };
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+
+  let requestCounter = 0;
+  let hydrationCounter = 0;
+  const run = async (dailyUsageBuckets, { rejectNetwork = false } = {}) => {
+    const checkpoints = [];
+    const result = await sync({
+      home: fixture.home,
+      roots: fixture.roots,
+      readCodexAccountUsage: async () => ({
+        status: "available",
+        summary: { lifetimeTokens: 1_000 },
+        dailyUsageBuckets
+      }),
+      chunkPaceMs: 0,
+      fetchImpl: async (url, init) => {
+        if (url.endsWith("/heartbeat")) {
+          hydrationCounter += 1;
+          const snapshot = (await loadRuntime(fixture.paths)).state.codexCheckpointSnapshot;
+          const heartbeatBody = JSON.parse(init.body);
+          assert.deepEqual(heartbeatBody.providerSnapshotHeads.codex, snapshot.generationId === null
+            ? null
+            : {
+                generationId: snapshot.generationId,
+                snapshotDigest: snapshot.snapshotDigest
+              });
+          return codexSnapshotHeartbeat(
+            `digest_snapshot_hydration_${hydrationCounter}_1234567890`,
+            snapshot.generationId === null ? null : snapshot,
+            { compact: snapshot.generationId !== null }
+          );
+        }
+        if (rejectNetwork) throw new Error("an identical snapshot must not upload");
+        requestCounter += 1;
+        const body = JSON.parse(init.body);
+        checkpoints.push(...(body.checkpoints || []));
+        return jsonResponse({
+          request: { digest: `digest_snapshot_generation_${requestCounter}_1234567890` },
+          accepted: 0,
+          duplicates: 0,
+          rejected: 0,
+          checkpoints: acceptedCheckpointResults(body.checkpoints)
+        });
+      }
+    });
+    return { result, checkpoints };
+  };
+
+  const snapshotA = [
+    { startDate: "2026-07-18", tokens: 100 },
+    { startDate: "2026-07-19", tokens: 200 }
+  ];
+  const snapshotB = [
+    { startDate: "2026-07-18", tokens: 110 },
+    { startDate: "2026-07-19", tokens: 200 }
+  ];
+  const first = await run(snapshotA);
+  const firstCommit = first.checkpoints.at(-1);
+  assert.equal(first.checkpoints.filter((checkpoint) => checkpoint.snapshotRole === "daily_delta").length, 2);
+  assert.equal(firstCommit.deltaCount, 2);
+  assert.equal(firstCommit.parentGenerationId, "0".repeat(64));
+  assert.equal((await loadRuntime(fixture.paths)).state.providerEvidenceHashes.codex, undefined);
+
+  const unchanged = await run(snapshotA, { rejectNetwork: true });
+  assert.equal(unchanged.result.sent, 0);
+  assert.deepEqual(unchanged.checkpoints, []);
+
+  const second = await run(snapshotB);
+  const secondDeltas = second.checkpoints.filter((checkpoint) => checkpoint.snapshotRole === "daily_delta");
+  const secondCommit = second.checkpoints.at(-1);
+  assert.equal(secondDeltas.length, 1);
+  assert.equal(secondDeltas[0].periodStart, "2026-07-18T00:00:00.000Z");
+  assert.equal(secondDeltas[0].totalTokens, "110");
+  assert.equal(secondCommit.totalTokens, firstCommit.totalTokens);
+  assert.equal(secondCommit.deltaCount, 1);
+  assert.equal(secondCommit.parentGenerationId, firstCommit.snapshotGenerationId);
+  assert.deepEqual((await loadRuntime(fixture.paths)).state.codexCheckpointSnapshot.dailyValues, {
+    "2026-07-18": "110",
+    "2026-07-19": "200"
+  });
+
+  const third = await run(snapshotA);
+  const thirdCommit = third.checkpoints.at(-1);
+  assert.equal(thirdCommit.snapshotDigest, firstCommit.snapshotDigest);
+  assert.notEqual(thirdCommit.snapshotGenerationId, firstCommit.snapshotGenerationId);
+  assert.equal(thirdCommit.parentGenerationId, secondCommit.snapshotGenerationId);
+  const committed = (await loadRuntime(fixture.paths)).state.codexCheckpointSnapshot;
+  assert.equal(committed.generationId, thirdCommit.snapshotGenerationId);
+  assert.deepEqual(committed.dailyValues, {
+    "2026-07-18": "100",
+    "2026-07-19": "200"
+  });
+});
+
+test("a persisted v0.1.6 checkpoint outbox drains before the genesis generation", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_legacy_checkpoint_outbox";
+  state.providerEvidenceHashes.codex = "legacy_checkpoint_hash";
+  const batchId = "a".repeat(24);
+  const emptyPage = { version: 1, batchId, pageIndex: 0, events: [] };
+  state.syncOutbox = {
+    version: 4,
+    batchId,
+    pageIndex: 0,
+    pageCount: 1,
+    pageSize: 5_000,
+    pages: [{ pageIndex: 0, eventCount: 0, digest: payloadHash(emptyPage) }],
+    index: 0,
+    chunks: [{
+      events: [],
+      checkpoints: [{
+        checkpointId: "legacy-checkpoint-id-0001",
+        provider: "codex",
+        source: "codex_app_server_account_usage_lifetime",
+        sourceScope: "codex_subscription_account",
+        periodStart: "2026-07-19T00:00:00.000Z",
+        periodEnd: "2026-07-20T00:00:00.000Z",
+        totalTokens: "900"
+      }]
+    }],
+    totalChunks: 1,
+    totalEvents: 0,
+    totalCheckpoints: 1,
+    pageEventCount: 0,
+    processedEvents: 0,
+    processedCheckpoints: 0,
+    processedChunks: 0,
+    accepted: 0,
+    duplicates: 0,
+    rejected: 0,
+    quarantinedCount: 0,
+    quarantinedEventIds: [],
+    commit: {
+      nextCursors: structuredClone(state.cursors),
+      checkpointHash: "legacy_checkpoint_hash",
+      scannedAt: "2026-07-20T00:00:00.000Z",
+      scanSummary: {},
+      withheld: 0,
+      unknownModels: [],
+      collectionPending: false,
+      nextUnresolvedEvents: [],
+      unresolvedOverflow: { totalDropped: 0, lastOverflowAt: null },
+      nextRawOnlyBackfill: state.rawOnlyBackfill
+    }
+  };
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["codex"];
+  config.supportedProviders = ["codex"];
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+
+  let legacyBody;
+  await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    readCodexAccountUsage: async () => { throw new Error("legacy outbox must drain before recollection"); },
+    fetchImpl: async (_url, init) => {
+      legacyBody = JSON.parse(init.body);
+      return jsonResponse({
+        request: { digest: "digest_legacy_checkpoint_outbox_1234567890" },
+        accepted: 0,
+        duplicates: 0,
+        rejected: 0,
+        checkpoints: acceptedCheckpointResults(legacyBody.checkpoints)
+      });
+    }
+  });
+  assert.equal(legacyBody.checkpoints[0].snapshotRole, undefined);
+  const afterLegacy = await loadRuntime(fixture.paths);
+  assert.equal(afterLegacy.state.codexCheckpointSnapshot.generationId, null);
+  assert.equal(afterLegacy.state.providerEvidenceHashes.codex, "legacy_checkpoint_hash");
+
+  let firstGeneration;
+  await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    readCodexAccountUsage: async () => ({
+      status: "available",
+      summary: { lifetimeTokens: 1_000 },
+      dailyUsageBuckets: [{ startDate: "2026-07-19", tokens: 100 }]
+    }),
+    fetchImpl: async (url, init) => {
+      if (url.endsWith("/heartbeat")) {
+        return codexSnapshotHeartbeat("digest_legacy_hydration_1234567890");
+      }
+      const body = JSON.parse(init.body);
+      firstGeneration = body.checkpoints.at(-1);
+      return jsonResponse({
+        request: { digest: "digest_genesis_after_legacy_1234567890" },
+        accepted: 0,
+        duplicates: 0,
+        rejected: 0,
+        checkpoints: acceptedCheckpointResults(body.checkpoints)
+      });
+    }
+  });
+  assert.equal(firstGeneration.snapshotRole, "commit");
+  assert.equal(firstGeneration.parentGenerationId, "0".repeat(64));
+  assert.equal((await loadRuntime(fixture.paths)).state.providerEvidenceHashes.codex, undefined);
+});
+
+test("a reinstalled connector hydrates the active generation before planning its first snapshot", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_reinstalled_snapshot";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["codex"];
+  config.supportedProviders = ["codex"];
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+
+  const active = codexSnapshotRecord("b".repeat(64), 1_400, {
+    "2026-07-18": "100",
+    "2026-07-19": "200"
+  });
+  const submitted = [];
+  let requestCounter = 0;
+  await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    readCodexAccountUsage: async () => ({
+      status: "available",
+      summary: { lifetimeTokens: 1_500 },
+      dailyUsageBuckets: [
+        { startDate: "2026-07-18", tokens: 100 },
+        { startDate: "2026-07-19", tokens: 250 }
+      ]
+    }),
+    chunkPaceMs: 0,
+    fetchImpl: async (url, init) => {
+      requestCounter += 1;
+      if (url.endsWith("/heartbeat")) {
+        assert.equal(JSON.parse(init.body).providerSnapshotHeads.codex, null);
+        return codexSnapshotHeartbeat(`digest_reinstall_hydration_${requestCounter}_1234567890`, active);
+      }
+      const body = JSON.parse(init.body);
+      submitted.push(...body.checkpoints);
+      return jsonResponse({
+        request: { digest: `digest_reinstall_ingest_${requestCounter}_1234567890` },
+        accepted: 0,
+        duplicates: 0,
+        rejected: 0,
+        checkpoints: acceptedCheckpointResults(body.checkpoints)
+      });
+    }
+  });
+  const deltas = submitted.filter((checkpoint) => checkpoint.snapshotRole === "daily_delta");
+  const marker = submitted.find((checkpoint) => checkpoint.snapshotRole === "commit");
+  assert.deepEqual(deltas.map((checkpoint) => [checkpoint.periodStart, checkpoint.totalTokens]), [
+    ["2026-07-19T00:00:00.000Z", "250"]
+  ]);
+  assert.equal(marker.parentGenerationId, active.generationId);
+  assert.notEqual(marker.parentGenerationId, "0".repeat(64));
+  const committed = (await loadRuntime(fixture.paths)).state.codexCheckpointSnapshot;
+  assert.equal(committed.generationId, marker.snapshotGenerationId);
+  assert.deepEqual(committed.dailyValues, {
+    "2026-07-18": "100",
+    "2026-07-19": "250"
+  });
+});
+
+test("snapshot planning fails closed when signed hydration omits authoritative status", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_missing_snapshot_status";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["codex"];
+  config.supportedProviders = ["codex"];
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+
+  await assert.rejects(() => sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    readCodexAccountUsage: async () => ({
+      status: "available",
+      summary: { lifetimeTokens: 1_000 },
+      dailyUsageBuckets: [{ startDate: "2026-07-19", tokens: 100 }]
+    }),
+    fetchImpl: async (url) => {
+      assert.equal(url.endsWith("/heartbeat"), true);
+      return jsonResponse({
+        request: { digest: "digest_missing_snapshot_status_1234567890" },
+        heartbeat: { nextExpectedAt: "2026-07-21T01:00:00.000Z" }
+      });
+    }
+  }), (error) => error.code === "INVALID_SERVER_SNAPSHOT_STATUS");
+  const blocked = await loadRuntime(fixture.paths);
+  assert.equal(blocked.state.nextSequence, 1);
+  assert.equal(blocked.state.previousRequestDigest, "");
+  assert.equal(blocked.state.syncOutbox, null);
+  assert.equal(blocked.state.pendingRequest.kind, "heartbeat");
+  assert.equal(blocked.state.pendingRequest.permanentFailure.code, "INVALID_SERVER_SNAPSHOT_STATUS");
+});
+
+test("a crash before the Codex snapshot marker replays one generation and commits only after success", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_snapshot_crash";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["codex"];
+  config.supportedProviders = ["codex"];
+  config.transcriptFallbacks = { codex: false, claude: false, kimi: false };
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+  const evidence = {
+    status: "available",
+    summary: { lifetimeTokens: 1_234 },
+    dailyUsageBuckets: [
+      { startDate: "2026-07-17", tokens: 100 },
+      { startDate: "2026-07-18", tokens: 200 },
+      { startDate: "2026-07-19", tokens: 300 }
+    ]
+  };
+  let calls = 0;
+  let markerRequest;
+  await assert.rejects(() => sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    readCodexAccountUsage: async () => evidence,
+    chunkPaceMs: 0,
+    maxAttempts: 1,
+    fetchImpl: async (url, init) => {
+      if (url.endsWith("/heartbeat")) {
+        return codexSnapshotHeartbeat("digest_snapshot_crash_hydration_1234567890");
+      }
+      calls += 1;
+      if (calls === 1) {
+        return jsonResponse({
+          request: { digest: "digest_snapshot_daily_1234567890" },
+          accepted: 0,
+          duplicates: 0,
+          rejected: 0,
+          checkpoints: acceptedCheckpointResults(JSON.parse(init.body).checkpoints)
+        });
+      }
+      markerRequest = { body: init.body, requestId: init.headers["x-tokenboard-request-id"] };
+      throw new Error("simulated crash before marker receipt");
+    }
+  }), /could not be reached/);
+  const interrupted = await loadRuntime(fixture.paths);
+  assert.equal(interrupted.state.codexCheckpointSnapshot.generationId, null);
+  const pendingCheckpoints = interrupted.state.pendingRequest.body.checkpoints;
+  const pendingCommit = pendingCheckpoints.find((checkpoint) => checkpoint.snapshotRole === "commit");
+  assert.ok(pendingCommit);
+  assert.equal(pendingCheckpoints.every((checkpoint) => (
+    checkpoint.snapshotGenerationId === pendingCommit.snapshotGenerationId
+  )), true);
+
+  let replayed;
+  await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    readCodexAccountUsage: async () => { throw new Error("persisted outbox must replay without recollection"); },
+    chunkPaceMs: 0,
+    fetchImpl: async (_url, init) => {
+      replayed = { body: init.body, requestId: init.headers["x-tokenboard-request-id"] };
+      return jsonResponse({
+        request: { digest: "digest_snapshot_marker_1234567890" },
+        accepted: 0,
+        duplicates: 0,
+        rejected: 0,
+        checkpoints: acceptedCheckpointResults(JSON.parse(init.body).checkpoints, { status: "duplicate" })
+      });
+    }
+  });
+  assert.deepEqual(replayed, markerRequest);
+  const completed = await loadRuntime(fixture.paths);
+  assert.equal(completed.state.codexCheckpointSnapshot.generationId, pendingCommit.snapshotGenerationId);
+  assert.equal(completed.state.codexCheckpointSnapshot.snapshotDigest, pendingCommit.snapshotDigest);
+});
+
+test("a missing daily-delta acknowledgement blocks the generation and preserves local snapshot state", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_snapshot_missing_delta_ack";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["codex"];
+  config.supportedProviders = ["codex"];
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+
+  let calls = 0;
+  await assert.rejects(() => sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    readCodexAccountUsage: async () => ({
+      status: "available",
+      summary: { lifetimeTokens: 1_234 },
+      dailyUsageBuckets: [
+        { startDate: "2026-07-18", tokens: 100 },
+        { startDate: "2026-07-19", tokens: 200 }
+      ]
+    }),
+    chunkPaceMs: 0,
+    fetchImpl: async (url, init) => {
+      if (url.endsWith("/heartbeat")) {
+        return codexSnapshotHeartbeat("digest_missing_delta_hydration_1234567890");
+      }
+      calls += 1;
+      const body = JSON.parse(init.body);
+      assert.equal(body.checkpoints.length, 2);
+      return jsonResponse({
+        request: { digest: "digest_missing_daily_ack_1234567890" },
+        accepted: 0,
+        duplicates: 0,
+        rejected: 0,
+        // Deliberately acknowledge only one of the two submitted deltas.
+        checkpoints: acceptedCheckpointResults(body.checkpoints.slice(0, 1))
+      });
+    }
+  }), (error) => error.code === "CHECKPOINT_ACKNOWLEDGEMENT_REJECTED");
+  assert.equal(calls, 1);
+  const blocked = await loadRuntime(fixture.paths);
+  assert.equal(blocked.state.codexCheckpointSnapshot.generationId, null);
+  assert.equal(blocked.state.syncOutbox.index, 0);
+  assert.equal(blocked.state.syncOutbox.permanentFailure.code, "CHECKPOINT_ACKNOWLEDGEMENT_REJECTED");
+  assert.equal(blocked.state.syncOutbox.permanentFailure.itemCount, 1);
+});
+
+test("an inactive commit for a non-stale structural failure remains permanently blocked", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_snapshot_bad_commit";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["codex"];
+  config.supportedProviders = ["codex"];
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+
+  await assert.rejects(() => sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    readCodexAccountUsage: async () => ({
+      status: "available",
+      summary: { lifetimeTokens: 1_234 },
+      dailyUsageBuckets: [{ startDate: "2026-07-19", tokens: 200 }]
+    }),
+    chunkPaceMs: 0,
+    fetchImpl: async (url, init) => {
+      if (url.endsWith("/heartbeat")) {
+        return codexSnapshotHeartbeat("digest_bad_commit_hydration_1234567890");
+      }
+      const body = JSON.parse(init.body);
+      const results = acceptedCheckpointResults(body.checkpoints, { submittedGenerationActive: false })
+        .map((entry) => Object.hasOwn(entry, "submittedGenerationActive")
+          ? { ...entry, activationReason: "digest_mismatch" }
+          : entry);
+      return jsonResponse({
+        request: { digest: "digest_bad_commit_ingest_1234567890" },
+        accepted: 0,
+        duplicates: 0,
+        rejected: 0,
+        checkpoints: results,
+        providerSnapshots: { codex: null }
+      });
+    }
+  }), (error) => error.code === "CHECKPOINT_GENERATION_NOT_ACTIVE");
+  const blocked = await loadRuntime(fixture.paths);
+  assert.equal(blocked.state.codexCheckpointSnapshot.generationId, null);
+  assert.equal(blocked.state.syncOutbox.permanentFailure.code, "CHECKPOINT_GENERATION_NOT_ACTIVE");
+});
+
+test("a two-device sibling race retires the stale generation and hydrates the active parent", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_snapshot_stale_parent";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["codex", "claude", "kimi"];
+  config.supportedProviders = ["codex", "claude", "kimi"];
+  config.transcriptFallbacks = { codex: true, claude: true, kimi: true };
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+
+  let checkpointCalls = 0;
+  let requestCounter = 0;
+  const uploadedEventIds = [];
+  const winner = codexSnapshotRecord("a".repeat(64), 1_500, {
+    "2026-07-18": "150",
+    "2026-07-19": "250"
+  });
+  const result = await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    readCodexAccountUsage: async () => ({
+      status: "available",
+      summary: { lifetimeTokens: 1_234 },
+      dailyUsageBuckets: [
+        { startDate: "2026-07-18", tokens: 100 },
+        { startDate: "2026-07-19", tokens: 200 }
+      ]
+    }),
+    chunkPaceMs: 0,
+    maxIngestRequests: 2,
+    maximumSyncPageEvents: 1,
+    fetchImpl: async (url, init) => {
+      if (url.endsWith("/heartbeat")) {
+        return codexSnapshotHeartbeat("digest_stale_parent_hydration_1234567890");
+      }
+      requestCounter += 1;
+      const body = JSON.parse(init.body);
+      if (!body.checkpoints) {
+        uploadedEventIds.push(...body.events.map((event) => event.eventId));
+        return jsonResponse({
+          request: { digest: `digest_race_event_${requestCounter}_1234567890` },
+          accepted: body.events.length,
+          duplicates: 0,
+          rejected: 0,
+          events: body.events.map(acceptedEventResult)
+        });
+      }
+      checkpointCalls += 1;
+      const marker = body.checkpoints.find((checkpoint) => checkpoint.snapshotRole === "commit");
+      const checkpointResults = marker
+        ? acceptedCheckpointResults(body.checkpoints, { submittedGenerationActive: false })
+            .map((entry) => ({ ...entry, activationReason: "stale_parent" }))
+        : acceptedCheckpointResults(body.checkpoints);
+      return jsonResponse({
+        request: { digest: `digest_stale_parent_${requestCounter}_1234567890` },
+        accepted: 0,
+        duplicates: 0,
+        rejected: 0,
+        checkpoints: checkpointResults,
+        ...(marker ? { providerSnapshots: { codex: winner } } : {})
+      });
+    }
+  });
+  assert.equal(checkpointCalls, 2);
+  assert.deepEqual(uploadedEventIds, []);
+  assert.equal(result.generationRebased, true);
+  assert.equal(result.catchingUp, true);
+  const staged = await loadRuntime(fixture.paths);
+  assert.ok(staged.state.syncOutbox);
+  assert.equal(staged.state.syncOutbox.commit.codexCheckpointSnapshot, null);
+  assert.equal(staged.state.syncOutbox.totalEvents > 0, true);
+  assert.equal(staged.state.syncOutbox.pages.length > 1, true);
+  assert.deepEqual(staged.state.codexCheckpointSnapshot, {
+    version: 1,
+    ...winner
+  });
+
+  await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    readCodexAccountUsage: async () => { throw new Error("the durable event outbox must drain before recollection"); },
+    chunkPaceMs: 0,
+    fetchImpl: async (_url, init) => {
+      requestCounter += 1;
+      const body = JSON.parse(init.body);
+      assert.equal(body.checkpoints, undefined);
+      uploadedEventIds.push(...body.events.map((event) => event.eventId));
+      return jsonResponse({
+        request: { digest: `digest_race_recovery_event_${requestCounter}_1234567890` },
+        accepted: body.events.length,
+        duplicates: 0,
+        rejected: 0,
+        events: body.events.map(acceptedEventResult)
+      });
+    }
+  });
+  assert.equal(uploadedEventIds.length, staged.state.syncOutbox.totalEvents);
+  assert.equal(new Set(uploadedEventIds).size, uploadedEventIds.length);
+  const completed = await loadRuntime(fixture.paths);
+  assert.equal(completed.state.syncOutbox, null);
+  assert.notEqual(completed.state.lastSyncAt, null);
+  assert.deepEqual(completed.state.codexCheckpointSnapshot, {
+    version: 1,
+    ...winner
+  });
+});
+
+test("an exact duplicate commit marker advances only when the submitted generation is active", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_snapshot_active_duplicate";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["codex"];
+  config.supportedProviders = ["codex"];
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+
+  let submittedGenerationId;
+  await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    readCodexAccountUsage: async () => ({
+      status: "available",
+      summary: { lifetimeTokens: 1_234 },
+      dailyUsageBuckets: [
+        { startDate: "2026-07-18", tokens: 100 },
+        { startDate: "2026-07-19", tokens: 200 }
+      ]
+    }),
+    chunkPaceMs: 0,
+    fetchImpl: async (url, init) => {
+      if (url.endsWith("/heartbeat")) {
+        return codexSnapshotHeartbeat("digest_active_duplicate_hydration_1234567890");
+      }
+      const body = JSON.parse(init.body);
+      const marker = body.checkpoints.find((checkpoint) => checkpoint.snapshotRole === "commit");
+      if (marker) submittedGenerationId = marker.snapshotGenerationId;
+      return jsonResponse({
+        request: { digest: `digest_active_duplicate_${marker ? "marker" : "daily"}_1234567890` },
+        accepted: 0,
+        duplicates: marker ? 1 : 0,
+        rejected: 0,
+        checkpoints: acceptedCheckpointResults(body.checkpoints, {
+          status: marker ? "duplicate" : "accepted"
+        })
+      });
+    }
+  });
+  assert.equal((await loadRuntime(fixture.paths)).state.codexCheckpointSnapshot.generationId, submittedGenerationId);
 });
 
 test("a lost response retries the exact persisted request ID and body", async (context) => {
@@ -771,7 +1503,8 @@ test("a lost response retries the exact persisted request ID and body", async (c
         request: { digest: "digest_replayed_123456" },
         accepted: 1,
         duplicates: 0,
-        rejected: 0
+        rejected: 0,
+        events: JSON.parse(init.body).events.map(acceptedEventResult)
       });
     },
     now: 1_750_000_100_000
@@ -1637,7 +2370,8 @@ test("a raw-only event beyond 90 days commits when the server confirms Raw prese
           scoringState: "quarantined",
           scoringReasons: ["retroactive_window"],
           rawEligible: true,
-          rawPreserved: true
+          rawPreserved: true,
+          submittedRevisionActive: true
         }]
       });
     }
@@ -2357,7 +3091,8 @@ test("the retired unresolved queue migrates once to raw-only without exposing or
           status: "accepted",
           scoringState: "accepted",
           rawEligible: true,
-          rawPreserved: true
+          rawPreserved: true,
+          submittedRevisionActive: true
         }]
       });
     }
@@ -2469,7 +3204,11 @@ test("a partial-success response cannot quarantine raw-only usage or commit its 
         accepted: 0,
         duplicates: 0,
         rejected: 1,
-        events: [{ eventId: rejectedId, status: "rejected" }]
+        events: [{
+          eventId: rejectedId,
+          status: "rejected",
+          submittedRevisionActive: true
+        }]
       });
     }
   }), (error) => error.code === "RAW_ONLY_CONTRACT_REJECTED");
@@ -2479,7 +3218,7 @@ test("a partial-success response cannot quarantine raw-only usage or commit its 
   assert.deepEqual(blocked.state.syncOutbox.permanentFailure, {
     code: "RAW_ONLY_CONTRACT_REJECTED",
     status: null,
-    rawOnlyEventCount: 1
+    eventCount: 1
   });
   assert.deepEqual(blocked.state.syncOutbox.quarantinedEventIds, []);
   assert.deepEqual(blocked.state.cursors.kimi.files, {});
@@ -2513,7 +3252,7 @@ test("a partial-success response cannot quarantine raw-only usage or commit its 
   assert.equal(heartbeatBody.status, "degraded");
 });
 
-test("permanent event conflicts are quarantined without pinning cursors forever", async (context) => {
+test("a response without exact revision acknowledgement fails closed", async (context) => {
   const fixture = await setup();
   context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
   const secrets = createDeviceSecrets();
@@ -2529,7 +3268,7 @@ test("permanent event conflicts are quarantined without pinning cursors forever"
   await saveSecrets(fixture.paths, secrets);
   await saveRuntime(fixture.paths, { state, config });
   let conflictedId;
-  const first = await sync({
+  await assert.rejects(() => sync({
     home: fixture.home,
     roots: fixture.roots,
     officialEvidence: false,
@@ -2544,22 +3283,62 @@ test("permanent event conflicts are quarantined without pinning cursors forever"
         events: [{ eventId: conflictedId, status: "conflict" }]
       });
     }
-  });
-  assert.equal(first.rejected, 1);
-  assert.equal(first.quarantined, 1);
+  }), (error) => error.code === "EVENT_ACKNOWLEDGEMENT_REJECTED");
   const afterConflict = await loadRuntime(fixture.paths);
-  assert.deepEqual(afterConflict.state.quarantinedEventIds, [conflictedId]);
-  assert.equal(afterConflict.state.syncOutbox, null);
-  const second = await sync({
+  assert.deepEqual(afterConflict.state.quarantinedEventIds, []);
+  assert.equal(afterConflict.state.syncOutbox.permanentFailure.code, "EVENT_ACKNOWLEDGEMENT_REJECTED");
+  assert.deepEqual(afterConflict.state.cursors.codex.files, {});
+  await assert.rejects(() => sync({
     home: fixture.home,
     roots: fixture.roots,
     officialEvidence: false,
-    fetchImpl: async () => { throw new Error("conflicted cursor should already be committed"); }
-  });
-  assert.equal(second.sent, 0);
+    fetchImpl: async () => { throw new Error("blocked outbox must not retry"); }
+  }), (error) => error.code === "EVENT_ACKNOWLEDGEMENT_REJECTED");
 });
 
-test("a permanently invalid same-type batch is bisected and only the bad event is quarantined", async (context) => {
+test("an exact canonical-observation duplicate acknowledgement commits the submitted cursor", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_canonical_observation_duplicate";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["kimi"];
+  config.supportedProviders = ["kimi"];
+  config.transcriptFallbacks = { codex: false, claude: false, kimi: true };
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+
+  const result = await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    officialEvidence: false,
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      return jsonResponse({
+        request: { digest: "digest_canonical_observation_1234567890" },
+        accepted: 0,
+        duplicates: body.events.length,
+        rejected: 0,
+        events: body.events.map((event) => ({
+          eventId: event.eventId,
+          status: "duplicate",
+          submittedRevisionActive: false,
+          submittedObservationCanonical: true
+        }))
+      });
+    }
+  });
+  assert.equal(result.sent, 1);
+  const committed = await loadRuntime(fixture.paths);
+  assert.ok(Object.values(committed.state.cursors.kimi.files)[0].offset > 0);
+  assert.equal(committed.state.syncOutbox, null);
+});
+
+test("a permanently invalid same-type batch is bisected and the isolated item blocks cursor commit", async (context) => {
   const fixture = await setup();
   context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
   const wirePath = path.join(fixture.roots.kimi, "session", "agents", "main", "wire.jsonl");
@@ -2587,7 +3366,7 @@ test("a permanently invalid same-type batch is bisected and only the bad event i
   let badEventId;
   let acceptedRequests = 0;
   const batches = [];
-  const result = await sync({
+  await assert.rejects(() => sync({
     home: fixture.home,
     roots: fixture.roots,
     officialEvidence: false,
@@ -2608,18 +3387,14 @@ test("a permanently invalid same-type batch is bisected and only the bad event i
         events: body.events.map(acceptedEventResult)
       });
     }
-  });
-  assert.equal(result.sent, 3);
-  assert.equal(result.accepted, 2);
-  assert.equal(result.rejected, 1);
-  assert.equal(result.quarantined, 1);
+  }), (error) => error.code === "MODEL_NOT_SUPPORTED");
   assert.equal(batches.some((batch) => batch.length > 1), true);
   assert.equal(batches.some((batch) => batch.length === 1 && batch[0] === badEventId), true);
   const updated = await loadRuntime(fixture.paths);
-  assert.deepEqual(updated.state.quarantinedEventIds, [badEventId]);
-  assert.equal(updated.state.pendingRequest, null);
-  assert.equal(updated.state.syncOutbox, null);
-  assert.equal(updated.state.nextSequence, 3);
+  assert.deepEqual(updated.state.quarantinedEventIds, []);
+  assert.equal(updated.state.pendingRequest.permanentFailure.code, "SYNC_ITEM_UNACKNOWLEDGED");
+  assert.notEqual(updated.state.syncOutbox, null);
+  assert.deepEqual(updated.state.cursors.kimi.files, {});
 });
 
 test("a non-retryable authorization failure is journaled once and not retried forever", async (context) => {
@@ -2694,7 +3469,8 @@ test("a non-retryable authorization failure is journaled once and not retried fo
         request: { digest: "digest_after_repair_123456" },
         accepted: body.events.length,
         duplicates: 0,
-        rejected: 0
+        rejected: 0,
+        events: body.events.map(acceptedEventResult)
       });
     }
   });
@@ -2951,7 +3727,7 @@ test("scheduler mutation is preview-only until the exact confirmation flag", asy
   assert.match(commands[0].join(" "), /SetAccessRuleProtection/);
   assert.match(commands[0].join(" "), /Current-user-only ACL verification failed/);
   assert.equal(commands[1][0], "schtasks.exe");
-  assert.match(commands[1].join(" "), /versions[\\/]0\.1\.6[\\/]src[\\/]cli\.mjs/);
+  assert.match(commands[1].join(" "), /versions[\\/]0\.1\.7[\\/]src[\\/]cli\.mjs/);
   assert.match(commands[1].join(" "), /scheduled-run --home/);
   assert.equal(await fs.access(path.join(installed.installedRelease, "package.json")).then(() => true), true);
   assert.equal(await fs.access(path.join(installed.installedRelease, "RELEASING.md")).then(() => true), true);
@@ -2989,7 +3765,7 @@ test("Windows installation fails closed before copying or scheduling when ACL ha
   }), (error) => error.code === "WINDOWS_ACL_HARDENING_FAILED");
   assert.equal(commands.length, 1);
   assert.match(commands[0][0], /powershell\.exe$/i);
-  const installedPath = path.join(fixture.home, "versions", "0.1.6");
+  const installedPath = path.join(fixture.home, "versions", "0.1.7");
   assert.equal(await fs.access(installedPath).then(() => true).catch(() => false), false);
 });
 
@@ -3022,7 +3798,7 @@ test("confirmed install and uninstall refuse to overlap another connector operat
 
   assert.deepEqual(commands, []);
   assert.equal(
-    await fs.access(path.join(fixture.home, "versions", "0.1.6")).then(() => true).catch(() => false),
+    await fs.access(path.join(fixture.home, "versions", "0.1.7")).then(() => true).catch(() => false),
     false
   );
 });

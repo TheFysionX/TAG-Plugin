@@ -1,9 +1,10 @@
-export const CONNECTOR_VERSION = "0.1.6";
+export const CONNECTOR_VERSION = "0.1.7";
 export const SCHEMA_VERSION = 1;
 export const CODEX_ACCOUNTING_VERSION = 5;
 export const CLAUDE_ACCOUNTING_VERSION = 5;
 export const KIMI_ACCOUNTING_VERSION = 2;
 export const AGGREGATE_CURSOR_VERSION = 3;
+export const CODEX_SNAPSHOT_STATE_VERSION = 1;
 export const GENESIS_HASH = "0".repeat(64);
 export const MAX_LOG_BYTES = 256 * 1024;
 export const MAX_CURSOR_FILES = 5_000;

@@ -6,14 +6,14 @@
     "repository": "https://github.com/TheFysionX/TAG-Plugin",
     "package": "@the-artificial-games/tag-plugin"
   },
-  "connectorVersion": "0.1.6",
+  "connectorVersion": "0.1.7",
   "runtime": {
     "name": "Node.js",
     "minimumMajor": 22,
     "thirdPartyDependencies": []
   },
   "releaseArtifact": {
-    "archiveName": "tag-plugin-0.1.6.tgz",
+    "archiveName": "tag-plugin-0.1.7.tgz",
     "includesSyntheticTestSuite": true,
     "testCommand": "npm test",
     "releaseContract": "require package @the-artificial-games/tag-plugin; reject -local; require tag v<package-version>; require package, runtime constant, and manifest versions to match; require archive tag-plugin-<package-version>.tgz",
@@ -93,11 +93,11 @@
     ],
     "pendingDeviceSecrets": "separate unpaired Ed25519 key until exchange succeeds; does not overwrite an active device during replacement",
     "pairingRecovery": "short-lived code, public key, endpoint, device label, connector version, approved fallbacks, private key, and fixed exchange request are stored only in the restricted pending-secret journal until config-first/state-last commit succeeds",
-    "syncRecovery": "provider checkpoints first, with Codex daily rows followed by the lifetime authority as the signed snapshot commit marker, then newest-first catch-up pages capped at 5000 hourly aggregate events each; active page embedded in state and future content-free pages stored privately under sync-pages/<batch-id> with an event-count/digest manifest; fixed active request plus disjoint chunks of at most 3 events or 2 checkpoints, paced 550 ms apart; missing or corrupt pages fail closed; collection cursors commit only after the final page; interactive sync processes at most 100 requests; scheduled runs process at most 1000 ingest requests, heartbeat every 50 and once at the end even with backlog",
+    "syncRecovery": "signed heartbeat hydration reads the current Codex account snapshot before every eligible plan; Codex snapshot generations follow, with generationId equal to SHA-256(parentGenerationId plus NUL plus the canonical snapshot digest), only changed daily values tagged daily_delta, and one final lifetime commit marker carrying the generation, parent, full snapshot digest, and delta count; every checkpoint requires exact canonical-digest acknowledgement and the marker additionally requires active-generation proof; stale-parent recovery hydrates the winner, retires only checkpoint work, and preserves durable event pages; the submitted generation, digest, lifetime value, and daily map persist locally only after proof and the final outbox item succeed; then newest-first catch-up pages capped at 5000 hourly aggregate events each; active page embedded in state and future content-free pages stored privately under sync-pages/<batch-id> with an event-count/digest manifest; fixed active request plus disjoint chunks of at most 3 events or 2 checkpoints, paced 550 ms apart; missing or corrupt pages fail closed; collection cursors commit only after the final page; interactive sync processes at most 100 requests; scheduled runs process at most 1000 ingest requests, heartbeat every 50 and once at the end even with backlog",
     "historyImport": "all safely discoverable retained journal history from the Unix epoch, independently of the server score-eligibility horizon; local source-ID deduplication; stable provider/source-session/UTC-hour/raw-model/raw-mode/surface aggregation without sharding; disabled, unavailable, truncated, or event-limited providers retain their prior through-watermark; malformed or oversized records keep coverage explicitly partial with a privacy-safe count while a completed scan range may advance so later valid usage is not pinned; later runs normally scan only newly settled hours",
     "aggregateWatermarks": "independent Codex, Claude, and Kimi settled-through times staged per complete provider and committed only after the final sync page",
     "unresolvedModels": "unknown-model or unknown-mode usage uploads immediately as an atomic raw-only event without a local queue; modelId and serviceMode are both the unknown sentinel, attribution is raw_only, source model tokens never upload, and a one-time stable-ID backfill repairs the retired queue generation",
-    "eventIdentity": "raw source IDs are account-scoped HMACs over content-independent source identity and deduplicate locally; corrected Codex and Claude aggregates use v4 identity while unchanged Kimi aggregates retain v3 identity, binding provider, stable source-session scope, UTC hour, raw source-model token, raw mode token, and coding surface; source-ID set, totals, and canonical model mapping are excluded from identity; raw source IDs and identity inputs do not upload as separate fields",
+    "eventIdentity": "raw source IDs are account-scoped HMACs over content-independent source identity and deduplicate locally; Codex and Claude logical aggregates retain the released v4 identity domain and Kimi retains v3, binding provider, stable source-session scope, UTC hour, raw source-model token, raw mode token, and coding surface independently of parser/accounting generation and raw-versus-attributed classification; source-ID set, totals, canonical model mapping, and collector provenance are excluded from identity but changed canonical observation fields produce a new payload revision under the same event ID; raw source IDs and identity inputs do not upload as separate fields",
     "operationLock": "random owner token, open-handle lease renewed every stale-window quarter, live-PID stale-takeover guard, atomic rename/revalidation, and ownership-checked release",
     "atomicWriteRecovery": "atomic rename is the only replacement step; Windows EEXIST or EPERM retries that same primitive five times with bounded delay, then fails closed without unlinking the prior committed JSON and removes only that operation's temp; after the 15-minute lease window, state-changing startup may remove only exact known runtime-JSON temp names under connector home, only while proving ownership of the canonical overlap lock, only when both the temp and its unchanged committed counterpart are regular files and the encoded PID is no longer live; a temp that is the sole recovery copy is preserved; root and direct sync-page scans are non-recursive and bounded",
     "pathPrivacy": "raw paths are not persisted; installation-keyed HMAC aliases are persisted locally as cursor keys",
@@ -114,7 +114,8 @@
     "redirectOriginsAllowed": false,
     "queryStringsAllowed": false,
     "maximumResponseBytes": 1048576,
-    "rawOnlyCommit": "each raw-only event requires a matching per-event rawPreserved true response before its local source cursor can commit; score status may be accepted, quarantined, duplicate, or superseded",
+    "eventCommitAcknowledgement": "every submitted event requires exactly one matching response that explicitly reports submittedRevisionActive true, or submittedObservationCanonical true for an exact content duplicate under a different logical event; status and aggregate counts never authorize cursor commit and an isolated permanent rejection fails closed",
+    "rawOnlyCommit": "in addition to exact event acknowledgement, each raw-only event requires a matching per-event rawPreserved true response before its local source cursor can commit; score status may be accepted, quarantined, duplicate, or superseded",
     "retry": {
       "maximumAttempts": 3,
       "strategy": "exponential backoff with jitter or bounded standards-compliant Retry-After",
@@ -124,7 +125,7 @@
         "HTTP 429",
         "HTTP 5xx"
       ],
-      "permanent4xx": "no blind retry; eligible invalid batches are bisected and isolated invalid events are quarantined"
+      "permanent4xx": "no blind retry; eligible invalid batches are bisected and an isolated unacknowledged event or checkpoint blocks without committing its source cursor"
     }
   },
   "outboundUsageEventFields": [
