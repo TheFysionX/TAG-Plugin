@@ -1,4 +1,6 @@
-import { spawn as nodeSpawn } from "node:child_process";
+import { execFile as nodeExecFile, spawn as nodeSpawn } from "node:child_process";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { CONNECTOR_VERSION } from "../constants.mjs";
 
 const MAX_STDOUT_BYTES = 1024 * 1024;
@@ -30,9 +32,75 @@ function sanitizeUsageResult(value) {
   };
 }
 
+function executeForStdout(executable, arguments_, options = {}) {
+  const execFileImpl = options.execFileImpl || nodeExecFile;
+  return new Promise((resolve, reject) => {
+    execFileImpl(executable, arguments_, {
+      windowsHide: true,
+      timeout: options.timeoutMs || 2_000,
+      encoding: "utf8"
+    }, (error, stdout) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(typeof stdout === "string" ? stdout : String(stdout || ""));
+    });
+  });
+}
+
+async function findLocalCodexExecutable(options = {}) {
+  const localAppData = options.localAppData || process.env.LOCALAPPDATA;
+  if (!localAppData) return null;
+  const binaryRoot = path.join(localAppData, "OpenAI", "Codex", "bin");
+  try {
+    const entries = await fs.readdir(binaryRoot, { withFileTypes: true });
+    const candidates = [path.join(binaryRoot, "codex.exe")];
+    for (const entry of entries) {
+      if (entry.isDirectory()) candidates.push(path.join(binaryRoot, entry.name, "codex.exe"));
+    }
+    const existing = (await Promise.all(candidates.map(async (candidate) => {
+      try {
+        const stat = await fs.stat(candidate);
+        return stat.isFile() ? { candidate, modifiedAt: stat.mtimeMs } : null;
+      } catch {
+        return null;
+      }
+    }))).filter(Boolean);
+    existing.sort((left, right) => right.modifiedAt - left.modifiedAt);
+    return existing[0]?.candidate || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function resolveCodexExecutable(options = {}) {
+  const explicit = options.executable || process.env.CODEX_BINARY;
+  if (explicit) return explicit;
+  const platform = options.platform || process.platform;
+  if (platform !== "win32") return "codex";
+
+  const localExecutable = await (options.resolveLocalExecutable || findLocalCodexExecutable)(options);
+  if (localExecutable) return localExecutable;
+
+  try {
+    const stdout = await executeForStdout("where.exe", ["codex.exe"], options);
+    const resolved = stdout
+      .split(/\r?\n/u)
+      .map((line) => line.trim().replace(/^"|"$/gu, ""))
+      .find((candidate) => path.win32.isAbsolute(candidate) && /\.exe$/iu.test(candidate));
+    if (resolved) return resolved;
+  } catch {
+    // Fall back to normal PATH resolution below.
+  }
+  return "codex.exe";
+}
+
 export async function readCodexAccountUsage(options = {}) {
   const spawnImpl = options.spawnImpl || nodeSpawn;
-  const executable = options.executable || process.env.CODEX_BINARY || "codex";
+  const executable = options.spawnImpl && !options.resolveExecutable
+    ? (options.executable || process.env.CODEX_BINARY || "codex")
+    : await (options.resolveExecutable || resolveCodexExecutable)(options);
   const timeoutMs = options.timeoutMs || 6_000;
   return new Promise((resolve) => {
     let child;

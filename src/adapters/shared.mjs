@@ -126,13 +126,25 @@ export function normalizeModel(value) {
   return value.trim().slice(0, 120);
 }
 
-export function normalizeMode({ serviceTier, speed } = {}) {
-  const safeServiceTier = typeof serviceTier === "string" ? serviceTier.slice(0, 40) : null;
-  const safeSpeed = typeof speed === "string" ? speed.slice(0, 40) : null;
+export function normalizeMode({ provider, serviceTier, speed } = {}) {
+  const safeServiceTier = typeof serviceTier === "string"
+    ? serviceTier.trim().toLowerCase().slice(0, 40)
+    : null;
+  const safeSpeed = typeof speed === "string"
+    ? speed.trim().toLowerCase().slice(0, 40)
+    : null;
+  const fast = provider === "claude"
+    ? safeSpeed === "fast"
+    : (safeServiceTier === "priority" || safeSpeed === "fast");
+  const classified = provider === "claude"
+    ? ["fast", "standard"].includes(safeSpeed)
+    : (["priority", "default", "standard"].includes(safeServiceTier)
+      || ["fast", "standard"].includes(safeSpeed));
   return {
     serviceTier: safeServiceTier,
     speed: safeSpeed,
-    fast: safeServiceTier === "priority" || safeSpeed === "fast"
+    fast,
+    classified
   };
 }
 

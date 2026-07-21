@@ -106,3 +106,26 @@ test("loading a v2 aggregate cursor preserves and normalizes provider watermarks
     }
   });
 });
+
+test("loading pre-v4 Codex accounting resets only Codex generation state", async (context) => {
+  const home = await temporaryDirectory(context, "tag-plugin-codex-accounting-v4-");
+  const paths = runtimePaths({ home });
+  const state = initialState();
+  delete state.cursors.codex.accountingVersion;
+  state.cursors.codex.files.old_file = { offset: 123 };
+  state.cursors.codex.sessions = { ["a".repeat(64)]: { highWatermark: 999, lastSeenAt: 1 } };
+  state.cursors.claude.seen.preserved = { hash: "b".repeat(64), lastSeenAt: 2 };
+  state.cursors.aggregate.providers.codex.through = "2026-07-19T01:00:00.000Z";
+  state.cursors.aggregate.providers.claude.through = "2026-07-19T02:00:00.000Z";
+  state.providerEvidenceHashes = { codex: "old-checkpoint", claude: "preserved-checkpoint" };
+  await saveRuntime(paths, { state, config: initialConfig() });
+
+  const loaded = await loadRuntime(paths);
+
+  assert.deepEqual(loaded.state.cursors.codex, { accountingVersion: 4, files: {}, sessions: {} });
+  assert.equal(loaded.state.cursors.aggregate.providers.codex.through, null);
+  assert.equal(loaded.state.providerEvidenceHashes.codex, undefined);
+  assert.equal(loaded.state.cursors.aggregate.providers.claude.through, "2026-07-19T02:00:00.000Z");
+  assert.deepEqual(loaded.state.cursors.claude.seen.preserved, { hash: "b".repeat(64), lastSeenAt: 2 });
+  assert.equal(loaded.state.providerEvidenceHashes.claude, "preserved-checkpoint");
+});

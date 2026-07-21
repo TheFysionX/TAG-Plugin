@@ -1,8 +1,9 @@
-export const CONNECTOR_VERSION = "0.1.2";
+export const CONNECTOR_VERSION = "0.1.3";
 export const SCHEMA_VERSION = 1;
 export const GENESIS_HASH = "0".repeat(64);
 export const MAX_LOG_BYTES = 256 * 1024;
 export const MAX_CURSOR_FILES = 5_000;
+export const MAX_CODEX_LOGICAL_SESSIONS = 50_000;
 export const MAX_CLAUDE_SEEN_EVENTS = 250_000;
 export const MAX_UNRESOLVED_EVENTS = 2_000;
 export const MAX_INGEST_EVENTS = 3;

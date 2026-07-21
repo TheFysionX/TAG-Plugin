@@ -2,7 +2,36 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { readCodexAccountUsage } from "../src/adapters/codex-account-usage.mjs";
+import {
+  readCodexAccountUsage,
+  resolveCodexExecutable
+} from "../src/adapters/codex-account-usage.mjs";
+
+test("Codex app-server resolves the absolute Windows executable before spawning", async () => {
+  const expected = String.raw`C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0_x64\codex.exe`;
+  const calls = [];
+  const resolved = await resolveCodexExecutable({
+    platform: "win32",
+    resolveLocalExecutable: async () => null,
+    execFileImpl: (executable, arguments_, options, callback) => {
+      calls.push({ executable, arguments_, options });
+      callback(null, `${expected}\r\n`, "");
+    }
+  });
+  assert.equal(resolved, expected);
+  assert.deepEqual(calls[0].arguments_, ["codex.exe"]);
+  assert.equal(calls[0].options.windowsHide, true);
+});
+
+test("Codex app-server prefers the app-managed local binary on Windows", async () => {
+  const expected = String.raw`C:\Users\test\AppData\Local\OpenAI\Codex\bin\release\codex.exe`;
+  const resolved = await resolveCodexExecutable({
+    platform: "win32",
+    resolveLocalExecutable: async () => expected,
+    execFileImpl: () => assert.fail("where.exe should not run when the app-managed binary exists")
+  });
+  assert.equal(resolved, expected);
+});
 
 test("Codex app-server adapter uses initialize then account/usage/read", async () => {
   const requests = [];

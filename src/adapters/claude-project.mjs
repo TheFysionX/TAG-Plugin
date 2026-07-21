@@ -17,7 +17,10 @@ function assistantSnapshot(record, options, line) {
     return null;
   }
   const serviceTier = record.message.usage.service_tier || record.message.service_tier || record.service_tier || null;
-  const speed = record.message.speed || record.speed || null;
+  // Claude's service_tier is a routing/billing field, not the inference-speed
+  // control. usage.speed is authoritative; older journal placements remain
+  // compatibility fallbacks when the nested value is absent.
+  const speed = record.message.usage.speed ?? record.message.speed ?? record.speed ?? null;
   const sourceModelId = normalizeModel(record.message.model);
   const resolveModel = options.canonicalModelId || canonicalModelId;
   return {
@@ -32,7 +35,7 @@ function assistantSnapshot(record, options, line) {
       speed || "default"
     ].join("\0")),
     observedAt: normalizeTimestamp(record.timestamp),
-    mode: normalizeMode({ serviceTier, speed }),
+    mode: normalizeMode({ provider: "claude", serviceTier, speed }),
     usage: normalizeUsage(record.message.usage, "claude"),
     provenance: {
       collector: "claude_project_jsonl_fallback",

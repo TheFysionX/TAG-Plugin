@@ -9,6 +9,7 @@ import { parseClaudeProject } from "../src/adapters/claude-project.mjs";
 import { parseKimiWire } from "../src/adapters/kimi-wire.mjs";
 import { MAX_JOURNAL_LINE_BYTES } from "../src/adapters/shared.mjs";
 import { canonicalModelId as resolveCanonicalModel } from "../src/model-registry.mjs";
+import { collectUsage, toWireEvent } from "../src/collector.mjs";
 
 const fixtureDirectory = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const aliasKey = Buffer.alloc(32, 7).toString("base64");
@@ -41,6 +42,101 @@ test("Codex fallback extracts only allowlisted final-turn usage", async () => {
   assert.equal(parsed.duplicateSnapshots, 1);
   assert.equal(parsed.cumulativeMismatches, 0);
   assert.doesNotMatch(serialized(parsed), /SECRET_|private|repository/i);
+});
+
+test("Codex lineage suppresses resumed, forked, and re-timestamped inherited usage", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-codex-lineage-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const fixture = JSON.parse(await fs.readFile(
+    path.join(fixtureDirectory, "codex-lineage-copies.json"),
+    "utf8"
+  ));
+  const paths = {};
+  for (const [name, records] of Object.entries(fixture)) {
+    paths[name] = path.join(temporary, `rollout-${name}.jsonl`);
+    await fs.writeFile(paths[name], records.map(JSON.stringify).join("\n") + "\n", "utf8");
+  }
+  const logicalSessions = {};
+  const parsed = {};
+  for (const name of ["original", "resumed", "forked", "rewritten"]) {
+    parsed[name] = await parseCodexRollout(paths[name], {
+      aliasKey,
+      dedupNamespaceKey,
+      logicalSessions,
+      now: 123
+    });
+  }
+
+  assert.deepEqual(
+    ["original", "resumed", "forked", "rewritten"].map((name) => parsed[name].events.length),
+    [2, 1, 1, 0]
+  );
+  assert.equal(
+    Object.values(parsed).flatMap((result) => result.events)
+      .reduce((total, event) => total + event.usage.total, 0),
+    220
+  );
+  assert.equal(parsed.original.events[0].aggregationScope, parsed.original.events[1].aggregationScope);
+  assert.equal(parsed.original.events[0].aggregationScope, parsed.resumed.events[0].aggregationScope);
+  assert.notEqual(parsed.original.events[0].aggregationScope, parsed.forked.events[0].aggregationScope);
+  assert.equal(parsed.resumed.events[0].mode.fast, true);
+  assert.equal(parsed.forked.events[0].mode.fast, false);
+  assert.equal(parsed.forked.events[0].mode.classified, true);
+  assert.equal(parsed.resumed.inheritedSnapshots, 2);
+  assert.equal(parsed.forked.inheritedSnapshots, 1);
+  assert.equal(parsed.rewritten.inheritedSnapshots, 2);
+
+  const originalAlone = await parseCodexRollout(paths.original, { aliasKey, dedupNamespaceKey });
+  const rewrittenAlone = await parseCodexRollout(paths.rewritten, { aliasKey, dedupNamespaceKey });
+  assert.deepEqual(
+    rewrittenAlone.events.map((event) => event.eventId),
+    originalAlone.events.map((event) => event.eventId)
+  );
+
+  const restoredSessions = {};
+  const initiallyCommitted = await parseCodexRollout(paths.original, {
+    aliasKey,
+    dedupNamespaceKey,
+    logicalSessions: restoredSessions,
+    now: 100
+  });
+  delete restoredSessions[initiallyCommitted.cursor.logicalSessionAlias];
+  const unchanged = await parseCodexRollout(paths.original, {
+    aliasKey,
+    dedupNamespaceKey,
+    logicalSessions: restoredSessions,
+    cursor: initiallyCommitted.cursor,
+    now: 200
+  });
+  assert.equal(unchanged.events.length, 0);
+  assert.equal(
+    restoredSessions[initiallyCommitted.cursor.logicalSessionAlias].highWatermark,
+    150
+  );
+
+  const collectInOrder = (files) => collectUsage({
+    roots: { codex: temporary, claude: path.join(temporary, "none-claude"), kimi: path.join(temporary, "none-kimi") },
+    state: {
+      cursors: {
+        codex: { accountingVersion: 4, files: {}, sessions: {} },
+        claude: { seen: {} },
+        kimi: { files: {} }
+      }
+    },
+    secrets: { localAliasKey: aliasKey },
+    dedupNamespaceKey,
+    enabledFallbacks: { codex: true, claude: false, kimi: false },
+    officialEvidence: false,
+    discoverJsonlFiles: async () => ({ files, unavailable: false, truncated: false }),
+    now: 123
+  });
+  const forward = await collectInOrder(Object.values(paths));
+  const reversed = await collectInOrder(Object.values(paths).reverse());
+  assert.equal(forward.events.reduce((total, event) => total + event.usage.total, 0), 220);
+  assert.deepEqual(
+    reversed.events.map((event) => event.eventId),
+    forward.events.map((event) => event.eventId)
+  );
 });
 
 test("Codex fallback pages a large journal without changing event identity or totals", async (context) => {
@@ -141,6 +237,44 @@ test("Claude fallback deduplicates message snapshots using the maximum/final usa
   assert.equal(known.mode.fast, true);
   assert.equal(unknown.sourceModelId, "claude-unregistered-99");
   assert.doesNotMatch(serialized(parsed), /SECRET_|private|source\.ts/i);
+});
+
+test("Claude classifies speed only from message usage evidence", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-claude-speed-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "claude-speed.jsonl");
+  await fs.writeFile(activePath, [
+    {
+      type: "assistant",
+      timestamp: "2026-07-19T11:00:00.000Z",
+      speed: "fast",
+      message: {
+        id: "msg_standard_speed",
+        model: "claude-sonnet-5-20260701",
+        stop_reason: "end_turn",
+        usage: { input_tokens: 10, output_tokens: 5, service_tier: "priority", speed: "standard" }
+      }
+    },
+    {
+      type: "assistant",
+      timestamp: "2026-07-19T11:01:00.000Z",
+      message: {
+        id: "msg_missing_speed",
+        model: "claude-sonnet-5-20260701",
+        stop_reason: "end_turn",
+        usage: { input_tokens: 10, output_tokens: 5, service_tier: "priority" }
+      }
+    }
+  ].map(JSON.stringify).join("\n") + "\n", "utf8");
+  const parsed = await parseClaudeProject(activePath, { dedupNamespaceKey });
+  const standard = parsed.events.find((event) => event.mode.speed === "standard");
+  const unclassified = parsed.events.find((event) => event.mode.speed === null);
+  assert.equal(standard.mode.fast, false);
+  assert.equal(standard.mode.classified, true);
+  assert.equal(unclassified.mode.fast, false);
+  assert.equal(unclassified.mode.classified, false);
+  assert.equal(toWireEvent(standard)?.serviceMode, "standard");
+  assert.equal(toWireEvent(unclassified), null);
 });
 
 test("Kimi v0.28 fallback prefilters usage.record and maps HighSpeed to fast", async () => {
@@ -318,7 +452,7 @@ test("Codex cursor resets after an in-place larger rewrite preserves file metada
   assert.equal(second.cursor.fileIdentity, first.cursor.fileIdentity);
   assert.equal(second.events.length, 1);
   assert.equal(second.events[0].usage.total, 270);
-  assert.equal(second.events[0].eventId, first.events[0].eventId);
+  assert.notEqual(second.events[0].eventId, first.events[0].eventId);
   assert.notEqual(second.cursor.usagePrefixDigest, first.cursor.usagePrefixDigest);
 });
 
@@ -460,7 +594,7 @@ test("Codex advances past an unknown model for the local unresolved queue", asyn
   assert.equal(second.cursor.offset, (await fs.stat(activePath)).size);
 });
 
-test("Codex timestamp-fallback IDs survive reformatting when cumulative usage is absent", async (context) => {
+test("Codex fails closed when cumulative lineage evidence is absent", async (context) => {
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-codex-id-stability-test-"));
   context.after(() => fs.rm(temporary, { recursive: true, force: true }));
   const activePath = path.join(temporary, "rollout-00000000-0000-4000-8000-000000000001.jsonl");
@@ -480,8 +614,10 @@ test("Codex timestamp-fallback IDs survive reformatting when cumulative usage is
   await fs.writeFile(activePath, `${JSON.stringify({ type: "trace", ignored: true })}\n${original}${"\n".repeat(512)}`, "utf8");
   const second = await parseCodexRollout(activePath, { dedupNamespaceKey, cursor: first.cursor });
   assert.equal(second.cursor.fileIdentity, first.cursor.fileIdentity);
-  assert.equal(second.events.length, 1);
-  assert.equal(second.events[0].eventId, first.events[0].eventId);
+  assert.equal(first.events.length, 0);
+  assert.equal(first.ambiguousLineage, 1);
+  assert.equal(second.events.length, 0);
+  assert.equal(second.ambiguousLineage, 1);
 });
 
 test("Codex IDs distinguish separate eligible token records at the same timestamp", async (context) => {

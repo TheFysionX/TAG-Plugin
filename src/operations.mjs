@@ -123,6 +123,9 @@ function safeScanSummary(stats) {
     duplicateSnapshots: value.duplicateSnapshots || 0,
     cumulativeResets: value.cumulativeResets || 0,
     cumulativeMismatches: value.cumulativeMismatches || 0,
+    inheritedSnapshots: value.inheritedSnapshots || 0,
+    ambiguousLineage: value.ambiguousLineage || 0,
+    unclassifiedModes: value.unclassifiedModes || 0,
     pending: Boolean(value.pending),
     truncated: Boolean(value.truncated),
     collector: value.collector || null
@@ -134,6 +137,10 @@ function oversizedReleasedV1Outbox(state) {
     && state.syncOutbox.version === 1
     && Number.isSafeInteger(state.syncOutbox.totalEvents)
     && state.syncOutbox.totalEvents > MAX_SYNC_OUTBOX_EVENTS;
+}
+
+function staleAggregateV3Outbox(state) {
+  return state.syncOutbox?.version === 3;
 }
 
 function floorUtcHour(milliseconds) {
@@ -206,9 +213,37 @@ function migrateOversizedReleasedV1Outbox(runtime, historyRange) {
   runtime.state.syncOutbox = null;
 }
 
+function resetCodexAccountingGeneration(state) {
+  state.cursors.codex = { accountingVersion: 4, files: {}, sessions: {} };
+  if (state.cursors.aggregate?.providers?.codex) {
+    state.cursors.aggregate.providers.codex.through = null;
+  }
+  delete state.providerEvidenceHashes.codex;
+}
+
+async function discardStaleAggregateV3Outbox(runtime, paths) {
+  const outbox = runtime.state.syncOutbox;
+  const migration = {
+    batchId: SYNC_BATCH_ID_PATTERN.test(outbox?.batchId || "") ? outbox.batchId : null,
+    remainingChunks: remainingSyncChunks(outbox),
+    remainingEvents: Math.max(0, (outbox?.totalEvents || 0) - (outbox?.processedEvents || 0)),
+    remainingCheckpoints: Math.max(0, (outbox?.totalCheckpoints || 0) - (outbox?.processedCheckpoints || 0))
+  };
+  // The request chain is independent from the local collection outbox. With no
+  // pending request, removing only the stale v3 work preserves pairing,
+  // sequence, prior digest, and committed non-Codex cursors. Codex's accounting
+  // generation is reset deliberately so completed v3 files are recollected.
+  runtime.state.syncOutbox = null;
+  resetCodexAccountingGeneration(runtime.state);
+  await saveRuntime(paths, runtime);
+  if (migration.batchId) await cleanupSyncBatch(paths, migration.batchId);
+  return migration;
+}
+
 function toUnresolvedEvent(event) {
   if (!event?.eventId
     || !event?.observedAt
+    || event?.mode?.classified === false
     || typeof event?.sourceModelId !== "string"
     || !SOURCE_MODEL_PATTERN.test(event.sourceModelId)) return null;
   return {
@@ -317,11 +352,38 @@ function checkpointForBucket(bucket) {
   };
 }
 
+function lifetimeCodexCheckpoint(codexEvidence, dailyCheckpoints) {
+  const lifetimeTokens = codexEvidence?.summary?.lifetimeTokens;
+  if (!Number.isSafeInteger(lifetimeTokens) || lifetimeTokens < 0 || dailyCheckpoints.length === 0) {
+    return null;
+  }
+  // The source names the cumulative semantics. The period is the observation
+  // day (not the lifetime coverage span), keeping the wire contract's bounded
+  // checkpoint-period invariant while allowing latest-observation selection.
+  const latestObservation = [...dailyCheckpoints]
+    .sort((left, right) => right.periodStart.localeCompare(left.periodStart))[0];
+  const seed = {
+    provider: "codex",
+    source: "codex_app_server_account_usage_lifetime",
+    periodStart: latestObservation.periodStart,
+    periodEnd: latestObservation.periodEnd,
+    totalTokens: String(lifetimeTokens)
+  };
+  return {
+    checkpointId: sha256(JSON.stringify(seed)),
+    ...seed
+  };
+}
+
 function codexCheckpoints(providerEvidence) {
   if (providerEvidence?.codex?.status !== "available" || !Array.isArray(providerEvidence.codex.dailyUsageBuckets)) {
     return [];
   }
-  return providerEvidence.codex.dailyUsageBuckets.map(checkpointForBucket).filter(Boolean);
+  const dailyCheckpoints = providerEvidence.codex.dailyUsageBuckets
+    .map(checkpointForBucket)
+    .filter(Boolean);
+  const lifetimeCheckpoint = lifetimeCodexCheckpoint(providerEvidence.codex, dailyCheckpoints);
+  return lifetimeCheckpoint ? [lifetimeCheckpoint, ...dailyCheckpoints] : dailyCheckpoints;
 }
 
 function acceptedRequestDigest(response) {
@@ -426,8 +488,12 @@ function activePageEvents(outbox) {
     : [];
 }
 
+function isPagedSyncOutbox(outbox) {
+  return outbox?.version === 3 || outbox?.version === 4;
+}
+
 function assertActiveSyncPage(outbox) {
-  if (outbox.version !== 3) return;
+  if (!isPagedSyncOutbox(outbox)) return;
   const manifest = outbox.pages?.[outbox.pageIndex];
   const events = activePageEvents(outbox);
   const page = syncPagePayload(outbox.batchId, outbox.pageIndex, events);
@@ -472,7 +538,7 @@ function assertActiveSyncPage(outbox) {
 }
 
 function futureSyncChunks(outbox) {
-  if (outbox.version !== 3 || !Array.isArray(outbox.pages)) return 0;
+  if (!isPagedSyncOutbox(outbox) || !Array.isArray(outbox.pages)) return 0;
   return outbox.pages
     .slice(outbox.pageIndex + 1)
     .reduce((total, page) => total + Math.ceil(page.eventCount / MAX_INGEST_EVENTS), 0);
@@ -518,7 +584,7 @@ async function createPagedSyncOutbox(paths, events, checkpoints, commit, options
   }
   const chunks = chunkSyncPayloads(pageEvents[0], checkpoints);
   return {
-    version: 3,
+    version: 4,
     batchId,
     pageIndex: 0,
     pageCount,
@@ -555,7 +621,7 @@ async function saveFinalizedRuntime(paths, runtime, cleanupBatchId) {
 async function advanceCompletedOutbox(runtime, paths) {
   const outbox = runtime.state.syncOutbox;
   if (!outbox || outbox.index < outbox.chunks.length) return null;
-  if (outbox.version === 3 && outbox.pageIndex + 1 < outbox.pageCount) {
+  if (isPagedSyncOutbox(outbox) && outbox.pageIndex + 1 < outbox.pageCount) {
     const nextPageIndex = outbox.pageIndex + 1;
     const page = await readSyncPage(paths, outbox, nextPageIndex);
     outbox.pageIndex = nextPageIndex;
@@ -565,7 +631,7 @@ async function advanceCompletedOutbox(runtime, paths) {
     assertActiveSyncPage(outbox);
     return null;
   }
-  const cleanupBatchId = outbox.version === 3 ? outbox.batchId : null;
+  const cleanupBatchId = isPagedSyncOutbox(outbox) ? outbox.batchId : null;
   runtime.state.cursors = outbox.commit.nextCursors;
   if (outbox.commit.checkpointHash) {
     runtime.state.providerEvidenceHashes.codex = outbox.commit.checkpointHash;
@@ -751,16 +817,16 @@ async function sendHeartbeatRequest(runtime, secrets, paths, options) {
 
 export function chunkSyncPayloads(events, checkpoints) {
   const chunks = [];
-  for (let index = 0; index < events.length; index += MAX_INGEST_EVENTS) {
-    chunks.push({
-      events: events.slice(index, index + MAX_INGEST_EVENTS),
-      checkpoints: []
-    });
-  }
   for (let index = 0; index < checkpoints.length; index += MAX_INGEST_CHECKPOINTS) {
     chunks.push({
       events: [],
       checkpoints: checkpoints.slice(index, index + MAX_INGEST_CHECKPOINTS)
+    });
+  }
+  for (let index = 0; index < events.length; index += MAX_INGEST_EVENTS) {
+    chunks.push({
+      events: events.slice(index, index + MAX_INGEST_EVENTS),
+      checkpoints: []
     });
   }
   return chunks;
@@ -1019,7 +1085,7 @@ export async function pair(options = {}) {
         throw new ConnectorError("PAIR_WHILE_SYNC_PENDING", "Finish or resolve the pending authenticated request before pairing again.");
       }
       // Cursors were never committed, so dropping this rejected outbox is lossless: it will be recollected after re-pair.
-      const abandonedBatchId = runtime.state.syncOutbox?.version === 3
+      const abandonedBatchId = isPagedSyncOutbox(runtime.state.syncOutbox)
         ? runtime.state.syncOutbox.batchId
         : null;
       runtime.state.pendingRequest = null;
@@ -1233,6 +1299,43 @@ export async function sync(options = {}) {
     if (runtime.state.pendingRequest?.kind === "sync" && !runtime.state.syncOutbox) {
       throw new ConnectorError("MISSING_SYNC_OUTBOX", "A pending sync request has no matching local outbox.");
     }
+    if (staleAggregateV3Outbox(runtime.state) && runtime.state.pendingRequest?.kind === "sync") {
+      const recovered = await processSyncOutbox(runtime, secrets, paths, {
+        ...options,
+        maxIngestRequests: 1
+      });
+      let discarded = null;
+      if (!runtime.state.pendingRequest && staleAggregateV3Outbox(runtime.state)) {
+        discarded = await discardStaleAggregateV3Outbox(runtime, paths);
+      } else if (!runtime.state.pendingRequest && !runtime.state.syncOutbox) {
+        // The exact pending request was the final v3 chunk and finalized its old
+        // commit. Force the corrected Codex generation to rescan on the next run.
+        resetCodexAccountingGeneration(runtime.state);
+        await saveRuntime(paths, runtime);
+      }
+      await safeLog(paths.log, {
+        action: "sync",
+        status: "replayed_pending_then_retired_v3_outbox",
+        eventCount: discarded?.remainingEvents || 0,
+        sequence: runtime.state.nextSequence
+      });
+      return {
+        recovered: true,
+        retiredStaleV3: true,
+        ...recovered,
+        remainingChunks: remainingSyncChunks(runtime.state.syncOutbox),
+        nextSequence: runtime.state.nextSequence
+      };
+    }
+    if (staleAggregateV3Outbox(runtime.state) && !runtime.state.pendingRequest) {
+      const discarded = await discardStaleAggregateV3Outbox(runtime, paths);
+      await safeLog(paths.log, {
+        action: "sync",
+        status: "discarded_stale_v3_outbox",
+        eventCount: discarded.remainingEvents,
+        sequence: runtime.state.nextSequence
+      });
+    }
     if (aggregateHistory && oversizedReleasedV1Outbox(runtime.state) && !runtime.state.pendingRequest) {
       const abandonedEvents = runtime.state.syncOutbox.totalEvents;
       migrateOversizedReleasedV1Outbox(runtime, historyWindow);
@@ -1301,7 +1404,9 @@ export async function sync(options = {}) {
     );
     const currentWireEvents = eligibleEvents.map(toWireEvent).filter(Boolean);
     const currentUnresolved = [];
-    for (const event of eligibleEvents.filter((candidate) => !candidate.modelId)) {
+    for (const event of eligibleEvents.filter((candidate) =>
+      !candidate.modelId && candidate.mode?.classified !== false
+    )) {
       const normalized = toUnresolvedEvent(event);
       if (normalized) {
         currentUnresolved.push(normalized);

@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
-import { MAX_MIGRATION_EXCLUSIONS, MAX_UNRESOLVED_EVENTS, SCHEMA_VERSION } from "./constants.mjs";
+import { MAX_CODEX_LOGICAL_SESSIONS, MAX_MIGRATION_EXCLUSIONS, MAX_UNRESOLVED_EVENTS, SCHEMA_VERSION } from "./constants.mjs";
 
 const UNRESOLVED_EVENT_KEYS = new Set([
   "eventId",
@@ -41,6 +41,21 @@ function normalizedAggregateCursors(value) {
       }];
     }))
   };
+}
+
+function normalizedCodexSessions(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value)
+    .filter(([alias, entry]) => /^[a-f0-9]{64}$/.test(alias)
+      && Number.isSafeInteger(entry?.highWatermark)
+      && entry.highWatermark >= 0)
+    .sort((a, b) => (b[1]?.lastSeenAt || 0) - (a[1]?.lastSeenAt || 0))
+    .slice(0, MAX_CODEX_LOGICAL_SESSIONS)
+    .map(([alias, entry]) => [alias, {
+      epoch: Number.isSafeInteger(entry.epoch) && entry.epoch >= 0 ? entry.epoch : 0,
+      highWatermark: entry.highWatermark,
+      lastSeenAt: Number.isFinite(entry.lastSeenAt) ? entry.lastSeenAt : 0
+    }]));
 }
 
 function normalizedUnresolvedEvent(value) {
@@ -83,7 +98,7 @@ export function initialState() {
     unresolvedOverflow: { totalDropped: 0, lastOverflowAt: null },
     providerEvidenceHashes: {},
     cursors: {
-      codex: { files: {} },
+      codex: { accountingVersion: 4, files: {}, sessions: {} },
       claude: { seen: {} },
       kimi: { files: {} },
       aggregate: initialAggregateCursors()
@@ -127,10 +142,25 @@ export async function loadRuntime(paths) {
   ]);
   state.cursors = state.cursors || initialState().cursors;
   state.providerEvidenceHashes = state.providerEvidenceHashes || {};
-  state.cursors.codex = state.cursors.codex || { files: {} };
+  state.cursors.codex = state.cursors.codex || { files: {}, sessions: {} };
+  state.cursors.codex.files = state.cursors.codex.files
+    && typeof state.cursors.codex.files === "object"
+    && !Array.isArray(state.cursors.codex.files)
+    ? state.cursors.codex.files
+    : {};
+  state.cursors.codex.sessions = normalizedCodexSessions(state.cursors.codex.sessions);
   state.cursors.claude = state.cursors.claude || { seen: {} };
   state.cursors.kimi = state.cursors.kimi || { files: {} };
   state.cursors.aggregate = normalizedAggregateCursors(state.cursors.aggregate);
+  if (state.cursors.codex.accountingVersion !== 4) {
+    // v4 changes both physical replay detection and logical session identity.
+    // Old completed cursors must not short-circuit the one corrected rescan.
+    state.cursors.codex = { accountingVersion: 4, files: {}, sessions: {} };
+    state.cursors.aggregate.providers.codex.through = null;
+    delete state.providerEvidenceHashes.codex;
+  } else {
+    state.cursors.codex.accountingVersion = 4;
+  }
   config.transcriptFallbacks = {
     codex: Boolean(config.transcriptFallbacks?.codex),
     claude: Boolean(config.transcriptFallbacks?.claude),

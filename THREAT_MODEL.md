@@ -13,7 +13,7 @@
 | --- | --- | --- |
 | Network replay | Unique request ID, timestamp window, monotonic sequence | The same signed request is detectable. |
 | Batch deletion/reordering after submission | Previous-request digest chain | A later client cannot silently rewrite the server's accepted chain. |
-| Duplicate journal scans | Account-scoped source IDs, stable v3 session-hour IDs independent of source set/canonical mapping, preserved cursors, Claude sent ledger, and server idempotency | An unchanged replay is idempotent; a partial or expanded replay cannot mint a separately scoreable ID. |
+| Duplicate journal scans | Account-scoped source IDs, lineage-aware Codex endpoints, stable provider-versioned session-hour IDs independent of source set/canonical mapping, preserved cursors, Claude sent ledger, and server idempotency | An unchanged replay is idempotent; a partial or expanded replay cannot mint a separately scoreable ID. |
 | Duplicate physical journals | In-memory source-ID set before hourly summing | Copied records with the same provider identity count once. |
 | Reinstall with preserved state | Uninstall preserves cursors, the Claude sent ledger, and the server-issued per-account namespace | Later records remain append-only without cross-account linkability. |
 | Oversized first history | 89-day scored window, stable hourly aggregation, private digest-manifest pages of at most 5,000 events, disjoint 3/2 request chunks, and bounded catch-up | Guaranteed-quarantine history is skipped and server/query/rate limits are respected without early cursor advancement. |
@@ -42,7 +42,7 @@
 
 An open-source connector running under a user's account cannot prove that the user did not modify the executable, forge local journal fixtures, suppress events before first submission, run multiple accounts, or manipulate the machine clock within allowed tolerances. Agent review improves transparency but is not remote attestation.
 
-Deleting local state and then rescanning a session-hour after its journal gained or lost records can change the aggregate totals, but not its stable v3 event ID. The server therefore sees a conflicting body under the existing ID and the connector rejects or quarantines it rather than creating extra scored usage. This prevents a partial-overlap replay from double-scoring; it does not reconstruct lost continuity. Uninstall intentionally preserves state; device revocation and state loss should still be treated as a new trust epoch rather than assumed equivalent to an append-safe reinstall.
+Deleting local state and then rescanning a session-hour after its journal gained or lost records can change the aggregate totals, but not its stable provider-versioned event ID. The server therefore sees a conflicting body under the existing ID and the connector rejects or quarantines it rather than creating extra scored usage. This prevents a partial-overlap replay from double-scoring; it does not reconstruct lost continuity. Uninstall intentionally preserves state; device revocation and state loss should still be treated as a new trust epoch rather than assumed equivalent to an append-safe reinstall.
 
 Consequently:
 

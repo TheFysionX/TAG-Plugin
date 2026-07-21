@@ -611,6 +611,71 @@ test("sync sends only strict allowlisted wire events and advances the request ch
   assert.equal(second.sent, 0);
 });
 
+test("Codex lifetime authority is the first checkpoint in the first ingest request", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_lifetime_checkpoint";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["codex"];
+  config.supportedProviders = ["codex"];
+  config.transcriptFallbacks = { codex: false, claude: false, kimi: false };
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+  const bodies = [];
+  const evidence = {
+    status: "available",
+    summary: { lifetimeTokens: 17_772_403_863 },
+    dailyUsageBuckets: [
+      { startDate: "2026-07-18", tokens: 100 },
+      { startDate: "2026-07-19", tokens: 200 },
+      { startDate: "2026-07-20", tokens: 300 }
+    ]
+  };
+  const result = await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    readCodexAccountUsage: async () => evidence,
+    chunkPaceMs: 0,
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      bodies.push(body);
+      return jsonResponse({
+        request: { digest: `digest_lifetime_checkpoint_${bodies.length}_1234567890` },
+        accepted: 0,
+        duplicates: 0,
+        rejected: 0
+      });
+    }
+  });
+  assert.equal(result.sent, 0);
+  assert.equal(result.checkpoints, 4);
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies.every((body) => body.events.length === 0), true);
+  assert.deepEqual(bodies[0].checkpoints[0], {
+    checkpointId: bodies[0].checkpoints[0].checkpointId,
+    provider: "codex",
+    source: "codex_app_server_account_usage_lifetime",
+    periodStart: "2026-07-20T00:00:00.000Z",
+    periodEnd: "2026-07-21T00:00:00.000Z",
+    totalTokens: "17772403863"
+  });
+  assert.equal(bodies[0].checkpoints[1].source, "codex_app_server_account_usage");
+  assert.deepEqual(
+    bodies.flatMap((body) => body.checkpoints).map((checkpoint) => checkpoint.source),
+    [
+      "codex_app_server_account_usage_lifetime",
+      "codex_app_server_account_usage",
+      "codex_app_server_account_usage",
+      "codex_app_server_account_usage"
+    ]
+  );
+});
+
 test("a lost response retries the exact persisted request ID and body", async (context) => {
   const fixture = await setup();
   context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
@@ -903,7 +968,7 @@ test("aggregate history above 5,000 records is durably paged instead of rejected
   assert.equal(result.catchingUp, true);
   const updated = await loadRuntime(fixture.paths);
   const outbox = updated.state.syncOutbox;
-  assert.equal(outbox.version, 3);
+  assert.equal(outbox.version, 4);
   assert.equal(outbox.totalEvents, MAX_SYNC_OUTBOX_EVENTS + 1);
   assert.equal(outbox.pageCount, 2);
   assert.equal(outbox.pages[0].eventCount, MAX_SYNC_OUTBOX_EVENTS);
@@ -1183,7 +1248,7 @@ test("aggregate through watermarks advance independently and preserve deferred p
       model: "claude-sonnet-5-20260701",
       stop_reason: "end_turn",
       content: "PRIVATE_DEFERRED_CONTENT",
-      usage: { input_tokens: 21, cache_read_input_tokens: 4, output_tokens: 9 }
+      usage: { input_tokens: 21, cache_read_input_tokens: 4, output_tokens: 9, speed: "standard" }
     }
   }) + "\n", "utf8");
   const providerDiscovery = (status) => async (root) => {
@@ -1536,6 +1601,127 @@ test("sync migrates an oversized released-v1 raw outbox without replaying accept
   assert.equal(completed.state.syncOutbox, null);
   assert.equal(completed.state.migrationExcludedEvents[0].eventId, rawEvent.eventId);
   assert.match(await fs.readFile(fixture.paths.log, "utf8"), /requeued_released_v1_outbox/);
+});
+
+test("sync discards only stale v3 remaining work while preserving the request chain", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_v3_migration";
+  state.nextSequence = 17;
+  state.previousRequestDigest = "digest_before_v3_migration_123456";
+  state.cursors.codex.files.committed_marker = { lastSeenAt: 1 };
+  state.cursors.kimi.files.preserved_marker = { lastSeenAt: 2 };
+  const batchId = "a".repeat(24);
+  state.syncOutbox = {
+    version: 3,
+    batchId,
+    index: 1,
+    chunks: [
+      { events: [{ eventId: "b".repeat(64) }], checkpoints: [] },
+      { events: [{ eventId: "c".repeat(64) }], checkpoints: [] }
+    ],
+    totalEvents: 2,
+    totalCheckpoints: 0,
+    processedEvents: 1,
+    processedCheckpoints: 0
+  };
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  await fs.mkdir(path.join(fixture.paths.syncPages, batchId), { recursive: true });
+  await fs.writeFile(path.join(fixture.paths.syncPages, batchId, "000001.json"), "{}\n", "utf8");
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+
+  const result = await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    aggregateHistory: true,
+    officialEvidence: false,
+    fetchImpl: async () => { throw new Error("discarding idle v3 work must not use the network"); }
+  });
+  assert.equal(result.sent, 0);
+  const updated = await loadRuntime(fixture.paths);
+  assert.equal(updated.state.syncOutbox, null);
+  assert.equal(updated.state.paired, true);
+  assert.equal(updated.state.deviceId, "device_v3_migration");
+  assert.equal(updated.state.nextSequence, 17);
+  assert.equal(updated.state.previousRequestDigest, "digest_before_v3_migration_123456");
+  assert.deepEqual(updated.state.cursors.codex.files, {});
+  assert.deepEqual(updated.state.cursors.codex.sessions, {});
+  assert.deepEqual(updated.state.cursors.kimi.files.preserved_marker, { lastSeenAt: 2 });
+  assert.equal(
+    await fs.access(path.join(fixture.paths.syncPages, batchId)).then(() => true).catch(() => false),
+    false
+  );
+  assert.match(await fs.readFile(fixture.paths.log, "utf8"), /discarded_stale_v3_outbox/);
+});
+
+test("sync replays one exact pending v3 request before retiring the old generation", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_pending_v3_migration";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["kimi"];
+  config.supportedProviders = ["kimi"];
+  config.transcriptFallbacks = { codex: false, claude: false, kimi: true };
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+
+  let firstRequest;
+  await assert.rejects(() => sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    officialEvidence: false,
+    maxAttempts: 1,
+    chunkPaceMs: 0,
+    fetchImpl: async (_url, init) => {
+      firstRequest = init;
+      throw new Error("simulated lost v3 response");
+    }
+  }), /could not be reached/);
+  const stranded = await loadRuntime(fixture.paths);
+  stranded.state.syncOutbox.version = 3;
+  await saveRuntime(fixture.paths, stranded);
+
+  const retries = [];
+  const recovered = await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    officialEvidence: false,
+    chunkPaceMs: 0,
+    fetchImpl: async (_url, init) => {
+      retries.push(init);
+      const body = JSON.parse(init.body);
+      return jsonResponse({
+        request: { digest: "digest_pending_v3_replay_1234567890" },
+        accepted: body.events.length,
+        duplicates: 0,
+        rejected: 0,
+        events: body.events.map((event) => ({ eventId: event.eventId, status: "accepted" }))
+      });
+    }
+  });
+  assert.equal(recovered.recovered, true);
+  assert.equal(recovered.retiredStaleV3, true);
+  assert.equal(retries.length, 1);
+  assert.equal(retries[0].body, firstRequest.body);
+  assert.equal(retries[0].headers["x-tokenboard-request-id"], firstRequest.headers["x-tokenboard-request-id"]);
+  const updated = await loadRuntime(fixture.paths);
+  assert.equal(updated.state.pendingRequest, null);
+  assert.equal(updated.state.syncOutbox, null);
+  assert.equal(updated.state.nextSequence, 2);
+  assert.equal(updated.state.previousRequestDigest, "digest_pending_v3_replay_1234567890");
+  assert.deepEqual(updated.state.cursors.codex, { accountingVersion: 4, files: {}, sessions: {} });
+  assert.match(await fs.readFile(fixture.paths.log, "utf8"), /replayed_pending_then_retired_v3_outbox/);
 });
 
 test("sync drains an unreleased version-2 aggregate outbox under its original IDs", async (context) => {
@@ -1955,8 +2141,8 @@ test("sync payload chunker enforces disjoint event and checkpoint caps", () => {
   assert.equal(chunks.every((chunk) => chunk.events.length <= 3), true);
   assert.equal(chunks.every((chunk) => chunk.checkpoints.length <= 2), true);
   assert.equal(chunks.every((chunk) => (chunk.events.length > 0) !== (chunk.checkpoints.length > 0)), true);
-  assert.deepEqual(chunks.map((chunk) => chunk.events.length), [3, 3, 2, 0, 0, 0]);
-  assert.deepEqual(chunks.map((chunk) => chunk.checkpoints.length), [0, 0, 0, 2, 2, 1]);
+  assert.deepEqual(chunks.map((chunk) => chunk.events.length), [0, 0, 0, 3, 3, 2]);
+  assert.deepEqual(chunks.map((chunk) => chunk.checkpoints.length), [2, 2, 1, 0, 0, 0]);
   assert.deepEqual(chunkSyncPayloads([], []), []);
 });
 
@@ -2196,7 +2382,7 @@ test("scheduler mutation is preview-only until the exact confirmation flag", asy
   assert.match(commands[0].join(" "), /SetAccessRuleProtection/);
   assert.match(commands[0].join(" "), /Current-user-only ACL verification failed/);
   assert.equal(commands[1][0], "schtasks.exe");
-  assert.match(commands[1].join(" "), /versions[\\/]0\.1\.2[\\/]src[\\/]cli\.mjs/);
+  assert.match(commands[1].join(" "), /versions[\\/]0\.1\.3[\\/]src[\\/]cli\.mjs/);
   assert.match(commands[1].join(" "), /scheduled-run --home/);
   assert.equal(await fs.access(path.join(installed.installedRelease, "package.json")).then(() => true), true);
   assert.equal(await fs.access(path.join(installed.installedRelease, "RELEASING.md")).then(() => true), true);
@@ -2234,7 +2420,7 @@ test("Windows installation fails closed before copying or scheduling when ACL ha
   }), (error) => error.code === "WINDOWS_ACL_HARDENING_FAILED");
   assert.equal(commands.length, 1);
   assert.match(commands[0][0], /powershell\.exe$/i);
-  const installedPath = path.join(fixture.home, "versions", "0.1.2");
+  const installedPath = path.join(fixture.home, "versions", "0.1.3");
   assert.equal(await fs.access(installedPath).then(() => true).catch(() => false), false);
 });
 

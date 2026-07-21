@@ -45,7 +45,7 @@ function usageRecord(recordId, time, multiplier) {
   };
 }
 
-test("aggregate v3 identity is stable across partial replay and resolver drift but isolated by account", async (context) => {
+test("unchanged Kimi aggregate v3 identity stays stable across partial replay and resolver drift", async (context) => {
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-aggregate-v3-id-test-"));
   context.after(() => fs.rm(temporary, { recursive: true, force: true }));
 
@@ -127,4 +127,38 @@ test("aggregate v3 identity is stable across partial replay and resolver drift b
   assert.ok(parsed.events.every((event) => (
     event.aggregationModeToken === sha256("kimi-raw-mode\0highspeed")
   )));
+});
+
+test("corrected Codex aggregates use v4 identity and provenance", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-codex-aggregate-v4-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const roots = {
+    codex: path.join(temporary, "codex"),
+    claude: path.join(temporary, "claude"),
+    kimi: path.join(temporary, "kimi")
+  };
+  await Promise.all(Object.values(roots).map((root) => fs.mkdir(root, { recursive: true })));
+  const journalPath = path.join(roots.codex, "rollout-00000000-0000-4000-8000-0000000000a1.jsonl");
+  await fs.writeFile(journalPath, [
+    { timestamp: "2026-07-19T10:00:00.000Z", type: "session_meta", payload: { id: "00000000-0000-4000-8000-0000000000a1" } },
+    { timestamp: "2026-07-19T10:00:00.500Z", type: "event_msg", payload: { type: "task_started", started_at: 1784455200 } },
+    { timestamp: "2026-07-19T10:00:01.000Z", type: "event_msg", payload: { type: "thread_settings_applied", thread_settings: { model: "gpt-5.6-sol", service_tier: "priority" } } },
+    { timestamp: "2026-07-19T10:00:02.000Z", type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { total_tokens: 25 }, last_token_usage: { input_tokens: 20, output_tokens: 5, total_tokens: 25 } } } }
+  ].map(JSON.stringify).join("\n") + "\n", "utf8");
+  const collection = await collectUsage({
+    roots,
+    state: freshState(),
+    secrets: { localAliasKey },
+    dedupNamespaceKey: firstDedupNamespaceKey,
+    enabledFallbacks: { codex: true, claude: false, kimi: false },
+    officialEvidence: false,
+    aggregateRanges: {
+      codex: { start: "2026-07-19T10:00:00.000Z", end: "2026-07-19T11:00:00.000Z" }
+    },
+    now: Date.parse("2026-07-19T12:00:00.000Z")
+  });
+  assert.equal(collection.events.length, 1);
+  assert.equal(collection.events[0].provenance.collector, "session_hour_usage_aggregate_v4");
+  assert.equal(collection.events[0].usage.total, 25);
+  assert.equal(collection.events[0].mode.fast, true);
 });

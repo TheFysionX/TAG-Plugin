@@ -1,13 +1,18 @@
-import { MAX_CLAUDE_SEEN_EVENTS, MAX_CURSOR_FILES } from "./constants.mjs";
+import { MAX_CLAUDE_SEEN_EVENTS, MAX_CODEX_LOGICAL_SESSIONS, MAX_CURSOR_FILES } from "./constants.mjs";
 import { accountScopedEventId, hmacAlias, payloadHash, sha256 } from "./crypto.mjs";
 import { discoverJsonlFiles } from "./discovery.mjs";
-import { parseCodexRollout } from "./adapters/codex-rollout.mjs";
+import { codexRolloutSortKey, parseCodexRollout } from "./adapters/codex-rollout.mjs";
 import { chooseClaudeSnapshot, parseClaudeProject } from "./adapters/claude-project.mjs";
 import { readCodexAccountUsage } from "./adapters/codex-account-usage.mjs";
 import path from "node:path";
 import { parseKimiWire } from "./adapters/kimi-wire.mjs";
 
 const AGGREGATE_USAGE_FIELDS = ["input", "cachedInput", "cacheWriteInput", "output", "reasoningOutput"];
+
+function modeLabel(event) {
+  if (event?.mode?.classified === false) return "unclassified";
+  return event?.mode?.fast ? "fast" : "standard";
+}
 
 function createHourlyAggregator(options) {
   const ranges = Object.fromEntries(Object.entries(options.ranges || {}).map(([provider, range]) => [
@@ -58,9 +63,10 @@ function createHourlyAggregator(options) {
       || sha256("per-source-aggregate-scope\0" + event.eventId);
     const rawModelToken = event.sourceModelId || "unknown";
     const rawModeToken = event.aggregationModeToken
-      || sha256("normalized-mode-fallback\0" + (event.mode.fast ? "fast" : "standard"));
+      || sha256("normalized-mode-fallback\0" + modeLabel(event));
+    const aggregateVersion = event.provider === "kimi" ? 3 : 4;
     const key = payloadHash({
-      schema: "session-hour-aggregate-v3",
+      schema: `session-hour-aggregate-v${aggregateVersion}`,
       hour: new Date(hourStartMs).toISOString(),
       provider: event.provider,
       aggregationScope,
@@ -73,7 +79,8 @@ function createHourlyAggregator(options) {
       provider: event.provider,
       modelId: event.modelId,
       sourceModelId: rawModelToken,
-      mode: event.mode.fast ? "fast" : "standard",
+      mode: modeLabel(event),
+      aggregateVersion,
       surface,
       usage: Object.fromEntries(AGGREGATE_USAGE_FIELDS.map((field) => [field, 0n]))
     };
@@ -97,10 +104,15 @@ function createHourlyAggregator(options) {
         modelId: group.modelId,
         sourceModelId: group.sourceModelId,
         observedAt: new Date(group.hourStartMs + 30 * 60 * 1_000).toISOString(),
-        mode: { fast: group.mode === "fast", serviceTier: null, speed: null },
+        mode: {
+          fast: group.mode === "fast",
+          classified: group.mode !== "unclassified",
+          serviceTier: null,
+          speed: null
+        },
         usage,
         provenance: {
-          collector: "session_hour_usage_aggregate_v3",
+          collector: `session_hour_usage_aggregate_v${group.aggregateVersion}`,
           verification: "connector_attested",
           surface: group.surface
         }
@@ -162,9 +174,11 @@ export async function collectUsage(options) {
         excludedEventIds: new Set(options.excludedEventIds || [])
       })
     : null;
-  const nextCursors = structuredClone(state.cursors || { codex: { files: {} }, claude: { seen: {} }, kimi: { files: {} } });
-  nextCursors.codex = nextCursors.codex || { files: {} };
+  const nextCursors = structuredClone(state.cursors || { codex: { accountingVersion: 4, files: {}, sessions: {} }, claude: { seen: {} }, kimi: { files: {} } });
+  nextCursors.codex = nextCursors.codex || { accountingVersion: 4, files: {}, sessions: {} };
+  nextCursors.codex.accountingVersion = 4;
   nextCursors.codex.files = nextCursors.codex.files || {};
+  nextCursors.codex.sessions = nextCursors.codex.sessions || {};
   nextCursors.claude = nextCursors.claude || { seen: {} };
   nextCursors.claude.seen = nextCursors.claude.seen || {};
   nextCursors.kimi = nextCursors.kimi || { files: {} };
@@ -175,7 +189,7 @@ export async function collectUsage(options) {
     providerScans: {},
     nextCursors,
     stats: {
-      codex: { files: 0, events: 0, pending: false, malformed: 0, duplicateSnapshots: 0, cumulativeResets: 0, cumulativeMismatches: 0, unavailable: false, collector: "local_log_fallback" },
+      codex: { files: 0, events: 0, pending: false, malformed: 0, duplicateSnapshots: 0, cumulativeResets: 0, cumulativeMismatches: 0, inheritedSnapshots: 0, ambiguousLineage: 0, unclassifiedModes: 0, unavailable: false, collector: "local_log_fallback" },
       claude: { files: 0, events: 0, pending: false, malformed: 0, unavailable: false, collector: "local_log_fallback" },
       gemini: { status: "pending_verified_adapter" },
       kimi: { files: 0, events: 0, pending: false, malformed: 0, unavailable: false, collector: "kimi_v0_28_wire_usage_record_fallback" },
@@ -214,7 +228,14 @@ export async function collectUsage(options) {
     result.stats.codex.status = codexDiscovery.unavailable ? "unavailable" : "truncated";
     result.stats.codex.pending = true;
   }
-  const codexFiles = result.providerScans.codex.complete ? codexDiscovery.files : [];
+  const codexFiles = result.providerScans.codex.complete
+    ? (await Promise.all(codexDiscovery.files.map(async (filePath) => ({
+        filePath,
+        sortKey: await codexRolloutSortKey(filePath)
+      }))))
+        .sort((a, b) => a.sortKey.localeCompare(b.sortKey) || a.filePath.localeCompare(b.filePath))
+        .map((entry) => entry.filePath)
+    : [];
   const codexRange = aggregateRanges?.codex || null;
   let remainingCodexEvents = maximumEventsPerProvider;
   for (const filePath of codexFiles) {
@@ -227,6 +248,7 @@ export async function collectUsage(options) {
       aliasKey: secrets.localAliasKey,
       fileAlias,
       cursor: nextCursors.codex.files[fileAlias],
+      logicalSessions: nextCursors.codex.sessions,
       dedupNamespaceKey,
       canonicalModelId: options.canonicalModelId,
       maximumEvents: aggregator ? undefined : remainingCodexEvents,
@@ -242,6 +264,9 @@ export async function collectUsage(options) {
     result.stats.codex.duplicateSnapshots += parsed.duplicateSnapshots;
     result.stats.codex.cumulativeResets += parsed.cumulativeResets;
     result.stats.codex.cumulativeMismatches += parsed.cumulativeMismatches;
+    result.stats.codex.inheritedSnapshots += parsed.inheritedSnapshots || 0;
+    result.stats.codex.ambiguousLineage += parsed.ambiguousLineage || 0;
+    result.stats.codex.unclassifiedModes += parsed.unclassifiedModes || 0;
     remainingCodexEvents -= parsed.eventCount ?? parsed.events.length;
     if (!aggregator && parsed.reachedEventLimit) {
       result.stats.codex.pending = true;
@@ -249,6 +274,11 @@ export async function collectUsage(options) {
     }
   }
   nextCursors.codex.files = newestEntries(nextCursors.codex.files, MAX_CURSOR_FILES, "lastSeenAt");
+  nextCursors.codex.sessions = newestEntries(
+    nextCursors.codex.sessions,
+    MAX_CODEX_LOGICAL_SESSIONS,
+    "lastSeenAt"
+  );
 
   const claudeDiscovery = enabledFallbacks.claude
     ? await discover(roots.claude)
@@ -394,7 +424,7 @@ export async function collectUsage(options) {
 }
 
 export function toWireEvent(event) {
-  if (!event.modelId || !event.observedAt) {
+  if (!event.modelId || !event.observedAt || event.mode?.classified === false) {
     return null;
   }
   return {
@@ -414,13 +444,14 @@ export function toWireEvent(event) {
 export function aggregatePreview(collection) {
   const groups = new Map();
   for (const event of collection.events) {
-    const key = [event.provider, event.modelId || "unscored", event.mode.fast ? "fast" : "standard"].join("|");
+    const mode = modeLabel(event);
+    const key = [event.provider, event.modelId || "unscored", mode].join("|");
     const current = groups.get(key) || {
       provider: event.provider,
       model: event.modelId,
       sourceModelId: event.sourceModelId,
       scored: Boolean(event.modelId),
-      mode: event.mode.fast ? "fast" : "standard",
+      mode,
       records: 0,
       rawUsage: {
         input: 0,

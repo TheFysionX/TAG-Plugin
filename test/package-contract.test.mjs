@@ -24,12 +24,12 @@ test("package and install manifest remain dependency-free", async () => {
   assert.equal(manifest.product.name, "TAG Plugin");
   assert.equal(manifest.product.publisher, "The Artificial Games");
   assert.equal(manifest.product.repository, "https://github.com/TheFysionX/TAG-Plugin");
-  assert.equal(manifest.releaseArtifact.archiveName, "tag-plugin-0.1.2.tgz");
+  assert.equal(manifest.releaseArtifact.archiveName, "tag-plugin-0.1.3.tgz");
   assert.match(manifest.releaseArtifact.releaseContract, /@the-artificial-games\/tag-plugin/);
   assert.equal(manifest.releaseArtifact.testCommand, "npm test");
   assert.deepEqual(
     (await fs.readdir(path.join(root, "test", "fixtures"))).sort(),
-    ["claude-project.jsonl", "codex-rollout.jsonl", "kimi-wire.jsonl"]
+    ["claude-project.jsonl", "codex-lineage-copies.json", "codex-rollout.jsonl", "kimi-wire.jsonl"]
   );
   assert.deepEqual(manifest.runtime.thirdPartyDependencies, []);
   assert.equal(manifest.scheduler.elevation, false);
@@ -54,8 +54,8 @@ test("package and install manifest remain dependency-free", async () => {
   assert.match(onePrompt, /provider may receive and retain/i);
   const security = await fs.readFile(path.join(root, "SECURITY.md"), "utf8");
   assert.doesNotMatch(security, /100 events|32 checkpoints|eligible mixed batches/i);
-  assert.doesNotMatch(security, /heartbeat follows completed catch-up|heartbeat is deliberately deferred|cumulative record identity/i);
-  assert.match(security, /timestamp occurrence ordinal/i);
+  assert.doesNotMatch(security, /heartbeat follows completed catch-up|heartbeat is deliberately deferred/i);
+  assert.match(security, /first owner session identity plus lineage epoch and cumulative endpoint/i);
   assert.match(security, /queue capped at 2,000/i);
   const threatModel = await fs.readFile(path.join(root, "THREAT_MODEL.md"), "utf8");
   assert.match(threatModel, /provider receives and may retain the short-lived credential/i);
