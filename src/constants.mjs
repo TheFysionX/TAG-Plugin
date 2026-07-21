@@ -1,4 +1,4 @@
-export const CONNECTOR_VERSION = "0.1.0";
+export const CONNECTOR_VERSION = "0.1.1";
 export const SCHEMA_VERSION = 1;
 export const GENESIS_HASH = "0".repeat(64);
 export const MAX_LOG_BYTES = 256 * 1024;
@@ -26,7 +26,7 @@ export const SUPPORTED_ADAPTERS = Object.freeze({
     evidence: null
   },
   kimi: {
-    status: "supported_opt_in_fallback",
+    status: "supported",
     evidence: "Kimi Code v0.28 wire usage.record journal entries"
   },
   grok: {

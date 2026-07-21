@@ -6,14 +6,14 @@
     "repository": "https://github.com/TheFysionX/TAG-Plugin",
     "package": "@the-artificial-games/tag-plugin"
   },
-  "connectorVersion": "0.1.0",
+  "connectorVersion": "0.1.1",
   "runtime": {
     "name": "Node.js",
     "minimumMajor": 22,
     "thirdPartyDependencies": []
   },
   "releaseArtifact": {
-    "archiveName": "tag-plugin-0.1.0.tgz",
+    "archiveName": "tag-plugin-0.1.1.tgz",
     "includesSyntheticTestSuite": true,
     "testCommand": "npm test",
     "releaseContract": "require package @the-artificial-games/tag-plugin; reject -local; require tag v<package-version>; require package, runtime constant, and manifest versions to match; require archive tag-plugin-<package-version>.tgz",
@@ -159,7 +159,7 @@
     "defaultAction": "dry-run",
     "applyFlag": "--confirm-install",
     "removeFlag": "--confirm-uninstall",
-    "postInstall": "send one immediate signed heartbeat to establish continuity before the first hourly trigger",
+    "postInstall": "send one immediate allowlisted usage sync and signed heartbeat before the first hourly trigger",
     "identifiers": {
       "windowsTask": "TAG Plugin",
       "macOSLaunchAgent": "com.theartificialgames.tag-plugin",

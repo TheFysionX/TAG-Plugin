@@ -18,13 +18,13 @@ The Artificial Games onboarding returns a short-lived eight-character code and a
 node src/cli.mjs pair --endpoint https://YOUR_ARTIFICIAL_GAMES_HOST --code ABCD-EFGH
 ```
 
-Sensitive journal fallbacks are off by default. If the user explicitly approves model-level local journal reading, add only the selected providers:
+When a The Artificial Games setup prompt lists `Required journals`, that line is the user's explicit approval for those local usage sources. Pass exactly those provider IDs and no others:
 
 ```text
 node src/cli.mjs pair --endpoint https://YOUR_ARTIFICIAL_GAMES_HOST --code ABCD-EFGH --allow-journal-fallbacks codex,claude,kimi
 ```
 
-The backend allowlist wins. Asking for a provider that onboarding did not allow does not enable it.
+The backend allowlist wins. Asking for a provider that onboarding did not allow does not enable it. Re-running this command against an existing pairing at the exact same endpoint reuses that device and applies the explicitly listed journals without consuming another pairing code. A different endpoint is rejected.
 
 Before the exchange request is sent, the plugin persists the new Ed25519 key, pairing body (including the short-lived code), approved fallbacks, and fixed request ID only in `pending-device-secrets.json`; ordinary state keeps nonsecret pending status. Windows restricts the plugin directory before creating that credential, then explicitly verifies the pending file's current-user-only ACL before traffic. If the network response is lost, rerun `node src/cli.mjs pair` with the same plugin home; it resumes the exact pending exchange without needing another code. Final config commits before state clears the pending marker, so a one-file write failure also resumes safely. If The Artificial Games permanently rejects pairing—or a permanent authenticated request shows that the device must be replaced—obtain a fresh code and explicitly use `--replace-pending-pair` with the new endpoint and code. An uncommitted rejected sync outbox is then safely recollected because its cursors were never advanced. The existing active device is not replaced until the new response and final secret ACL are validated.
 
@@ -44,6 +44,7 @@ Only after reviewing the dry run:
 
 ```text
 node src/cli.mjs install --confirm-install
+node src/cli.mjs sync
 node src/cli.mjs heartbeat
 ```
 
@@ -53,7 +54,7 @@ node src/cli.mjs heartbeat
 
 The confirmed install first copies the already verified release into `<connector-home>/versions/<connector-version>` and makes the scheduler target that stable copy. Every scheduler command includes `--home <connector-home>`, including when a custom home was supplied. On Windows, a local non-interactive PowerShell ACL operation disables inheritance, replaces all access rules with one full-control grant for the resolved current user, and verifies the resulting SID/rule before continuing; installation stops before copying or scheduling if that operation fails.
 
-The immediate heartbeat establishes continuity without waiting for the first hourly trigger. No platform path uses an administrator, root, SYSTEM account, highest-run-level flag, or system-wide service directory.
+The immediate sync uploads the available allowlisted usage records, and the heartbeat establishes continuity without waiting for the first hourly trigger. No platform path uses an administrator, root, SYSTEM account, highest-run-level flag, or system-wide service directory.
 
 ## Pause or remove
 

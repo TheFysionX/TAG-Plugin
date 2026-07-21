@@ -679,6 +679,33 @@ export async function pair(options = {}) {
       runtime.state.syncOutbox = null;
       await saveRuntime(paths, runtime);
     }
+    if (runtime.state.paired && !runtime.state.pendingPair && !options.replacePendingPair) {
+      const configuredEndpoint = validateEndpoint(runtime.config.endpoint);
+      if (options.endpoint && validateEndpoint(options.endpoint) !== configuredEndpoint) {
+        throw new ConnectorError(
+          "PAIR_ENDPOINT_MISMATCH",
+          "This connector is already paired to a different The Artificial Games endpoint."
+        );
+      }
+      const activeSecrets = await loadSecrets(paths);
+      assertPaired(runtime.state, runtime.config, activeSecrets);
+      await hardenWindowsSecrets(paths.secrets, options);
+      if (options.enabledFallbacks !== undefined) {
+        runtime.config.transcriptFallbacks = allowedFallbacks(
+          requestedFallbacks(options.enabledFallbacks),
+          runtime.config.allowedPlatforms
+        );
+        await saveRuntime(paths, runtime);
+      }
+      return {
+        paired: true,
+        alreadyPaired: true,
+        deviceId: runtime.state.deviceId,
+        allowedPlatforms: runtime.config.allowedPlatforms,
+        supportedProviders: runtime.config.supportedProviders,
+        transcriptFallbacks: runtime.config.transcriptFallbacks
+      };
+    }
     let secrets = await loadPendingSecrets(paths);
     let pendingState = runtime.state.pendingPair;
     if (pendingState?.permanentFailure && !options.replacePendingPair) {
@@ -699,12 +726,6 @@ export async function pair(options = {}) {
       : null;
     let createdPendingSecrets = false;
     if (!pendingState) {
-      if (runtime.state.paired && !options.replacePendingPair) {
-        throw new ConnectorError(
-          "ALREADY_PAIRED",
-          "This connector already has an active device. Use --replace-pending-pair with a fresh code only when intentionally replacing it."
-        );
-      }
       const code = normalizePairCode(options.code);
       if (!code) {
         throw new ConnectorError("INVALID_PAIR_CODE", "Pairing requires the eight-character code shown by The Artificial Games.");

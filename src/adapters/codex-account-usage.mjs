@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn } from "node:child_process";
+import { CONNECTOR_VERSION } from "../constants.mjs";
 
 const MAX_STDOUT_BYTES = 1024 * 1024;
 
@@ -110,7 +111,7 @@ export async function readCodexAccountUsage(options = {}) {
         clientInfo: {
           name: "tag-plugin",
           title: "TAG Plugin",
-          version: "0.1.0"
+          version: CONNECTOR_VERSION
         }
       }
     }) + "\n");

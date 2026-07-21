@@ -6,7 +6,7 @@ import { ConnectorError } from "./errors.mjs";
 const execFile = promisify(nodeExecFile);
 
 async function defaultRunner(executable, arguments_) {
-  await execFile(executable, arguments_, { windowsHide: true });
+  return execFile(executable, arguments_, { windowsHide: true });
 }
 
 function powershellLiteral(value) {
@@ -14,28 +14,48 @@ function powershellLiteral(value) {
 }
 
 function aclScript(targetPath, identity, directory) {
+  const expectedInheritance = directory
+    ? "[System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit"
+    : "[System.Security.AccessControl.InheritanceFlags]::None";
   return [
     "$ErrorActionPreference = 'Stop'",
     "$targetPath = " + powershellLiteral(targetPath),
     "$identity = " + powershellLiteral(identity),
+    "function Test-TagAcl { param([string]$TargetPath, [string]$Identity)",
+    "$check = Get-Acl -LiteralPath $TargetPath",
+    "$rules = @($check.Access)",
+    "if ($rules.Count -ne 1) { return $false }",
+    "$expectedSid = (New-Object System.Security.Principal.NTAccount($Identity)).Translate([System.Security.Principal.SecurityIdentifier]).Value",
+    "$actualSid = $rules[0].IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value",
+    "$ownerSid = $check.GetOwner([System.Security.Principal.SecurityIdentifier]).Value",
+    "$full = [System.Security.AccessControl.FileSystemRights]::FullControl",
+    "$inherit = " + expectedInheritance,
+    "return [bool]($check.AreAccessRulesProtected -and $ownerSid -eq $expectedSid -and $actualSid -eq $expectedSid -and -not $rules[0].IsInherited -and $rules[0].AccessControlType -eq 'Allow' -and (($rules[0].FileSystemRights -band $full) -eq $full) -and $rules[0].InheritanceFlags -eq $inherit -and $rules[0].PropagationFlags -eq [System.Security.AccessControl.PropagationFlags]::None) }",
+    "$stage = 'inspect'",
+    "try {",
+    "if (Test-TagAcl -TargetPath $targetPath -Identity $identity) { [Console]::Out.Write('TAG_ACL_ALREADY_HARDENED'); exit 0 }",
+    "$stage = 'apply'",
     "$acl = Get-Acl -LiteralPath $targetPath",
     "$acl.SetAccessRuleProtection($true, $false)",
     "foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleSpecific($rule) }",
     directory
       ? "$grant = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')"
       : "$grant = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'Allow')",
+    "$acl.SetOwner((New-Object System.Security.Principal.NTAccount($identity)))",
     "$acl.SetAccessRule($grant)",
     "Set-Acl -LiteralPath $targetPath -AclObject $acl",
-    "$check = Get-Acl -LiteralPath $targetPath",
-    "$rules = @($check.Access)",
-    "$expectedSid = (New-Object System.Security.Principal.NTAccount($identity)).Translate([System.Security.Principal.SecurityIdentifier]).Value",
-    "$actualSid = if ($rules.Count -eq 1) { $rules[0].IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } else { '' }",
-    "$full = [System.Security.AccessControl.FileSystemRights]::FullControl",
-    directory
-      ? "$inherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit"
-      : "$inherit = [System.Security.AccessControl.InheritanceFlags]::None",
-    "if (-not $check.AreAccessRulesProtected -or $rules.Count -ne 1 -or $actualSid -ne $expectedSid -or $rules[0].AccessControlType -ne 'Allow' -or (($rules[0].FileSystemRights -band $full) -ne $full) -or $rules[0].InheritanceFlags -ne $inherit) { throw 'Current-user-only ACL verification failed.' }"
+    "$stage = 'verify'",
+    "if (-not (Test-TagAcl -TargetPath $targetPath -Identity $identity)) { throw 'Current-user-only ACL verification failed.' }",
+    "[Console]::Out.Write('TAG_ACL_HARDENED')",
+    "} catch { [Console]::Error.Write('TAG_ACL_STAGE=' + $stage); exit 17 }"
   ].join("; ");
+}
+
+function aclFailureStage(error) {
+  const marker = typeof error?.stderr === "string"
+    ? error.stderr.match(/TAG_ACL_STAGE=(inspect|apply|verify)(?:\s|$)/)
+    : null;
+  return marker?.[1] || "launch";
 }
 
 async function hardenWindowsPath(targetPath, options, directory) {
@@ -53,8 +73,9 @@ async function hardenWindowsPath(targetPath, options, directory) {
   const run = options.runCommand || defaultRunner;
   const executable = options.windowsPowerShellPath
     || path.win32.join(env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  let result;
   try {
-    await run(executable, [
+    result = await run(executable, [
       "-NoLogo",
       "-NoProfile",
       "-NonInteractive",
@@ -65,10 +86,14 @@ async function hardenWindowsPath(targetPath, options, directory) {
     throw new ConnectorError(
       "WINDOWS_ACL_HARDENING_FAILED",
       "The connector refused to continue because its secret ACL could not be restricted to the current user.",
-      { cause: error }
+      { diagnostic: { category: "windows_acl", stage: aclFailureStage(error) } }
     );
   }
-  return { applied: true, identity };
+  const alreadyHardened = typeof result?.stdout === "string"
+    && result.stdout.includes("TAG_ACL_ALREADY_HARDENED");
+  return alreadyHardened
+    ? { applied: false, reason: "already_hardened", identity }
+    : { applied: true, identity };
 }
 
 export async function hardenWindowsSecrets(secretPath, options = {}) {

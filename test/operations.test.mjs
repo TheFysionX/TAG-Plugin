@@ -97,6 +97,120 @@ test("pair signs exchange, stores one device, and restricts approved fallbacks",
   assert.equal(runtime.state.deviceId, "device_12345678");
 });
 
+test("pair is idempotent for an existing device on the same endpoint", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  let networkCalls = 0;
+  const fetchImpl = async () => {
+    networkCalls += 1;
+    return jsonResponse({
+      device: {
+        id: "device_12345678",
+        allowedPlatforms: ["codex", "claude"],
+        supportedProviders: ["codex", "claude"]
+      },
+      dedupNamespaceKey,
+      signing: { nextSequence: 1, lastRequestDigest: "" }
+    });
+  };
+  await pair({
+    home: fixture.home,
+    platform: "linux",
+    endpoint: "https://artificial-games.example",
+    code: "ABCD-EFGH",
+    enabledFallbacks: { codex: true, claude: true },
+    fetchImpl
+  });
+
+  const retried = await pair({
+    home: fixture.home,
+    platform: "linux",
+    endpoint: "https://artificial-games.example/",
+    code: "JKLM-NPQR",
+    fetchImpl: async () => {
+      networkCalls += 1;
+      throw new Error("an idempotent retry must not exchange another code");
+    }
+  });
+
+  assert.equal(networkCalls, 1);
+  assert.equal(retried.paired, true);
+  assert.equal(retried.alreadyPaired, true);
+  assert.equal(retried.deviceId, "device_12345678");
+  assert.deepEqual(retried.allowedPlatforms, ["codex", "claude"]);
+  assert.deepEqual(retried.transcriptFallbacks, { codex: true, claude: true, kimi: false });
+  assert.equal(await fs.access(fixture.paths.pendingSecrets).then(() => true).catch(() => false), false);
+});
+
+test("pair reuse applies explicitly requested journals without exchanging another code", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  let networkCalls = 0;
+  await pair({
+    home: fixture.home,
+    platform: "linux",
+    endpoint: "https://artificial-games.example",
+    code: "ABCD-EFGH",
+    fetchImpl: async () => {
+      networkCalls += 1;
+      return jsonResponse({
+        device: {
+          id: "device_12345678",
+          allowedPlatforms: ["codex", "claude"],
+          supportedProviders: ["codex", "claude"]
+        },
+        dedupNamespaceKey,
+        signing: { nextSequence: 1, lastRequestDigest: "" }
+      });
+    }
+  });
+
+  const retried = await pair({
+    home: fixture.home,
+    platform: "linux",
+    endpoint: "https://artificial-games.example",
+    code: "JKLM-NPQR",
+    enabledFallbacks: { codex: true, claude: true },
+    fetchImpl: async () => {
+      networkCalls += 1;
+      throw new Error("an active pairing must not exchange another code");
+    }
+  });
+
+  assert.equal(networkCalls, 1);
+  assert.equal(retried.alreadyPaired, true);
+  assert.deepEqual(retried.transcriptFallbacks, { codex: true, claude: true, kimi: false });
+  const after = await loadRuntime(fixture.paths);
+  assert.deepEqual(after.config.transcriptFallbacks, { codex: true, claude: true, kimi: false });
+});
+
+test("pair rejects an existing device when the supplied endpoint differs", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const runtime = await loadRuntime(fixture.paths);
+  runtime.state.paired = true;
+  runtime.state.deviceId = "device_12345678";
+  runtime.config.endpoint = "https://artificial-games.example";
+  runtime.config.allowedPlatforms = ["codex"];
+  runtime.config.supportedProviders = ["codex"];
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, runtime);
+
+  await assert.rejects(() => pair({
+    home: fixture.home,
+    platform: "linux",
+    endpoint: "https://another-artificial-games.example",
+    code: "ABCD-EFGH",
+    fetchImpl: async () => { throw new Error("network must not run"); }
+  }), (error) => error.code === "PAIR_ENDPOINT_MISMATCH");
+
+  const after = await loadRuntime(fixture.paths);
+  assert.equal(after.state.deviceId, "device_12345678");
+  assert.equal(after.config.endpoint, "https://artificial-games.example");
+});
+
 test("pairing response loss resumes the persisted key, body, and request ID", async (context) => {
   const fixture = await setup();
   context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
@@ -1132,7 +1246,7 @@ test("heartbeat uses the same monotonic request chain", async (context) => {
   assert.equal(updated.state.previousRequestDigest, "digest_next_1234567890");
 });
 
-test("preview is local-only and journal fallbacks are opt-in", async (context) => {
+test("preview is local-only and journal reads require pairing authorization", async (context) => {
   const fixture = await setup();
   context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
   const result = await preview({
@@ -1178,7 +1292,7 @@ test("scheduler mutation is preview-only until the exact confirmation flag", asy
   assert.match(commands[0].join(" "), /SetAccessRuleProtection/);
   assert.match(commands[0].join(" "), /Current-user-only ACL verification failed/);
   assert.equal(commands[1][0], "schtasks.exe");
-  assert.match(commands[1].join(" "), /versions[\\/]0\.1\.0[\\/]src[\\/]cli\.mjs/);
+  assert.match(commands[1].join(" "), /versions[\\/]0\.1\.1[\\/]src[\\/]cli\.mjs/);
   assert.match(commands[1].join(" "), /scheduled-run --home/);
   assert.equal(await fs.access(path.join(installed.installedRelease, "package.json")).then(() => true), true);
   assert.equal(await fs.access(path.join(installed.installedRelease, "RELEASING.md")).then(() => true), true);
@@ -1216,7 +1330,7 @@ test("Windows installation fails closed before copying or scheduling when ACL ha
   }), (error) => error.code === "WINDOWS_ACL_HARDENING_FAILED");
   assert.equal(commands.length, 1);
   assert.match(commands[0][0], /powershell\.exe$/i);
-  const installedPath = path.join(fixture.home, "versions", "0.1.0");
+  const installedPath = path.join(fixture.home, "versions", "0.1.1");
   assert.equal(await fs.access(installedPath).then(() => true).catch(() => false), false);
 });
 
