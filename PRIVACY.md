@@ -14,6 +14,8 @@ Model-level fallbacks are disabled until the user explicitly opts in:
 - Claude Code project journals: only terminal assistant rows with a non-empty `message.stop_reason`, then message ID, timestamp, model, speed/service tier, and `message.usage` counters. Partial streaming rows are withheld; terminal duplicates collapse to the final/maximum usage snapshot. This is a version-observed fallback, not a provider stability guarantee.
 - Kimi Code v0.28 wire journals: only `usage.record` model, time, usage counters, and usage scope.
 
+On first connection, journal processing is limited to the newest 89 days because the server automatically quarantines submissions older than 90 days. Usage is deduplicated by account-scoped source ID and reduced locally into stable provider/source-session/UTC-hour/raw-model/raw-mode/surface aggregates before upload; prompt, response, tool, command, filename, and repository content never participates in that aggregation. The canonical model sent for scoring is not part of aggregate identity. Codex, Claude, and Kimi each keep an independent settled-through watermark. A provider advances only after complete discovery and collection; disabled, unavailable, or truncated providers retain their prior watermarks. Later runs normally process only newly settled hours. A changed partial replay of a finalized session-hour reuses its stable event ID rather than uploading a separately scoreable aggregate.
+
 An onboarding provider allowlist controls which local adapters may run. A separate server `supportedProviders` list controls which parsed events may upload, so locally recognized Kimi usage is not sent or scored before the backend supports it.
 
 These files can contain prompts, responses, tool results, commands, and repository paths. The process technically opens an opted-in journal. It prefilters unrelated lines where practical and immediately discards every field outside the allowlist. It never uploads, persists, hashes, or logs prompt/response/tool content, commands, or repository names. Raw provider paths never upload, persist, or enter logs. The connector does HMAC each raw journal path with an installation-only key and persists that keyed alias locally as the cursor-map key; the raw path cannot be recovered from the alias without the local key and a candidate path.
@@ -25,9 +27,9 @@ These files can contain prompts, responses, tool results, commands, and reposito
 - Ed25519 private/public device key, the server-issued account deduplication namespace key, and a separate random local alias key in `device-secrets.json`.
 - Monotonic request sequence and prior accepted request digest.
 - Until pairing completes or is explicitly replaced: the short-lived pairing code, public key, endpoint, device label, connector version, approved fallback choices, fixed exchange request ID, and unpaired private key in the restricted `pending-device-secrets.json`. Ordinary `state.json` stores only nonsecret pending status, request ID, and any permanent error. An existing active `device-secrets.json` is not replaced until the exchange response is validated and its final ACL is verified.
-- At most one active content-free signed request body and fixed request ID, plus a bounded chunk outbox, for crash-safe idempotent replay.
+- At most one active content-free signed request body and fixed request ID. Catch-up keeps one active page of at most 5,000 hourly aggregate events in `state.json`; additional content-free pages are private files under `sync-pages/<batch-id>/`. State keeps only their event counts and integrity digests until they become active. Missing, oversized, malformed, or digest-mismatched pages fail closed, and the batch directory is removed after the final page commits.
 - At most 2,000 unresolved-model records containing only event ID, occurrence time, provider, strict source-model token, standard/fast mode, decimal usage counters, and coding surface. The state also keeps cumulative overflow count/time; no prompt, message, tool, command, path, or repository field is eligible for this queue.
-- Keyed HMAC file aliases, byte cursors, file-metadata identities, and rolling digests made only from allowlisted usage/model/mode fields to detect journal replacement; prompt/response/tool content never enters those digests.
+- Independent Codex, Claude, and Kimi aggregate-through watermarks; keyed HMAC file aliases; byte cursors; file-metadata identities; and rolling digests made only from allowlisted usage/model/mode fields to detect journal replacement. Prompt/response/tool content never enters those digests. Claude additionally keeps at most 250,000 content-free sent-event ledger entries so unchanged snapshots are not aggregated again.
 - Last sync/heartbeat times and content-free adapter health counts.
 - A bounded allowlisted operational log.
 
@@ -37,14 +39,16 @@ Secret files and state directories use user-only permissions on POSIX systems. O
 
 Pairing sends only the short-lived code, raw Ed25519 public key, user-visible device label, and connector version.
 
-Usage events contain only:
+Usage events contain only hourly aggregate records made from eligible journal usage:
 
 - deterministic account-scoped HMAC event ID;
-- occurrence time;
+- a deterministic occurrence time within the original UTC hour;
 - provider and canonical model ID;
 - standard/fast service mode;
 - decimal input, cached-input, output, and optional reasoning counters;
 - coding surface identifier.
+
+Each v3 aggregate ID is a deterministic account-scoped HMAC over provider, stable source-session scope, UTC hour, raw source-model token, raw mode token, and coding surface. Neither its locally deduplicated source IDs nor those raw identity inputs are uploaded as separate fields. The canonical model ID is sent for scoring but is not part of event identity, so registry remapping cannot mint another ID. Stable session-hour aggregates are not split: if one crosses the server's automatic single-event volume boundary, it remains whole for anomaly and quarantine handling. An unchanged replay is idempotent; a partial or expanded replay with different totals reuses the same ID and is rejected or quarantined rather than scored twice.
 
 Codex provider-backed daily checkpoints contain only provider, source, UTC period, total tokens, and deterministic checkpoint ID. They are used for reconciliation and are not scored as model usage.
 

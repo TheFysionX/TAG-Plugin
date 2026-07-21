@@ -5,9 +5,13 @@ import { fileURLToPath } from "node:url";
 import {
   CONNECTOR_VERSION,
   HEARTBEAT_EVERY_INGEST_REQUESTS,
+  HISTORY_SETTLE_MINUTES,
+  INITIAL_HISTORY_DAYS,
   INGEST_CHUNK_PACE_MS,
   MAX_INGEST_CHECKPOINTS,
   MAX_INGEST_EVENTS,
+  MAX_MIGRATION_EXCLUSIONS,
+  MAX_SYNC_OUTBOX_EVENTS,
   MAX_UNRESOLVED_EVENTS,
   SCHEDULED_MAX_INGEST_REQUESTS
 } from "./constants.mjs";
@@ -50,6 +54,13 @@ const UNRESOLVED_EVENT_KEYS = Object.freeze([
 ]);
 const SOURCE_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,119}$/;
 const TOKEN_COUNT_PATTERN = /^\d{1,30}$/;
+const SYNC_BATCH_ID_PATTERN = /^[a-f0-9]{24}$/;
+const MAX_SYNC_PAGE_BYTES = 64 * 1024 * 1024;
+const SYNC_EVENT_KEYS = new Set([
+  "eventId", "occurredAt", "provider", "modelId", "serviceMode",
+  "inputTokens", "cachedInputTokens", "outputTokens", "reasoningTokens", "surface"
+]);
+const SYNC_SURFACES = new Set(["codex", "claude_code", "kimi_code"]);
 const BISECTABLE_SYNC_CODES = new Set([
   "BODY_TOO_LARGE",
   "INVALID_EVENTS",
@@ -112,8 +123,87 @@ function safeScanSummary(stats) {
     duplicateSnapshots: value.duplicateSnapshots || 0,
     cumulativeResets: value.cumulativeResets || 0,
     cumulativeMismatches: value.cumulativeMismatches || 0,
+    pending: Boolean(value.pending),
+    truncated: Boolean(value.truncated),
     collector: value.collector || null
   }]));
+}
+
+function oversizedReleasedV1Outbox(state) {
+  return state.syncOutbox
+    && state.syncOutbox.version === 1
+    && Number.isSafeInteger(state.syncOutbox.totalEvents)
+    && state.syncOutbox.totalEvents > MAX_SYNC_OUTBOX_EVENTS;
+}
+
+function floorUtcHour(milliseconds) {
+  return Math.floor(milliseconds / (60 * 60 * 1_000)) * 60 * 60 * 1_000;
+}
+
+function aggregateHistoryWindow(now) {
+  const settledThroughMs = floorUtcHour(now - HISTORY_SETTLE_MINUTES * 60 * 1_000);
+  const windowStartMs = floorUtcHour(now - INITIAL_HISTORY_DAYS * 24 * 60 * 60 * 1_000);
+  return {
+    windowStart: new Date(windowStartMs).toISOString(),
+    settledThrough: new Date(settledThroughMs).toISOString()
+  };
+}
+
+function aggregateHistoryRanges(now, state, enabledFallbacks) {
+  const window = aggregateHistoryWindow(now);
+  const windowStartMs = Date.parse(window.windowStart);
+  const settledThroughMs = Date.parse(window.settledThrough);
+  return Object.fromEntries(Object.entries(enabledFallbacks)
+    .filter(([, enabled]) => enabled)
+    .map(([provider]) => {
+      const priorThroughMs = Date.parse(state?.cursors?.aggregate?.providers?.[provider]?.through || "");
+      const committedThroughMs = Number.isFinite(priorThroughMs)
+        ? Math.max(windowStartMs, priorThroughMs)
+        : windowStartMs;
+      const throughMs = Math.max(settledThroughMs, committedThroughMs);
+      return [provider, {
+        start: new Date(committedThroughMs).toISOString(),
+        end: new Date(throughMs).toISOString(),
+        windowStart: window.windowStart
+      }];
+    }));
+}
+
+function migrateOversizedReleasedV1Outbox(runtime, historyRange) {
+  const outbox = runtime.state.syncOutbox;
+  const existing = runtime.state.migrationExcludedEvents || [];
+  const windowStartMs = Date.parse(historyRange.windowStart);
+  const byEventId = new Map(
+    existing
+      .filter((event) => Date.parse(event.occurredAt) >= windowStartMs)
+      .map((event) => [event.eventId, event])
+  );
+  // Public v0.1.1 version-1 outboxes contain raw account-scoped source IDs.
+  // Preserve already accepted raw IDs as exclusions, then recollect only the
+  // unprocessed sources into v3 aggregates. Version-2 draft aggregate outboxes
+  // are deliberately not migrated and instead drain under their original IDs.
+  for (const chunk of outbox.chunks.slice(0, outbox.index)) {
+    for (const event of chunk.events || []) {
+      if (typeof event.eventId !== "string"
+        || !/^[a-f0-9]{64}$/.test(event.eventId)
+        || typeof event.occurredAt !== "string"
+        || Date.parse(event.occurredAt) < windowStartMs) {
+        continue;
+      }
+      byEventId.set(event.eventId, {
+        eventId: event.eventId,
+        occurredAt: new Date(event.occurredAt).toISOString()
+      });
+      if (byEventId.size > MAX_MIGRATION_EXCLUSIONS) {
+        throw new ConnectorError(
+          "OVERSIZED_OUTBOX_MIGRATION_LIMIT",
+          "The released v1 outbox has too many already-processed events to migrate safely."
+        );
+      }
+    }
+  }
+  runtime.state.migrationExcludedEvents = [...byEventId.values()];
+  runtime.state.syncOutbox = null;
 }
 
 function toUnresolvedEvent(event) {
@@ -247,9 +337,235 @@ function applyAcceptedRequest(state, response) {
   state.nextSequence += 1;
 }
 
-function commitCompletedOutbox(runtime) {
+function isWireEvent(event) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) return false;
+  if (!Object.keys(event).every((key) => SYNC_EVENT_KEYS.has(key))) return false;
+  if (typeof event.eventId !== "string" || !/^[a-f0-9]{64}$/.test(event.eventId)) return false;
+  if (typeof event.occurredAt !== "string" || !Number.isFinite(Date.parse(event.occurredAt))) return false;
+  if (!["codex", "claude", "kimi"].includes(event.provider)) return false;
+  if (typeof event.modelId !== "string" || event.modelId.length < 1 || event.modelId.length > 80) return false;
+  if (!['standard', 'fast'].includes(event.serviceMode)) return false;
+  if (!SYNC_SURFACES.has(event.surface)) return false;
+  for (const key of ["inputTokens", "cachedInputTokens", "outputTokens"]) {
+    if (typeof event[key] !== "string" || !TOKEN_COUNT_PATTERN.test(event[key])) return false;
+  }
+  return !Object.hasOwn(event, "reasoningTokens")
+    || (typeof event.reasoningTokens === "string" && TOKEN_COUNT_PATTERN.test(event.reasoningTokens));
+}
+
+function syncPagePath(paths, batchId, pageIndex) {
+  if (!SYNC_BATCH_ID_PATTERN.test(batchId) || !Number.isSafeInteger(pageIndex) || pageIndex < 1) {
+    throw new ConnectorError("SYNC_BATCH_CORRUPT", "The local sync page reference is invalid.");
+  }
+  const root = path.resolve(paths.syncPages);
+  const batchDirectory = path.resolve(root, batchId);
+  if (path.dirname(batchDirectory) !== root) {
+    throw new ConnectorError("SYNC_BATCH_CORRUPT", "The local sync page reference escaped its state directory.");
+  }
+  return path.join(batchDirectory, `${String(pageIndex).padStart(6, "0")}.json`);
+}
+
+async function readSyncPage(paths, outbox, pageIndex) {
+  const manifest = outbox.pages?.[pageIndex];
+  if (!manifest || manifest.pageIndex !== pageIndex) {
+    throw new ConnectorError("SYNC_BATCH_CORRUPT", "The next local sync page is missing from the manifest.");
+  }
+  const filePath = syncPagePath(paths, outbox.batchId, pageIndex);
+  let text;
+  try {
+    const stat = await fs.stat(filePath);
+    if (stat.size > MAX_SYNC_PAGE_BYTES) {
+      throw new ConnectorError("SYNC_BATCH_CORRUPT", "A local sync page exceeds the safe size limit.");
+    }
+    text = await fs.readFile(filePath, "utf8");
+  } catch (error) {
+    if (error instanceof ConnectorError) throw error;
+    throw new ConnectorError("SYNC_BATCH_CORRUPT", "A required local sync page is unavailable.");
+  }
+  let page;
+  try {
+    page = JSON.parse(text);
+  } catch {
+    throw new ConnectorError("SYNC_BATCH_CORRUPT", "A required local sync page is not valid JSON.");
+  }
+  if (page?.version !== 1
+    || page.batchId !== outbox.batchId
+    || page.pageIndex !== pageIndex
+    || !Array.isArray(page.events)
+    || page.events.length !== manifest.eventCount
+    || page.events.length > outbox.pageSize
+    || !page.events.every(isWireEvent)
+    || payloadHash(page) !== manifest.digest) {
+    throw new ConnectorError("SYNC_BATCH_CORRUPT", "A required local sync page failed integrity validation.");
+  }
+  return page;
+}
+
+async function cleanupSyncBatch(paths, batchId) {
+  if (!SYNC_BATCH_ID_PATTERN.test(batchId)) return;
+  const root = path.resolve(paths.syncPages);
+  const target = path.resolve(root, batchId);
+  if (path.dirname(target) !== root) return;
+  await fs.rm(target, { recursive: true, force: true });
+}
+
+function syncPageSize(options) {
+  return Number.isSafeInteger(options.maximumSyncPageEvents)
+    && options.maximumSyncPageEvents > 0
+    ? Math.min(options.maximumSyncPageEvents, MAX_SYNC_OUTBOX_EVENTS)
+    : MAX_SYNC_OUTBOX_EVENTS;
+}
+
+function syncPagePayload(batchId, pageIndex, events) {
+  return { version: 1, batchId, pageIndex, events };
+}
+
+function activePageEvents(outbox) {
+  return Array.isArray(outbox.chunks)
+    ? outbox.chunks.flatMap((chunk) => Array.isArray(chunk?.events) ? chunk.events : [])
+    : [];
+}
+
+function assertActiveSyncPage(outbox) {
+  if (outbox.version !== 3) return;
+  const manifest = outbox.pages?.[outbox.pageIndex];
+  const events = activePageEvents(outbox);
+  const page = syncPagePayload(outbox.batchId, outbox.pageIndex, events);
+  const manifestEvents = Array.isArray(outbox.pages)
+    ? outbox.pages.reduce((total, entry) => total + (entry?.eventCount || 0), 0)
+    : -1;
+  if (!SYNC_BATCH_ID_PATTERN.test(outbox.batchId)
+    || !Number.isSafeInteger(outbox.pageIndex)
+    || outbox.pageIndex < 0
+    || !Number.isSafeInteger(outbox.pageCount)
+    || !Array.isArray(outbox.pages)
+    || outbox.pageCount !== outbox.pages?.length
+    || outbox.pageCount < 1
+    || outbox.pageIndex >= outbox.pageCount
+    || !Number.isSafeInteger(outbox.pageSize)
+    || outbox.pageSize < 1
+    || outbox.pageSize > MAX_SYNC_OUTBOX_EVENTS
+    || !Number.isSafeInteger(outbox.totalEvents)
+    || outbox.totalEvents < 0
+    || manifestEvents !== outbox.totalEvents
+    || !outbox.pages.every((entry, index) => entry?.pageIndex === index
+      && Number.isSafeInteger(entry.eventCount)
+      && entry.eventCount >= 0
+      && entry.eventCount <= outbox.pageSize
+      && (index === outbox.pages.length - 1 || entry.eventCount === outbox.pageSize)
+      && typeof entry.digest === "string"
+      && /^[a-f0-9]{64}$/.test(entry.digest))
+    || !Number.isSafeInteger(outbox.index)
+    || outbox.index < 0
+    || outbox.index > outbox.chunks.length
+    || !Array.isArray(outbox.chunks)
+    || !outbox.chunks.every((chunk) => Array.isArray(chunk.events)
+      && Array.isArray(chunk.checkpoints)
+      && chunk.events.every(isWireEvent))
+    || !manifest
+    || manifest.pageIndex !== outbox.pageIndex
+    || manifest.eventCount !== events.length
+    || events.length > outbox.pageSize
+    || payloadHash(page) !== manifest.digest) {
+    throw new ConnectorError("SYNC_BATCH_CORRUPT", "The active local sync page failed integrity validation.");
+  }
+}
+
+function futureSyncChunks(outbox) {
+  if (outbox.version !== 3 || !Array.isArray(outbox.pages)) return 0;
+  return outbox.pages
+    .slice(outbox.pageIndex + 1)
+    .reduce((total, page) => total + Math.ceil(page.eventCount / MAX_INGEST_EVENTS), 0);
+}
+
+function remainingSyncChunks(outbox) {
+  if (!outbox) return 0;
+  const active = Array.isArray(outbox.chunks) && Number.isSafeInteger(outbox.index)
+    ? Math.max(0, outbox.chunks.length - outbox.index)
+    : 0;
+  return active + futureSyncChunks(outbox);
+}
+
+async function createPagedSyncOutbox(paths, events, checkpoints, commit, options) {
+  const pageSize = syncPageSize(options);
+  const batchId = randomBytes(12).toString("hex");
+  const pageCount = Math.max(1, Math.ceil(events.length / pageSize));
+  const pages = [];
+  const pageEvents = [];
+  for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
+    const selected = events.slice(pageIndex * pageSize, (pageIndex + 1) * pageSize);
+    const page = syncPagePayload(batchId, pageIndex, selected);
+    pages.push({
+      pageIndex,
+      eventCount: selected.length,
+      digest: payloadHash(page)
+    });
+    pageEvents.push(selected);
+  }
+  // Future pages are durable before state.json can point at this batch. Page 0
+  // remains embedded in state.json so an interrupted first request is replayable.
+  try {
+    for (let pageIndex = 1; pageIndex < pageCount; pageIndex += 1) {
+      await atomicWriteJson(
+        syncPagePath(paths, batchId, pageIndex),
+        syncPagePayload(batchId, pageIndex, pageEvents[pageIndex]),
+        0o600
+      );
+    }
+  } catch (error) {
+    await cleanupSyncBatch(paths, batchId);
+    throw error;
+  }
+  const chunks = chunkSyncPayloads(pageEvents[0], checkpoints);
+  return {
+    version: 3,
+    batchId,
+    pageIndex: 0,
+    pageCount,
+    pageSize,
+    pages,
+    index: 0,
+    chunks,
+    totalChunks: pages.reduce(
+      (total, page) => total + Math.ceil(page.eventCount / MAX_INGEST_EVENTS),
+      Math.ceil(checkpoints.length / MAX_INGEST_CHECKPOINTS)
+    ),
+    totalEvents: events.length,
+    totalCheckpoints: checkpoints.length,
+    pageEventCount: pageEvents[0].length,
+    processedEvents: 0,
+    processedCheckpoints: 0,
+    processedChunks: 0,
+    accepted: 0,
+    duplicates: 0,
+    rejected: 0,
+    quarantinedCount: 0,
+    quarantinedEventIds: [],
+    commit
+  };
+}
+
+async function saveFinalizedRuntime(paths, runtime, cleanupBatchId) {
+  await saveRuntime(paths, runtime);
+  if (cleanupBatchId) {
+    await cleanupSyncBatch(paths, cleanupBatchId);
+  }
+}
+
+async function advanceCompletedOutbox(runtime, paths) {
   const outbox = runtime.state.syncOutbox;
-  if (!outbox || outbox.index < outbox.chunks.length) return;
+  if (!outbox || outbox.index < outbox.chunks.length) return null;
+  if (outbox.version === 3 && outbox.pageIndex + 1 < outbox.pageCount) {
+    const nextPageIndex = outbox.pageIndex + 1;
+    const page = await readSyncPage(paths, outbox, nextPageIndex);
+    outbox.pageIndex = nextPageIndex;
+    outbox.index = 0;
+    outbox.chunks = chunkSyncPayloads(page.events, []);
+    outbox.pageEventCount = page.events.length;
+    assertActiveSyncPage(outbox);
+    return null;
+  }
+  const cleanupBatchId = outbox.version === 3 ? outbox.batchId : null;
   runtime.state.cursors = outbox.commit.nextCursors;
   if (outbox.commit.checkpointHash) {
     runtime.state.providerEvidenceHashes.codex = outbox.commit.checkpointHash;
@@ -265,7 +581,7 @@ function commitCompletedOutbox(runtime) {
     adapters: outbox.commit.scanSummary,
     withheld: outbox.commit.withheld,
     rejected: outbox.rejected,
-    quarantined: outbox.quarantinedEventIds.length,
+    quarantined: outbox.quarantinedCount || outbox.quarantinedEventIds.length,
     unknownModels: outbox.commit.unknownModels,
     unresolvedQueued: runtime.state.unresolvedEvents.length,
     unresolvedOverflow: runtime.state.unresolvedOverflow.totalDropped
@@ -275,9 +591,10 @@ function commitCompletedOutbox(runtime) {
     ...outbox.quarantinedEventIds
   ].slice(-2_000);
   runtime.state.syncOutbox = null;
+  return cleanupBatchId;
 }
 
-function finalizePending(runtime, response) {
+async function finalizePending(runtime, response, paths) {
   const pending = runtime.state.pendingRequest;
   if (!pending) {
     throw new ConnectorError("MISSING_PENDING_REQUEST", "The local request journal is missing its pending request.");
@@ -301,14 +618,20 @@ function finalizePending(runtime, response) {
     outbox.accepted += Number.isSafeInteger(response.accepted) ? response.accepted : 0;
     outbox.duplicates += Number.isSafeInteger(response.duplicates) ? response.duplicates : 0;
     outbox.rejected += rejected;
-    outbox.quarantinedEventIds.push(...rejectedIds);
+    outbox.quarantinedEventIds = [...outbox.quarantinedEventIds, ...rejectedIds].slice(-2_000);
+    outbox.quarantinedCount = (outbox.quarantinedCount || 0) + rejectedIds.length;
+    outbox.processedEvents = (outbox.processedEvents || 0) + outbox.chunks[outbox.index].events.length;
+    outbox.processedCheckpoints = (outbox.processedCheckpoints || 0) + outbox.chunks[outbox.index].checkpoints.length;
+    outbox.processedChunks = (outbox.processedChunks || 0) + 1;
     outbox.index += 1;
-    commitCompletedOutbox(runtime);
+    const cleanupBatchId = await advanceCompletedOutbox(runtime, paths);
+    runtime.state.pendingRequest = null;
+    return { pending, cleanupBatchId };
   } else if (pending.kind === "heartbeat") {
     runtime.state.lastHeartbeatAt = pending.commit.observedAt;
   }
   runtime.state.pendingRequest = null;
-  return pending;
+  return { pending, cleanupBatchId: null };
 }
 
 async function replayPending(runtime, secrets, paths, options) {
@@ -330,8 +653,9 @@ async function replayPending(runtime, secrets, paths, options) {
     await markPendingPermanentFailure(runtime, paths, error);
     throw error;
   }
-  const committed = finalizePending(runtime, response);
-  await saveRuntime(paths, runtime);
+  const finalized = await finalizePending(runtime, response, paths);
+  const committed = finalized.pending;
+  await saveFinalizedRuntime(paths, runtime, finalized.cleanupBatchId);
   await safeLog(paths.log, {
     action: committed.kind,
     status: "recovered",
@@ -383,6 +707,7 @@ async function sendHeartbeatRequest(runtime, secrets, paths, options) {
   const adapterHealth = Object.values(runtime.state.lastScan?.adapters || {});
   const degraded = adapterHealth.some((adapter) =>
     adapter.status === "unavailable"
+    || adapter.status === "truncated"
     || (adapter.malformed || 0) > 0
     || (adapter.cumulativeMismatches || 0) > 0
     || (adapter.cumulativeResets || 0) > 0
@@ -413,7 +738,7 @@ async function sendHeartbeatRequest(runtime, secrets, paths, options) {
     await markPendingPermanentFailure(runtime, paths, error);
     throw error;
   }
-  finalizePending(runtime, response);
+  await finalizePending(runtime, response, paths);
   await saveRuntime(paths, runtime);
   await safeLog(paths.log, { action: "heartbeat", status: "success", sequence });
   return {
@@ -487,15 +812,22 @@ async function handlePermanentSyncError(runtime, paths, error) {
   const chunk = outbox.chunks[outbox.index];
   const split = bisectChunk(chunk);
   runtime.state.pendingRequest = null;
+  let cleanupBatchId = null;
   if (split) {
     outbox.chunks.splice(outbox.index, 1, ...split);
+    outbox.totalChunks = (outbox.totalChunks || outbox.chunks.length - 1) + 1;
   } else {
     outbox.rejected += chunk.events.length + chunk.checkpoints.length;
-    outbox.quarantinedEventIds.push(...chunk.events.map((event) => event.eventId));
+    const rejectedIds = chunk.events.map((event) => event.eventId);
+    outbox.quarantinedEventIds = [...outbox.quarantinedEventIds, ...rejectedIds].slice(-2_000);
+    outbox.quarantinedCount = (outbox.quarantinedCount || 0) + rejectedIds.length;
+    outbox.processedEvents = (outbox.processedEvents || 0) + chunk.events.length;
+    outbox.processedCheckpoints = (outbox.processedCheckpoints || 0) + chunk.checkpoints.length;
+    outbox.processedChunks = (outbox.processedChunks || 0) + 1;
     outbox.index += 1;
-    commitCompletedOutbox(runtime);
+    cleanupBatchId = await advanceCompletedOutbox(runtime, paths);
   }
-  await saveRuntime(paths, runtime);
+  await saveFinalizedRuntime(paths, runtime, cleanupBatchId);
   return true;
 }
 
@@ -504,7 +836,15 @@ async function processSyncOutbox(runtime, secrets, paths, options) {
   if (!initial) {
     return null;
   }
-  const initialIndex = initial.index;
+  assertActiveSyncPage(initial);
+  if (!runtime.state.pendingRequest && initial.index >= initial.chunks.length) {
+    const cleanupBatchId = await advanceCompletedOutbox(runtime, paths);
+    await saveFinalizedRuntime(paths, runtime, cleanupBatchId);
+    if (runtime.state.syncOutbox) assertActiveSyncPage(runtime.state.syncOutbox);
+  }
+  const initialProcessedEvents = initial.processedEvents || 0;
+  const initialProcessedCheckpoints = initial.processedCheckpoints || 0;
+  const initialProcessedChunks = initial.processedChunks || 0;
   const maxIngestRequests = Number.isSafeInteger(options.maxIngestRequests)
     && options.maxIngestRequests >= 0
     ? options.maxIngestRequests
@@ -554,7 +894,11 @@ async function processSyncOutbox(runtime, secrets, paths, options) {
       continue;
     }
     const outbox = runtime.state.syncOutbox;
+    assertActiveSyncPage(outbox);
     const chunk = outbox.chunks[outbox.index];
+    if (!chunk) {
+      throw new ConnectorError("SYNC_BATCH_CORRUPT", "The active local sync page has no matching request chunk.");
+    }
     const sequence = runtime.state.nextSequence;
     const body = {
       events: chunk.events,
@@ -587,14 +931,14 @@ async function processSyncOutbox(runtime, secrets, paths, options) {
       }
       throw error;
     }
-    finalizePending(runtime, response);
-    await saveRuntime(paths, runtime);
+    const finalized = await finalizePending(runtime, response, paths);
+    await saveFinalizedRuntime(paths, runtime, finalized.cleanupBatchId);
     await afterIngestRequest();
   }
-  const completedChunks = initial.chunks.slice(initialIndex, initial.index);
-  const sent = completedChunks.reduce((total, chunk) => total + chunk.events.length, 0);
-  const checkpoints = completedChunks.reduce((total, chunk) => total + chunk.checkpoints.length, 0);
-  const catchingUp = Boolean(runtime.state.syncOutbox);
+  const sent = (initial.processedEvents || 0) - initialProcessedEvents;
+  const checkpoints = (initial.processedCheckpoints || 0) - initialProcessedCheckpoints;
+  const chunksProcessed = (initial.processedChunks || 0) - initialProcessedChunks;
+  const catchingUp = Boolean(runtime.state.syncOutbox) || Boolean(initial.commit.collectionPending);
   await safeLog(paths.log, {
     action: "sync",
     status: catchingUp ? "catching_up" : (initial.rejected > 0 ? "partial" : "success"),
@@ -608,18 +952,18 @@ async function processSyncOutbox(runtime, secrets, paths, options) {
     accepted: initial.accepted,
     duplicates: initial.duplicates,
     rejected: initial.rejected,
-    quarantined: initial.quarantinedEventIds.length,
-    chunks: initial.chunks.length,
+    quarantined: initial.quarantinedCount || initial.quarantinedEventIds.length,
+    chunks: initial.totalChunks || initial.chunks.length,
     unresolvedQueued: Array.isArray(initial.commit.nextUnresolvedEvents)
       ? initial.commit.nextUnresolvedEvents.length
       : runtime.state.unresolvedEvents.length,
     unresolvedOverflow: initial.commit.unresolvedOverflow?.totalDropped
       ?? runtime.state.unresolvedOverflow.totalDropped,
-    chunksProcessed: initial.index - initialIndex,
+    chunksProcessed,
     ingestRequests,
     interleavedHeartbeats,
     catchingUp,
-    remainingChunks: Math.max(0, initial.chunks.length - initial.index),
+    remainingChunks: remainingSyncChunks(runtime.state.syncOutbox),
     nextSequence: runtime.state.nextSequence,
     adapters: initial.commit.scanSummary
   };
@@ -675,9 +1019,13 @@ export async function pair(options = {}) {
         throw new ConnectorError("PAIR_WHILE_SYNC_PENDING", "Finish or resolve the pending authenticated request before pairing again.");
       }
       // Cursors were never committed, so dropping this rejected outbox is lossless: it will be recollected after re-pair.
+      const abandonedBatchId = runtime.state.syncOutbox?.version === 3
+        ? runtime.state.syncOutbox.batchId
+        : null;
       runtime.state.pendingRequest = null;
       runtime.state.syncOutbox = null;
       await saveRuntime(paths, runtime);
+      if (abandonedBatchId) await cleanupSyncBatch(paths, abandonedBatchId);
     }
     if (runtime.state.paired && !runtime.state.pendingPair && !options.replacePendingPair) {
       const configuredEndpoint = validateEndpoint(runtime.config.endpoint);
@@ -874,12 +1222,27 @@ export async function sync(options = {}) {
     const runtime = await loadRuntime(paths);
     const secrets = await loadSecrets(paths);
     assertPaired(runtime.state, runtime.config, secrets);
+    const aggregateHistory = options.aggregateHistory === true;
+    const historyWindow = aggregateHistory
+      ? aggregateHistoryWindow(options.now ?? Date.now())
+      : null;
     if (runtime.state.pendingRequest?.kind === "heartbeat") {
       assertPendingCanReplay(runtime);
       await replayPending(runtime, secrets, paths, options);
     }
     if (runtime.state.pendingRequest?.kind === "sync" && !runtime.state.syncOutbox) {
       throw new ConnectorError("MISSING_SYNC_OUTBOX", "A pending sync request has no matching local outbox.");
+    }
+    if (aggregateHistory && oversizedReleasedV1Outbox(runtime.state) && !runtime.state.pendingRequest) {
+      const abandonedEvents = runtime.state.syncOutbox.totalEvents;
+      migrateOversizedReleasedV1Outbox(runtime, historyWindow);
+      await saveRuntime(paths, runtime);
+      await safeLog(paths.log, {
+        action: "sync",
+        status: "requeued_released_v1_outbox",
+        eventCount: abandonedEvents,
+        sequence: runtime.state.nextSequence
+      });
     }
     if (runtime.state.syncOutbox) {
       return {
@@ -903,6 +1266,9 @@ export async function sync(options = {}) {
         Boolean(enabled && supportedProviderSet.has(provider))
       ])
     );
+    const historyRanges = aggregateHistory
+      ? aggregateHistoryRanges(options.now ?? Date.now(), runtime.state, enabledFallbacks)
+      : null;
     const collection = await collectUsage({
       roots,
       state: runtime.state,
@@ -916,8 +1282,19 @@ export async function sync(options = {}) {
       enabledProviders: {
         codex: allowedProviderSet.has("codex")
       },
-      dedupNamespaceKey: secrets.dedupNamespaceKey
+      dedupNamespaceKey: secrets.dedupNamespaceKey,
+      maximumEventsPerProvider: options.maximumEventsPerProvider,
+      aggregateRanges: historyRanges,
+      discoverJsonlFiles: options.discoverJsonlFiles,
+      excludedEventIds: runtime.state.migrationExcludedEvents.map((event) => event.eventId)
     });
+    if (historyRanges) {
+      for (const [provider, range] of Object.entries(historyRanges)) {
+        if (collection.providerScans?.[provider]?.complete) {
+          collection.nextCursors.aggregate.providers[provider].through = range.end;
+        }
+      }
+    }
     const scannedAt = new Date(options.now ?? Date.now()).toISOString();
     const eligibleEvents = collection.events.filter((event) =>
       allowedProviderSet.has(event.provider) && supportedProviderSet.has(event.provider)
@@ -933,6 +1310,7 @@ export async function sync(options = {}) {
       }
     }
     const scanSummary = safeScanSummary(collection.stats);
+    const collectionPending = Object.values(collection.stats).some((adapter) => adapter.pending === true);
     const retainedUnresolved = [];
     const resolvedQueuedEvents = [];
     for (const event of runtime.state.unresolvedEvents || []) {
@@ -961,9 +1339,10 @@ export async function sync(options = {}) {
     for (const event of [...resolvedQueuedEvents, ...currentWireEvents]) {
       eventsById.set(event.eventId, event);
     }
-    const events = [...eventsById.values()].sort((a, b) =>
-      a.occurredAt.localeCompare(b.occurredAt) || a.eventId.localeCompare(b.eventId)
-    );
+    const events = [...eventsById.values()].sort((a, b) => {
+      const timeOrder = a.occurredAt.localeCompare(b.occurredAt);
+      return (aggregateHistory ? -timeOrder : timeOrder) || a.eventId.localeCompare(b.eventId);
+    });
     const withheld = collection.events.length - currentWireEvents.length;
     const unknownModels = [...new Map(
       unresolvedQueue.events.map((event) => [event.provider + "\0" + event.sourceModelId, {
@@ -1003,32 +1382,35 @@ export async function sync(options = {}) {
         unresolvedQueued: unresolvedQueue.events.length,
         unresolvedOverflow: unresolvedOverflow.totalDropped,
         nextSequence: runtime.state.nextSequence,
+        catchingUp: collectionPending,
         adapters: scanSummary
       };
     }
 
-    runtime.state.syncOutbox = {
-      version: 1,
-      index: 0,
-      chunks: chunkSyncPayloads(events, checkpointsToSend),
-      totalEvents: events.length,
-      totalCheckpoints: checkpointsToSend.length,
-      accepted: 0,
-      duplicates: 0,
-      rejected: 0,
-      quarantinedEventIds: [],
-      commit: {
+    const createdOutbox = await createPagedSyncOutbox(
+      paths,
+      events,
+      checkpointsToSend,
+      {
         nextCursors: collection.nextCursors,
         checkpointHash,
         scannedAt,
         scanSummary,
         withheld,
         unknownModels,
+        collectionPending,
         nextUnresolvedEvents: unresolvedQueue.events,
         unresolvedOverflow
-      }
-    };
-    await saveRuntime(paths, runtime);
+      },
+      options
+    );
+    runtime.state.syncOutbox = createdOutbox;
+    try {
+      await saveRuntime(paths, runtime, { atomicWriteJson: options.atomicWriteJson });
+    } catch (error) {
+      await cleanupSyncBatch(paths, createdOutbox.batchId);
+      throw error;
+    }
     return processSyncOutbox(runtime, secrets, paths, options);
   });
 }
@@ -1091,7 +1473,7 @@ export async function status(options = {}) {
         }
       : null,
     pendingChunks: state.syncOutbox
-      ? Math.max(0, state.syncOutbox.chunks.length - state.syncOutbox.index)
+      ? remainingSyncChunks(state.syncOutbox)
       : 0,
     unresolvedQueued: Array.isArray(state.unresolvedEvents) ? state.unresolvedEvents.length : 0,
     unresolvedOverflow: state.unresolvedOverflow || { totalDropped: 0, lastOverflowAt: null },

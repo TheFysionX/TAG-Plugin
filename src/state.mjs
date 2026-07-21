@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
-import { MAX_UNRESOLVED_EVENTS, SCHEMA_VERSION } from "./constants.mjs";
+import { MAX_MIGRATION_EXCLUSIONS, MAX_UNRESOLVED_EVENTS, SCHEMA_VERSION } from "./constants.mjs";
 
 const UNRESOLVED_EVENT_KEYS = new Set([
   "eventId",
@@ -17,6 +17,31 @@ const UNRESOLVED_EVENT_KEYS = new Set([
 ]);
 const SOURCE_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,119}$/;
 const TOKEN_COUNT_PATTERN = /^\d{1,30}$/;
+const AGGREGATE_PROVIDERS = ["codex", "claude", "kimi"];
+
+function initialAggregateCursors() {
+  return {
+    version: 2,
+    providers: Object.fromEntries(AGGREGATE_PROVIDERS.map((provider) => [provider, { through: null }]))
+  };
+}
+
+function normalizedAggregateCursors(value) {
+  if (value?.version !== 2 || !value.providers || typeof value.providers !== "object") {
+    return initialAggregateCursors();
+  }
+  return {
+    version: 2,
+    providers: Object.fromEntries(AGGREGATE_PROVIDERS.map((provider) => {
+      const through = value.providers?.[provider]?.through;
+      return [provider, {
+        through: typeof through === "string" && Number.isFinite(Date.parse(through))
+          ? new Date(through).toISOString()
+          : null
+      }];
+    }))
+  };
+}
 
 function normalizedUnresolvedEvent(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
@@ -53,13 +78,15 @@ export function initialState() {
     pendingPair: null,
     syncOutbox: null,
     quarantinedEventIds: [],
+    migrationExcludedEvents: [],
     unresolvedEvents: [],
     unresolvedOverflow: { totalDropped: 0, lastOverflowAt: null },
     providerEvidenceHashes: {},
     cursors: {
       codex: { files: {} },
       claude: { seen: {} },
-      kimi: { files: {} }
+      kimi: { files: {} },
+      aggregate: initialAggregateCursors()
     },
     lastSyncAt: null,
     lastHeartbeatAt: null,
@@ -103,6 +130,7 @@ export async function loadRuntime(paths) {
   state.cursors.codex = state.cursors.codex || { files: {} };
   state.cursors.claude = state.cursors.claude || { seen: {} };
   state.cursors.kimi = state.cursors.kimi || { files: {} };
+  state.cursors.aggregate = normalizedAggregateCursors(state.cursors.aggregate);
   config.transcriptFallbacks = {
     codex: Boolean(config.transcriptFallbacks?.codex),
     claude: Boolean(config.transcriptFallbacks?.claude),
@@ -120,6 +148,16 @@ export async function loadRuntime(paths) {
     state.previousRequestDigest = "";
   }
   state.quarantinedEventIds = Array.isArray(state.quarantinedEventIds) ? state.quarantinedEventIds : [];
+  state.migrationExcludedEvents = (Array.isArray(state.migrationExcludedEvents)
+    ? state.migrationExcludedEvents
+    : [])
+    .filter((event) => event
+      && typeof event.eventId === "string"
+      && /^[a-f0-9]{64}$/.test(event.eventId)
+      && typeof event.occurredAt === "string"
+      && Number.isFinite(Date.parse(event.occurredAt)))
+    .slice(-MAX_MIGRATION_EXCLUSIONS)
+    .map((event) => ({ eventId: event.eventId, occurredAt: new Date(event.occurredAt).toISOString() }));
   const validUnresolvedEvents = (Array.isArray(state.unresolvedEvents) ? state.unresolvedEvents : [])
     .map(normalizedUnresolvedEvent)
     .filter(Boolean);
@@ -173,12 +211,13 @@ export async function atomicWriteJson(filePath, value, mode = 0o600) {
   }
 }
 
-export async function saveRuntime(paths, { state, config }) {
+export async function saveRuntime(paths, { state, config }, options = {}) {
   await ensureRuntimeDirectory(paths);
-  await Promise.all([
-    atomicWriteJson(paths.state, state),
-    atomicWriteJson(paths.config, config)
-  ]);
+  const writeJson = options.atomicWriteJson || atomicWriteJson;
+  // Config commits first and state commits last. A state file can therefore
+  // never durably reference data whose paired config write failed in parallel.
+  await writeJson(paths.config, config);
+  await writeJson(paths.state, state);
 }
 
 export async function saveSecrets(paths, secrets) {

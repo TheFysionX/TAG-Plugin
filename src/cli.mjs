@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { FOREGROUND_MAX_INGEST_REQUESTS } from "./constants.mjs";
 import { publicError } from "./errors.mjs";
 import {
   doctor,
@@ -74,6 +75,7 @@ async function main() {
     dryRun: Boolean(flags["dry-run"]),
     confirmInstall: Boolean(flags["confirm-install"]),
     confirmUninstall: Boolean(flags["confirm-uninstall"]),
+    aggregateHistory: true,
     cliPath
   };
   let result;
@@ -92,7 +94,10 @@ async function main() {
       });
       break;
     case "sync":
-      result = await sync(common);
+      result = await sync({
+        ...common,
+        maxIngestRequests: FOREGROUND_MAX_INGEST_REQUESTS
+      });
       break;
     case "heartbeat":
       result = await heartbeat(common);

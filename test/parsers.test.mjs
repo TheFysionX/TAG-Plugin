@@ -43,6 +43,90 @@ test("Codex fallback extracts only allowlisted final-turn usage", async () => {
   assert.doesNotMatch(serialized(parsed), /SECRET_|private|repository/i);
 });
 
+test("Codex fallback pages a large journal without changing event identity or totals", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-codex-page-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "rollout-00000000-0000-4000-8000-000000000001.jsonl");
+  const records = [
+    { type: "session_meta", payload: { id: "00000000-0000-4000-8000-000000000001" } },
+    { type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+    ...Array.from({ length: 5 }, (_unused, index) => ({
+      timestamp: new Date(Date.parse("2026-07-19T10:00:00.000Z") + index * 1_000).toISOString(),
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: { total_tokens: (index + 1) * 15 },
+          last_token_usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 }
+        }
+      }
+    }))
+  ];
+  await fs.writeFile(activePath, records.map(JSON.stringify).join("\n") + "\n", "utf8");
+
+  const full = await parseCodexRollout(activePath, { dedupNamespaceKey });
+  let cursor;
+  const paged = [];
+  for (let page = 0; page < 3; page += 1) {
+    const parsed = await parseCodexRollout(activePath, {
+      dedupNamespaceKey,
+      cursor,
+      maximumEvents: 2
+    });
+    paged.push(...parsed.events);
+    cursor = parsed.cursor;
+  }
+  const complete = await parseCodexRollout(activePath, {
+    dedupNamespaceKey,
+    cursor,
+    maximumEvents: 2
+  });
+
+  assert.deepEqual(paged, full.events);
+  assert.equal(cursor.offset, (await fs.stat(activePath)).size);
+  assert.equal(complete.events.length, 0);
+  assert.equal(complete.reachedEventLimit, false);
+});
+
+test("Codex time boundary leaves a complete cursor before deferred usage", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-codex-time-page-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "rollout-00000000-0000-4000-8000-000000000001.jsonl");
+  const usage = (timestamp, cumulativeTotal) => ({
+    timestamp,
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: {
+        total_token_usage: { total_tokens: cumulativeTotal },
+        last_token_usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 }
+      }
+    }
+  });
+  await fs.writeFile(activePath, [
+    { type: "session_meta", payload: { id: "00000000-0000-4000-8000-000000000001" } },
+    { type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+    usage("2026-07-19T10:00:00.000Z", 15),
+    usage("2026-07-19T11:00:00.000Z", 30)
+  ].map(JSON.stringify).join("\n") + "\n", "utf8");
+  const first = await parseCodexRollout(activePath, {
+    dedupNamespaceKey,
+    maximumObservedAtExclusive: "2026-07-19T11:00:00.000Z"
+  });
+  const second = await parseCodexRollout(activePath, {
+    dedupNamespaceKey,
+    cursor: first.cursor,
+    maximumObservedAtExclusive: "2026-07-19T12:00:00.000Z"
+  });
+  const full = await parseCodexRollout(activePath, { dedupNamespaceKey });
+
+  assert.equal(first.reachedTimeBoundary, true);
+  assert.equal(first.events.length, 1);
+  assert.equal(second.events.length, 1);
+  assert.deepEqual([...first.events, ...second.events], full.events);
+  assert.equal(second.cursor.offset, (await fs.stat(activePath)).size);
+});
+
 test("Claude fallback deduplicates message snapshots using the maximum/final usage", async () => {
   const parsed = await parseClaudeProject(path.join(fixtureDirectory, "claude-project.jsonl"), {
     aliasKey,
@@ -72,6 +156,46 @@ test("Kimi v0.28 fallback prefilters usage.record and maps HighSpeed to fast", a
   assert.equal(parsed.events[0].mode.fast, true);
   assert.equal(parsed.events[0].usage.total, 42);
   assert.doesNotMatch(serialized(parsed), /SECRET_|private|kimi\.py/i);
+});
+
+test("Kimi fallback pages a large journal without changing event identity or totals", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-kimi-page-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "wire.jsonl");
+  const records = Array.from({ length: 5 }, (_unused, index) => ({
+    type: "usage.record",
+    time: new Date(Date.parse("2026-07-19T12:00:00.000Z") + index * 1_000).toISOString(),
+    model: "kimi-code/kimi-for-coding-highspeed",
+    usage: { inputOther: 10 + index, inputCacheRead: 2, inputCacheCreation: 1, output: 5 },
+    usageScope: "turn"
+  }));
+  await fs.writeFile(activePath, records.map(JSON.stringify).join("\n") + "\n", "utf8");
+  const options = {
+    stableJournalIdentity: "stable-kimi-session-agent",
+    dedupNamespaceKey
+  };
+  const full = await parseKimiWire(activePath, options);
+  let cursor;
+  const paged = [];
+  for (let page = 0; page < 3; page += 1) {
+    const parsed = await parseKimiWire(activePath, {
+      ...options,
+      cursor,
+      maximumEvents: 2
+    });
+    paged.push(...parsed.events);
+    cursor = parsed.cursor;
+  }
+  const complete = await parseKimiWire(activePath, {
+    ...options,
+    cursor,
+    maximumEvents: 2
+  });
+
+  assert.deepEqual(paged, full.events);
+  assert.equal(cursor.offset, (await fs.stat(activePath)).size);
+  assert.equal(complete.events.length, 0);
+  assert.equal(complete.reachedEventLimit, false);
 });
 
 test("uploaded event IDs are stable across fresh local alias keys", async () => {

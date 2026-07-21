@@ -13,9 +13,14 @@
 | --- | --- | --- |
 | Network replay | Unique request ID, timestamp window, monotonic sequence | The same signed request is detectable. |
 | Batch deletion/reordering after submission | Previous-request digest chain | A later client cannot silently rewrite the server's accepted chain. |
-| Duplicate journal scans | Account-scoped provider-identity HMAC event IDs and server idempotency | Re-reading one source record does not create extra usage. |
-| Reinstall and full-history rescan | Server-issued per-account event-ID namespace independent of the installation alias key | The same provider record keeps the same uploaded ID across clean installs without being cross-account linkable. |
-| Oversized first history | Content-free disjoint chunks capped at 3 events or 2 checkpoints, paced 550 ms apart; 1,000-ingest scheduled-run bound; heartbeat every 50 ingests plus final heartbeat | Server/query/rate limits are respected without early cursor advancement or starving liveness. |
+| Duplicate journal scans | Account-scoped source IDs, stable v3 session-hour IDs independent of source set/canonical mapping, preserved cursors, Claude sent ledger, and server idempotency | An unchanged replay is idempotent; a partial or expanded replay cannot mint a separately scoreable ID. |
+| Duplicate physical journals | In-memory source-ID set before hourly summing | Copied records with the same provider identity count once. |
+| Reinstall with preserved state | Uninstall preserves cursors, the Claude sent ledger, and the server-issued per-account namespace | Later records remain append-only without cross-account linkability. |
+| Oversized first history | 89-day scored window, stable hourly aggregation, private digest-manifest pages of at most 5,000 events, disjoint 3/2 request chunks, and bounded catch-up | Guaranteed-quarantine history is skipped and server/query/rate limits are respected without early cursor advancement. |
+| Disabled, unavailable, or truncated provider source | Independent provider through-watermarks that advance only after complete discovery and collection | Healthy providers can progress without marking an incomplete provider's history as consumed. |
+| Missing or corrupt catch-up page | Private bounded files, path/schema/allowlist/count checks, digest manifest, and final-page cursor commit | Lost or modified paged history fails closed before collection cursors advance. |
+| False hourly volume anomaly | The stable aggregation key retains the original UTC hour | Daily usage is not collapsed into one artificial hour. |
+| Hidden aggregate volume anomaly | Stable session-hour aggregates are not sharded | An implausibly large aggregate remains visible as one event to server anomaly and quarantine rules. |
 | Permanent event-ID conflict | Hashed rejected ID quarantine after validated 2xx; final cursor commit | One conflicting record cannot block all later usage forever. |
 | Invalid record in a rejected batch | Permanent 4xx classification, batch bisection, isolated quarantine | One invalid record does not create infinite retries or discard valid siblings. |
 | Authorization/chain rejection | Non-retryable pending failure visible in local status | A permanent control-plane failure is not hammered forever or silently discarded. |
@@ -25,7 +30,7 @@
 | Pair code disclosed in an agent prompt | Conspicuous website and prompt disclosure before the generated install message | The user is told that the coding-agent provider receives and may retain the short-lived credential under its normal terms. |
 | Journal replaced at the same path | Metadata identity, complete-line boundary, and full rolling digest over allowlisted usage fields | A changed scored record anywhere in the prior prefix resets parsing without hashing prompt/tool content. |
 | Oversized JSONL content | One-MiB per-line buffer cap with discard-through-newline and malformed health count | One huge tool/response line cannot create unbounded parser memory. |
-| Catch-up rate pressure | Disjoint 3/2 chunks, 550 ms pacing, bounded `Retry-After`, bounded scheduled work, heartbeat interleaving, pending-chain preservation | History drains below the device window; throttled work resumes without chain gaps while liveness continues. |
+| Catch-up rate pressure | Disjoint 3/2 chunks, 550 ms pacing, 100-request interactive bound, 1,000-request scheduled bound, bounded `Retry-After`, heartbeat interleaving, pending-chain preservation | History drains below the device window; throttled work resumes without chain gaps while liveness continues. |
 | Data exfiltration bug | Parser prefilter, outbound allowlist, strict backend schema, safe-log allowlist | Unapproved fields are kept out of normal payload/log paths. |
 | Unknown or spoofed model | Canonical registry plus strict source-model token grammar; capped content-free unresolved queue with visible overflow | Unknown usage is not mislabeled or scored, and it does not block later known records. |
 | Inflated journal totals | Provider-backed aggregate checkpoints and server anomaly rules | Some inconsistencies can be flagged. |
@@ -36,6 +41,8 @@
 ## What it cannot prove
 
 An open-source connector running under a user's account cannot prove that the user did not modify the executable, forge local journal fixtures, suppress events before first submission, run multiple accounts, or manipulate the machine clock within allowed tolerances. Agent review improves transparency but is not remote attestation.
+
+Deleting local state and then rescanning a session-hour after its journal gained or lost records can change the aggregate totals, but not its stable v3 event ID. The server therefore sees a conflicting body under the existing ID and the connector rejects or quarantines it rather than creating extra scored usage. This prevents a partial-overlap replay from double-scoring; it does not reconstruct lost continuity. Uninstall intentionally preserves state; device revocation and state loss should still be treated as a new trust epoch rather than assumed equivalent to an append-safe reinstall.
 
 Consequently:
 

@@ -23,6 +23,7 @@ export function runtimePaths(options = {}) {
     state: path.join(home, "state.json"),
     secrets: path.join(home, "device-secrets.json"),
     pendingSecrets: path.join(home, "pending-device-secrets.json"),
+    syncPages: path.join(home, "sync-pages"),
     log: path.join(home, "connector.log.jsonl"),
     lock: path.join(home, "connector.lock")
   };

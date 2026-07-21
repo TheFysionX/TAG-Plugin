@@ -88,6 +88,18 @@ export async function parseKimiWire(filePath, options) {
   const resolveModel = options.canonicalModelId || canonicalModelId;
   const stat = await fs.stat(filePath);
   const savedCursor = options.cursor || {};
+  const maximumEvents = Number.isSafeInteger(options.maximumEvents) && options.maximumEvents >= 0
+    ? options.maximumEvents
+    : Number.POSITIVE_INFINITY;
+  const minimumObservedAtInclusive = typeof options.minimumObservedAtInclusive === "string"
+    ? Date.parse(options.minimumObservedAtInclusive)
+    : Number.NEGATIVE_INFINITY;
+  const maximumObservedAtExclusive = typeof options.maximumObservedAtExclusive === "string"
+    ? Date.parse(options.maximumObservedAtExclusive)
+    : Number.POSITIVE_INFINITY;
+  const emitEvent = typeof options.onEvent === "function"
+    ? options.onEvent
+    : null;
   const fileIdentity = sha256([
     "kimi-journal-file-v1",
     String(stat.dev),
@@ -101,6 +113,25 @@ export async function parseKimiWire(filePath, options) {
   const validOffset = Number.isSafeInteger(savedCursor.offset)
     && savedCursor.offset >= 0
     && savedCursor.offset <= stat.size;
+  const unchangedCompleteFile = !replaced
+    && !legacyCursor
+    && validOffset
+    && savedCursor.offset === stat.size
+    && savedCursor.observedSize === stat.size
+    && savedCursor.observedMtimeMs === stat.mtimeMs;
+  if (unchangedCompleteFile) {
+    return {
+      events: [],
+      malformed: 0,
+      eventCount: 0,
+      reachedEventLimit: false,
+      reachedTimeBoundary: false,
+      cursor: {
+        ...savedCursor,
+        lastSeenAt: options.now ?? Date.now()
+      }
+    };
+  }
   let prefixMismatch = false;
   let verifiedPrefix = null;
   if (!replaced
@@ -133,8 +164,10 @@ export async function parseKimiWire(filePath, options) {
     ? (verifiedPrefix?.timestampCounts || new Map())
     : new Map();
   const events = [];
+  let emittedEvents = 0;
+  let reachedTimeBoundary = false;
 
-  for await (const line of readCompleteJsonLines(filePath, startOffset)) {
+  for await (const line of readCompleteJsonLines(filePath, startOffset, stat.size)) {
     committedOffset = line.endOffset;
     if (line.oversized) {
       malformed += 1;
@@ -157,6 +190,20 @@ export async function parseKimiWire(filePath, options) {
     const sourceModelId = typeof usageRecord.model === "string" ? usageRecord.model.slice(0, 120) : "unknown";
     const fast = sourceModelId.toLowerCase().includes("highspeed");
     const observedAt = normalizeTimestamp(usageRecord.time || usageRecord.timestamp);
+    if (observedAt && Date.parse(observedAt) >= maximumObservedAtExclusive) {
+      committedOffset = line.startOffset;
+      reachedTimeBoundary = true;
+      break;
+    }
+    if (observedAt && Date.parse(observedAt) < minimumObservedAtInclusive) {
+      nextTimestampOrdinal(timestampCounts, observedAt);
+      usagePrefixDigest = advanceUsagePrefix(
+        usagePrefixDigest,
+        usageContentDigest(usageRecord, options.stableJournalIdentity)
+      );
+      usagePrefixCount += 1;
+      continue;
+    }
     const contentDigest = usageContentDigest(usageRecord, options.stableJournalIdentity);
     const modelId = resolveModel("kimi", sourceModelId);
     const providerIdentity = providerRecordIdentity(usageRecord);
@@ -174,6 +221,8 @@ export async function parseKimiWire(filePath, options) {
       provider: "kimi",
       modelId,
       sourceModelId,
+      aggregationScope: options.stableJournalIdentity,
+      aggregationModeToken: sha256("kimi-raw-mode\0" + (fast ? "highspeed" : "standard")),
       observedAt,
       mode: normalizeMode({ speed: fast ? "fast" : "standard" }),
       usage: normalizeUsage({
@@ -194,18 +243,31 @@ export async function parseKimiWire(filePath, options) {
       contentDigest
     );
     usagePrefixCount += 1;
-    events.push(event);
+    if (emitEvent) {
+      emitEvent(event);
+    } else {
+      events.push(event);
+    }
+    emittedEvents += 1;
+    if (emittedEvents >= maximumEvents) {
+      break;
+    }
   }
 
   return {
     events,
     malformed,
+    eventCount: emittedEvents,
+    reachedEventLimit: emittedEvents >= maximumEvents && committedOffset < stat.size,
+    reachedTimeBoundary,
     cursor: {
       fileIdentity,
       offset: committedOffset,
       usagePrefixVersion: 1,
       usagePrefixDigest,
       usagePrefixCount,
+      observedSize: stat.size,
+      observedMtimeMs: stat.mtimeMs,
       lastSeenAt: options.now ?? Date.now()
     }
   };

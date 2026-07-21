@@ -5,11 +5,12 @@ const MAX_DISCOVERED_FILES = 20_000;
 
 export async function discoverJsonlFiles(root, options = {}) {
   const maximum = options.maximum || MAX_DISCOVERED_FILES;
+  const discoveryLimit = maximum + 1;
   const files = [];
   const pending = [root];
   let unavailable = false;
 
-  while (pending.length > 0 && files.length < maximum) {
+  while (pending.length > 0 && files.length < discoveryLimit) {
     const directory = pending.pop();
     let entries;
     try {
@@ -30,12 +31,13 @@ export async function discoverJsonlFiles(root, options = {}) {
         pending.push(candidate);
       } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".jsonl")) {
         files.push(candidate);
-        if (files.length >= maximum) {
+        if (files.length >= discoveryLimit) {
           break;
         }
       }
     }
   }
   files.sort((a, b) => a.localeCompare(b));
-  return { files, unavailable, truncated: files.length >= maximum };
+  const truncated = files.length > maximum;
+  return { files: files.slice(0, maximum), unavailable, truncated };
 }

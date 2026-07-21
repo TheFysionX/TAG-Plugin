@@ -111,6 +111,18 @@ export async function parseCodexRollout(filePath, options) {
   const resolveModel = options.canonicalModelId || canonicalModelId;
   const stat = await fs.stat(filePath);
   const savedCursor = options.cursor || {};
+  const maximumEvents = Number.isSafeInteger(options.maximumEvents) && options.maximumEvents >= 0
+    ? options.maximumEvents
+    : Number.POSITIVE_INFINITY;
+  const minimumObservedAtInclusive = typeof options.minimumObservedAtInclusive === "string"
+    ? Date.parse(options.minimumObservedAtInclusive)
+    : Number.NEGATIVE_INFINITY;
+  const maximumObservedAtExclusive = typeof options.maximumObservedAtExclusive === "string"
+    ? Date.parse(options.maximumObservedAtExclusive)
+    : Number.POSITIVE_INFINITY;
+  const emitEvent = typeof options.onEvent === "function"
+    ? options.onEvent
+    : null;
   const fileIdentity = sha256([
     "codex-journal-file-v1",
     String(stat.dev),
@@ -125,6 +137,28 @@ export async function parseCodexRollout(filePath, options) {
   const validOffset = Number.isSafeInteger(savedCursor.offset)
     && savedCursor.offset >= 0
     && savedCursor.offset <= stat.size;
+  const unchangedCompleteFile = !replaced
+    && !legacyCursor
+    && validOffset
+    && savedCursor.offset === stat.size
+    && savedCursor.observedSize === stat.size
+    && savedCursor.observedMtimeMs === stat.mtimeMs;
+  if (unchangedCompleteFile) {
+    return {
+      events: [],
+      malformed: 0,
+      duplicateSnapshots: 0,
+      cumulativeResets: 0,
+      cumulativeMismatches: 0,
+      eventCount: 0,
+      reachedEventLimit: false,
+      reachedTimeBoundary: false,
+      cursor: {
+        ...savedCursor,
+        lastSeenAt: options.now ?? Date.now()
+      }
+    };
+  }
   let prefixMismatch = false;
   let verifiedPrefix = null;
   if (!replaced
@@ -170,8 +204,10 @@ export async function parseCodexRollout(filePath, options) {
     ? sha256("codex-session-filename\0" + filenameIdentity)
     : (savedCursor.sessionIdentityHash || sha256("codex-session-filename\0" + filenameIdentity));
   const events = [];
+  let emittedEvents = 0;
+  let reachedTimeBoundary = false;
 
-  for await (const line of readCompleteJsonLines(filePath, startOffset)) {
+  for await (const line of readCompleteJsonLines(filePath, startOffset, stat.size)) {
     committedOffset = line.endOffset;
     if (line.oversized) {
       malformed += 1;
@@ -202,6 +238,11 @@ export async function parseCodexRollout(filePath, options) {
       continue;
     }
     const observedAt = normalizeTimestamp(record.timestamp);
+    if (observedAt && Date.parse(observedAt) >= maximumObservedAtExclusive) {
+      committedOffset = line.startOffset;
+      reachedTimeBoundary = true;
+      break;
+    }
     const occurrenceOrdinal = (timestampCounts.get(
       timestampOccurrenceKey(sessionIdentityHash, observedAt)
     ) || 0) + 1;
@@ -235,6 +276,16 @@ export async function parseCodexRollout(filePath, options) {
       lastSnapshotHash = snapshotHash;
       continue;
     }
+    if (observedAt && Date.parse(observedAt) < minimumObservedAtInclusive) {
+      nextTimestampOrdinal(timestampCounts, sessionIdentityHash, observedAt);
+      usagePrefixDigest = advanceUsagePrefix(usagePrefixDigest, anchorDigest);
+      usagePrefixCount += 1;
+      if (cumulativeReset) cumulativeResets += 1;
+      if (cumulativeMismatch) cumulativeMismatches += 1;
+      lastCumulativeTotal = usageRecord.cumulativeTotal;
+      lastSnapshotHash = snapshotHash;
+      continue;
+    }
     const stableRecordIdentity = [
       sessionIdentityHash,
       observedAt || "invalid_timestamp",
@@ -247,6 +298,8 @@ export async function parseCodexRollout(filePath, options) {
       provider: "codex",
       modelId,
       sourceModelId: context.model,
+      aggregationScope: sessionIdentityHash,
+      aggregationModeToken: sha256("codex-raw-mode\0" + (context.serviceTier || "default")),
       observedAt,
       mode,
       usage: normalizeUsage(usageRecord.last, "codex"),
@@ -263,7 +316,15 @@ export async function parseCodexRollout(filePath, options) {
     if (cumulativeMismatch) cumulativeMismatches += 1;
     lastCumulativeTotal = usageRecord.cumulativeTotal;
     lastSnapshotHash = snapshotHash;
-    events.push(event);
+    if (emitEvent) {
+      emitEvent(event);
+    } else {
+      events.push(event);
+    }
+    emittedEvents += 1;
+    if (emittedEvents >= maximumEvents) {
+      break;
+    }
   }
 
   return {
@@ -272,6 +333,9 @@ export async function parseCodexRollout(filePath, options) {
     duplicateSnapshots,
     cumulativeResets,
     cumulativeMismatches,
+    eventCount: emittedEvents,
+    reachedEventLimit: emittedEvents >= maximumEvents && committedOffset < stat.size,
+    reachedTimeBoundary,
     cursor: {
       fileIdentity,
       offset: committedOffset,
@@ -283,6 +347,8 @@ export async function parseCodexRollout(filePath, options) {
       usagePrefixVersion: 1,
       usagePrefixDigest,
       usagePrefixCount,
+      observedSize: stat.size,
+      observedMtimeMs: stat.mtimeMs,
       lastSeenAt: options.now ?? Date.now()
     }
   };
