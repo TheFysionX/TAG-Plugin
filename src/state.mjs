@@ -5,12 +5,14 @@ import {
   AGGREGATE_CURSOR_VERSION,
   CLAUDE_ACCOUNTING_VERSION,
   CODEX_ACCOUNTING_VERSION,
+  DEFAULT_LOCK_STALE_MS,
   KIMI_ACCOUNTING_VERSION,
   MAX_CODEX_LOGICAL_SESSIONS,
   MAX_MIGRATION_EXCLUSIONS,
   MAX_UNRESOLVED_EVENTS,
   SCHEMA_VERSION
 } from "./constants.mjs";
+import { ConnectorError } from "./errors.mjs";
 
 const UNRESOLVED_EVENT_KEYS = new Set([
   "eventId",
@@ -27,6 +29,204 @@ const UNRESOLVED_EVENT_KEYS = new Set([
 const SOURCE_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,119}$/;
 const TOKEN_COUNT_PATTERN = /^\d{1,30}$/;
 const AGGREGATE_PROVIDERS = ["codex", "claude", "kimi"];
+const ROOT_ATOMIC_JSON_TEMP_PATTERN = /^\.(config\.json|state\.json|device-secrets\.json|pending-device-secrets\.json)\.([1-9]\d*)\.([a-f0-9]{12})\.tmp$/;
+const SYNC_BATCH_DIRECTORY_PATTERN = /^[a-f0-9]{24}$/;
+const SYNC_PAGE_ATOMIC_JSON_TEMP_PATTERN = /^\.(\d{6,})\.json\.([1-9]\d*)\.([a-f0-9]{12})\.tmp$/;
+const MAX_HOME_CLEANUP_ENTRIES = 256;
+const MAX_SYNC_BATCH_CLEANUP_ENTRIES = 256;
+const MAX_SYNC_PAGE_CLEANUP_ENTRIES = 2_048;
+
+async function boundedDirectoryEntries(directory, maximum) {
+  let handle;
+  try {
+    handle = await fs.opendir(directory);
+  } catch (error) {
+    if (error?.code === "ENOENT") return { entries: [], truncated: false };
+    throw error;
+  }
+  const entries = [];
+  let truncated = false;
+  try {
+    for (let index = 0; index < maximum; index += 1) {
+      const entry = await handle.read();
+      if (!entry) return { entries, truncated };
+      entries.push(entry);
+    }
+    truncated = Boolean(await handle.read());
+    return { entries, truncated };
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
+function processIsAlive(pid, processKill) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return true;
+  try {
+    processKill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+async function assertCleanupLockOwner(paths, ownerToken, home) {
+  const canonicalLock = path.join(home, "connector.lock");
+  if (path.resolve(paths.lock) !== canonicalLock || typeof ownerToken !== "string" || ownerToken.length < 16) {
+    throw new ConnectorError(
+      "ATOMIC_TEMP_CLEANUP_UNSAFE",
+      "Stale atomic-file cleanup requires the canonical connector overlap lock."
+    );
+  }
+  let stat;
+  let record;
+  try {
+    stat = await fs.lstat(canonicalLock);
+    record = JSON.parse(await fs.readFile(canonicalLock, "utf8"));
+  } catch (error) {
+    throw new ConnectorError(
+      "ATOMIC_TEMP_CLEANUP_UNSAFE",
+      "The connector overlap-lock ownership proof is unavailable.",
+      { cause: error }
+    );
+  }
+  if (!stat.isFile()
+    || record?.ownerToken !== ownerToken
+    || record?.pid !== process.pid) {
+    throw new ConnectorError(
+      "ATOMIC_TEMP_CLEANUP_UNSAFE",
+      "The connector overlap lock is not owned by this process."
+    );
+  }
+}
+
+function canonicalSyncPageIndex(value) {
+  if (!/^\d+$/.test(value)) return null;
+  const pageIndex = Number(value);
+  if (!Number.isSafeInteger(pageIndex) || pageIndex < 1) return null;
+  return String(pageIndex).padStart(6, "0") === value ? pageIndex : null;
+}
+
+async function removeStaleAtomicCandidate(filePath, canonicalPath, expectedDirectory, pid, options) {
+  if (path.dirname(path.resolve(filePath)) !== expectedDirectory
+    || path.dirname(path.resolve(canonicalPath)) !== expectedDirectory) return false;
+  let canonicalObserved;
+  try {
+    canonicalObserved = await fs.lstat(canonicalPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  // A temp can be the only recoverable copy after a crash. Never reclaim it
+  // unless the corresponding committed runtime JSON still exists as a file.
+  if (!canonicalObserved.isFile()) return false;
+  let observed;
+  try {
+    observed = await fs.lstat(filePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  if (!observed.isFile()
+    || options.now - observed.mtimeMs <= options.staleMs
+    || processIsAlive(pid, options.processKill)) {
+    return false;
+  }
+  let current;
+  let canonicalCurrent;
+  try {
+    [current, canonicalCurrent] = await Promise.all([
+      fs.lstat(filePath),
+      fs.lstat(canonicalPath)
+    ]);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  if (!current.isFile()
+    || current.dev !== observed.dev
+    || current.ino !== observed.ino
+    || current.size !== observed.size
+    || current.mtimeMs !== observed.mtimeMs
+    || !canonicalCurrent.isFile()
+    || canonicalCurrent.dev !== canonicalObserved.dev
+    || canonicalCurrent.ino !== canonicalObserved.ino
+    || canonicalCurrent.size !== canonicalObserved.size
+    || canonicalCurrent.mtimeMs !== canonicalObserved.mtimeMs) {
+    return false;
+  }
+  await fs.unlink(filePath);
+  return true;
+}
+
+export async function cleanupStaleAtomicWriteTemps(paths, options = {}) {
+  const home = path.resolve(paths.home);
+  await assertCleanupLockOwner(paths, options.ownerToken, home);
+  const cleanupOptions = {
+    now: Number.isFinite(options.now) ? options.now : Date.now(),
+    staleMs: Number.isFinite(options.staleMs) && options.staleMs >= DEFAULT_LOCK_STALE_MS
+      ? options.staleMs
+      : DEFAULT_LOCK_STALE_MS,
+    processKill: options.processKill || process.kill
+  };
+  let examined = 0;
+  let removed = 0;
+  let truncated = false;
+
+  const homeListing = await boundedDirectoryEntries(home, MAX_HOME_CLEANUP_ENTRIES);
+  truncated ||= homeListing.truncated;
+  for (const entry of homeListing.entries) {
+    examined += 1;
+    const match = ROOT_ATOMIC_JSON_TEMP_PATTERN.exec(entry.name);
+    if (!match || !entry.isFile()) continue;
+    const pid = Number(match[2]);
+    if (!Number.isSafeInteger(pid)) continue;
+    removed += Number(await removeStaleAtomicCandidate(
+      path.join(home, entry.name),
+      path.join(home, match[1]),
+      home,
+      pid,
+      cleanupOptions
+    ));
+  }
+
+  const syncRoot = path.resolve(home, "sync-pages");
+  if (path.dirname(syncRoot) !== home) {
+    throw new ConnectorError("ATOMIC_TEMP_CLEANUP_UNSAFE", "The sync-page directory escaped connector state.");
+  }
+  const batchListing = await boundedDirectoryEntries(syncRoot, MAX_SYNC_BATCH_CLEANUP_ENTRIES);
+  truncated ||= batchListing.truncated;
+  let remainingPageEntries = MAX_SYNC_PAGE_CLEANUP_ENTRIES;
+  for (const batchEntry of batchListing.entries) {
+    examined += 1;
+    if (remainingPageEntries <= 0) {
+      truncated = true;
+      break;
+    }
+    if (!batchEntry.isDirectory() || !SYNC_BATCH_DIRECTORY_PATTERN.test(batchEntry.name)) continue;
+    const batchDirectory = path.resolve(syncRoot, batchEntry.name);
+    if (path.dirname(batchDirectory) !== syncRoot) continue;
+    const batchStat = await fs.lstat(batchDirectory).catch(() => null);
+    if (!batchStat?.isDirectory()) continue;
+    const pageListing = await boundedDirectoryEntries(batchDirectory, remainingPageEntries);
+    remainingPageEntries -= pageListing.entries.length;
+    truncated ||= pageListing.truncated;
+    for (const entry of pageListing.entries) {
+      examined += 1;
+      const match = SYNC_PAGE_ATOMIC_JSON_TEMP_PATTERN.exec(entry.name);
+      if (!match || !entry.isFile() || canonicalSyncPageIndex(match[1]) === null) continue;
+      const pid = Number(match[2]);
+      if (!Number.isSafeInteger(pid)) continue;
+      removed += Number(await removeStaleAtomicCandidate(
+        path.join(batchDirectory, entry.name),
+        path.join(batchDirectory, `${match[1]}.json`),
+        batchDirectory,
+        pid,
+        cleanupOptions
+      ));
+    }
+  }
+  return { examined, removed, truncated };
+}
 
 function initialAggregateCursors() {
   return {
@@ -304,23 +504,41 @@ export async function ensureRuntimeDirectory(paths) {
   }
 }
 
-export async function atomicWriteJson(filePath, value, mode = 0o600) {
+async function atomicRenameWithBoundedWindowsRetry(temporary, filePath, options) {
+  const maximum = options.platform === "win32" ? 5 : 1;
+  for (let attempt = 1; attempt <= maximum; attempt += 1) {
+    try {
+      await options.rename(temporary, filePath);
+      return;
+    } catch (error) {
+      const retryableWindowsReplacement = options.platform === "win32"
+        && (error?.code === "EEXIST" || error?.code === "EPERM");
+      if (!retryableWindowsReplacement || attempt === maximum) throw error;
+      await options.sleep(10 * attempt);
+    }
+  }
+}
+
+export async function atomicWriteJson(filePath, value, mode = 0o600, options = {}) {
+  const platform = options.platform || process.platform;
+  const rename = options.rename || fs.rename;
+  const sleep = options.sleep || ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
   await fs.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
   const temporary = path.join(path.dirname(filePath), "." + path.basename(filePath) + "." + process.pid + "." + randomBytes(6).toString("hex") + ".tmp");
-  await fs.writeFile(temporary, JSON.stringify(value, null, 2) + "\n", { encoding: "utf8", mode, flag: "wx" });
-  if (process.platform !== "win32") {
-    await fs.chmod(temporary, mode);
-  }
   try {
-    await fs.rename(temporary, filePath);
-  } catch (error) {
-    if (process.platform !== "win32" || (error?.code !== "EEXIST" && error?.code !== "EPERM")) {
-      throw error;
+    await fs.writeFile(temporary, JSON.stringify(value, null, 2) + "\n", { encoding: "utf8", mode, flag: "wx" });
+    if (platform !== "win32") {
+      await fs.chmod(temporary, mode);
     }
-    await fs.rm(filePath, { force: true });
-    await fs.rename(temporary, filePath);
+    // Node's rename is the atomic replacement primitive. Windows contention is
+    // retried without unlinking the destination; exhaustion fails closed and
+    // preserves the last committed file.
+    await atomicRenameWithBoundedWindowsRetry(temporary, filePath, { platform, rename, sleep });
+  } catch (error) {
+    await fs.rm(temporary, { force: true }).catch(() => {});
+    throw error;
   }
-  if (process.platform !== "win32") {
+  if (platform !== "win32") {
     await fs.chmod(filePath, mode);
   }
 }

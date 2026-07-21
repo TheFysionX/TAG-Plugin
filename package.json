@@ -1,6 +1,6 @@
 {
   "name": "@the-artificial-games/tag-plugin",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": true,
   "description": "Privacy-minimal local coding-agent usage plugin for The Artificial Games",
   "author": "The Artificial Games",

@@ -31,6 +31,7 @@ import { applyScheduler, removeScheduler, schedulerPlan } from "./scheduler.mjs"
 import { hardenWindowsConnectorHome, hardenWindowsSecrets } from "./windows-security.mjs";
 import {
   atomicWriteJson,
+  cleanupStaleAtomicWriteTemps,
   ensureRuntimeDirectory,
   loadPendingSecrets,
   loadRuntime,
@@ -1206,8 +1207,9 @@ export async function preview(options = {}) {
 export async function pair(options = {}) {
   const { paths } = runtimeOptions(options);
   await ensureRuntimeDirectory(paths);
-  return withLock(paths.lock, async () => {
+  return withLock(paths.lock, async (lease) => {
     await hardenWindowsConnectorHome(paths.home, options);
+    await cleanupStaleAtomicWriteTemps(paths, { ownerToken: lease.ownerToken });
     const runtime = await loadRuntime(paths);
     if (runtime.state.pendingRequest || runtime.state.syncOutbox) {
       const explicitlyRepairingPermanentFailure = Boolean(
@@ -1481,7 +1483,8 @@ export async function pair(options = {}) {
 export async function sync(options = {}) {
   const { paths, roots } = runtimeOptions(options);
   await ensureRuntimeDirectory(paths);
-  return withLock(paths.lock, async () => {
+  return withLock(paths.lock, async (lease) => {
+    await cleanupStaleAtomicWriteTemps(paths, { ownerToken: lease.ownerToken });
     const runtime = await loadRuntime(paths);
     const secrets = await loadSecrets(paths);
     assertPaired(runtime.state, runtime.config, secrets);
@@ -1724,7 +1727,8 @@ export async function sync(options = {}) {
 export async function heartbeat(options = {}) {
   const { paths } = runtimeOptions(options);
   await ensureRuntimeDirectory(paths);
-  return withLock(paths.lock, async () => {
+  return withLock(paths.lock, async (lease) => {
+    await cleanupStaleAtomicWriteTemps(paths, { ownerToken: lease.ownerToken });
     const runtime = await loadRuntime(paths);
     const secrets = await loadSecrets(paths);
     assertPaired(runtime.state, runtime.config, secrets);
@@ -1865,7 +1869,8 @@ export async function doctor(options = {}) {
 async function setPaused(paused, options = {}) {
   const { paths } = runtimeOptions(options);
   await ensureRuntimeDirectory(paths);
-  return withLock(paths.lock, async () => {
+  return withLock(paths.lock, async (lease) => {
+    await cleanupStaleAtomicWriteTemps(paths, { ownerToken: lease.ownerToken });
     const runtime = await loadRuntime(paths);
     runtime.state.paused = paused;
     await saveRuntime(paths, runtime);
@@ -1990,23 +1995,27 @@ export async function install(options = {}) {
     return previewResult;
   }
   const { paths } = runtimeOptions(options);
-  const runtime = await loadRuntime(paths);
-  const secrets = await loadSecrets(paths);
-  assertPaired(runtime.state, runtime.config, secrets);
-  // No state journal references this file once pairing has committed; remove a crash-left duplicate.
-  await removePendingSecrets(paths);
-  await hardenWindowsSecrets(paths.secrets, options);
-  await copyVerifiedRelease(
-    previewResult.releaseCopy.source,
-    previewResult.releaseCopy.destination
-  );
-  const result = await applyScheduler(previewResult.plan, options);
-  return {
-    executed: true,
-    ...result,
-    installedRelease: previewResult.releaseCopy.destination,
-    plan: previewResult.plan
-  };
+  await ensureRuntimeDirectory(paths);
+  return withLock(paths.lock, async (lease) => {
+    await cleanupStaleAtomicWriteTemps(paths, { ownerToken: lease.ownerToken });
+    const runtime = await loadRuntime(paths);
+    const secrets = await loadSecrets(paths);
+    assertPaired(runtime.state, runtime.config, secrets);
+    // No state journal references this file once pairing has committed; remove a crash-left duplicate.
+    await removePendingSecrets(paths);
+    await hardenWindowsSecrets(paths.secrets, options);
+    await copyVerifiedRelease(
+      previewResult.releaseCopy.source,
+      previewResult.releaseCopy.destination
+    );
+    const result = await applyScheduler(previewResult.plan, options);
+    return {
+      executed: true,
+      ...result,
+      installedRelease: previewResult.releaseCopy.destination,
+      plan: previewResult.plan
+    };
+  });
 }
 
 export async function uninstall(options = {}) {
@@ -2015,22 +2024,26 @@ export async function uninstall(options = {}) {
     return previewResult;
   }
   const { paths } = runtimeOptions(options);
-  const plan = schedulerPlan({
-    platform: options.platform,
-    nodeExecutable: options.nodeExecutable,
-    cliPath: path.join(paths.home, "versions", CONNECTOR_VERSION, "src", "cli.mjs"),
-    home: paths.home,
-    env: options.env
+  await ensureRuntimeDirectory(paths);
+  return withLock(paths.lock, async (lease) => {
+    await cleanupStaleAtomicWriteTemps(paths, { ownerToken: lease.ownerToken });
+    const plan = schedulerPlan({
+      platform: options.platform,
+      nodeExecutable: options.nodeExecutable,
+      cliPath: path.join(paths.home, "versions", CONNECTOR_VERSION, "src", "cli.mjs"),
+      home: paths.home,
+      env: options.env
+    });
+    const result = await removeScheduler(plan, options);
+    const installedRelease = path.join(paths.home, "versions", CONNECTOR_VERSION);
+    assertInstallTarget(paths.home, installedRelease);
+    await fs.rm(installedRelease, { recursive: true, force: true });
+    return {
+      executed: true,
+      ...result,
+      installedReleaseRemoved: true,
+      localStateRemoved: false,
+      localStatePreservedForRecovery: true
+    };
   });
-  const result = await removeScheduler(plan, options);
-  const installedRelease = path.join(paths.home, "versions", CONNECTOR_VERSION);
-  assertInstallTarget(paths.home, installedRelease);
-  await fs.rm(installedRelease, { recursive: true, force: true });
-  return {
-    executed: true,
-    ...result,
-    installedReleaseRemoved: true,
-    localStateRemoved: false,
-    localStatePreservedForRecovery: true
-  };
 }

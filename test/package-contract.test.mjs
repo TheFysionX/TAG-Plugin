@@ -24,7 +24,7 @@ test("package and install manifest remain dependency-free", async () => {
   assert.equal(manifest.product.name, "TAG Plugin");
   assert.equal(manifest.product.publisher, "The Artificial Games");
   assert.equal(manifest.product.repository, "https://github.com/TheFysionX/TAG-Plugin");
-  assert.equal(manifest.releaseArtifact.archiveName, "tag-plugin-0.1.5.tgz");
+  assert.equal(manifest.releaseArtifact.archiveName, "tag-plugin-0.1.6.tgz");
   assert.match(manifest.releaseArtifact.releaseContract, /@the-artificial-games\/tag-plugin/);
   assert.equal(manifest.releaseArtifact.testCommand, "npm test");
   assert.deepEqual(
@@ -39,6 +39,7 @@ test("package and install manifest remain dependency-free", async () => {
   assert.match(manifest.network.rawOnlyCommit, /rawPreserved true.*source cursor/i);
   assert.match(manifest.localState.eventIdentity, /content-independent source identity/i);
   assert.match(manifest.localState.operationLock, /owner token.*lease renewed.*live-PID/i);
+  assert.match(manifest.localState.atomicWriteRecovery, /EEXIST or EPERM.*five times.*without unlinking.*15-minute.*overlap lock.*committed counterpart.*sole recovery copy.*non-recursive.*bounded/i);
   assert.match(manifest.scheduler.postInstall, /immediate allowlisted usage sync and signed heartbeat/i);
   assert.deepEqual(manifest.scheduler.identifiers, {
     windowsTask: "TAG Plugin",

@@ -52,7 +52,7 @@ node src/cli.mjs heartbeat
 - macOS: creates one user LaunchAgent.
 - Linux: creates one `systemd --user` service and timer.
 
-The confirmed install first copies the already verified release into `<connector-home>/versions/<connector-version>` and makes the scheduler target that stable copy. Every scheduler command includes `--home <connector-home>`, including when a custom home was supplied. On Windows, a local non-interactive PowerShell ACL operation disables inheritance, replaces all access rules with one full-control grant for the resolved current user, and verifies the resulting SID/rule before continuing; installation stops before copying or scheduling if that operation fails.
+The confirmed install first acquires the connector overlap lock, reclaims only stale exact runtime-JSON atomic temps that pass the lock/age/dead-PID safety checks, copies the already verified release into `<connector-home>/versions/<connector-version>`, and makes the scheduler target that stable copy. Every scheduler command includes `--home <connector-home>`, including when a custom home was supplied. On Windows, a local non-interactive PowerShell ACL operation disables inheritance, replaces all access rules with one full-control grant for the resolved current user, and verifies the resulting SID/rule before continuing; installation stops before copying or scheduling if that operation fails.
 
 The immediate sync uploads the available allowlisted usage records, and the heartbeat establishes continuity without waiting for the first hourly trigger. No platform path uses an administrator, root, SYSTEM account, highest-run-level flag, or system-wide service directory.
 

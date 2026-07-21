@@ -15,6 +15,7 @@ import {
 import { parseKimiWire } from "../src/adapters/kimi-wire.mjs";
 import { MAX_JOURNAL_LINE_BYTES } from "../src/adapters/shared.mjs";
 import { discoverJsonlFiles } from "../src/discovery.mjs";
+import { acquireLock } from "../src/lock.mjs";
 import {
   chunkSyncPayloads,
   pair,
@@ -2950,7 +2951,7 @@ test("scheduler mutation is preview-only until the exact confirmation flag", asy
   assert.match(commands[0].join(" "), /SetAccessRuleProtection/);
   assert.match(commands[0].join(" "), /Current-user-only ACL verification failed/);
   assert.equal(commands[1][0], "schtasks.exe");
-  assert.match(commands[1].join(" "), /versions[\\/]0\.1\.5[\\/]src[\\/]cli\.mjs/);
+  assert.match(commands[1].join(" "), /versions[\\/]0\.1\.6[\\/]src[\\/]cli\.mjs/);
   assert.match(commands[1].join(" "), /scheduled-run --home/);
   assert.equal(await fs.access(path.join(installed.installedRelease, "package.json")).then(() => true), true);
   assert.equal(await fs.access(path.join(installed.installedRelease, "RELEASING.md")).then(() => true), true);
@@ -2988,8 +2989,42 @@ test("Windows installation fails closed before copying or scheduling when ACL ha
   }), (error) => error.code === "WINDOWS_ACL_HARDENING_FAILED");
   assert.equal(commands.length, 1);
   assert.match(commands[0][0], /powershell\.exe$/i);
-  const installedPath = path.join(fixture.home, "versions", "0.1.5");
+  const installedPath = path.join(fixture.home, "versions", "0.1.6");
   assert.equal(await fs.access(installedPath).then(() => true).catch(() => false), false);
+});
+
+test("confirmed install and uninstall refuse to overlap another connector operation", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const commands = [];
+  const options = {
+    home: fixture.home,
+    platform: "win32",
+    releaseRoot: connectorRoot,
+    confirmInstall: true,
+    confirmUninstall: true,
+    runCommand: async (executable, args) => commands.push([executable, ...args])
+  };
+  await fs.mkdir(fixture.home, { recursive: true });
+  const release = await acquireLock(fixture.paths.lock);
+  try {
+    await assert.rejects(
+      () => install(options),
+      (error) => error?.code === "SYNC_ALREADY_RUNNING"
+    );
+    await assert.rejects(
+      () => uninstall(options),
+      (error) => error?.code === "SYNC_ALREADY_RUNNING"
+    );
+  } finally {
+    await release();
+  }
+
+  assert.deepEqual(commands, []);
+  assert.equal(
+    await fs.access(path.join(fixture.home, "versions", "0.1.6")).then(() => true).catch(() => false),
+    false
+  );
 });
 
 test("status exposes pending chunks and quarantine without revealing payloads", async (context) => {

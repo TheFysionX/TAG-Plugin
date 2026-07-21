@@ -29,6 +29,8 @@ Codex and Kimi byte cursors persist a metadata journal identity, a complete-line
 
 All state-changing commands use one local lock with a random owner token. Its open file handle renews the filesystem lease every quarter of the 15-minute stale window. A stale contender atomically renames and revalidates the observed lease, refuses takeover while the recorded local PID is alive, and creates the replacement with exclusive-create semantics. Release checks both owner token and file identity, so a delayed old owner cannot delete a replacement lock.
 
+Runtime JSON commits use an exclusive-create temp followed by one atomic rename, and ordinary failures remove the exact temp they created. Windows `EEXIST` or `EPERM` retries that same atomic primitive five times with bounded delay; exhaustion never unlinks the prior committed JSON. A hard process crash may bypass temp cleanup. After the same 15-minute safety window, a state-changing command that has proved ownership of the canonical overlap lock may delete only regular files under connector home whose name exactly matches the connector's runtime-JSON atomic format, whose encoded PID is no longer live, and whose unchanged canonical counterpart still exists as a regular file. A temp that is the sole recovery copy is preserved. Enumeration is bounded and limited to connector-home root plus direct files in exact sync-page batch directories; there is no recursive or wildcard deletion. Fresh files, live-writer files, malformed names, unrelated files, directories, and paths outside connector home are preserved.
+
 ## Supply chain
 
 - Install the GitHub release asset whose tag resolves to the expected full pinned commit, never a moving branch.
