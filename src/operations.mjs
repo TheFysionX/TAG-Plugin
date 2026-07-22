@@ -1269,6 +1269,11 @@ async function heartbeatObservationPlan(runtime, secrets, roots, options) {
         rawPlanCode: planObservation.rawPlanCode,
         observedAt
       });
+    } else if (antigravity?.status === "signed_out") {
+      // A current authenticated local response explicitly reporting logout
+      // revokes any prior Antigravity quota-family claim. Ordinary process or
+      // RPC unavailability still leaves the last valid observation untouched.
+      candidates.push({ providerId: "gemini", surface: "antigravity", rawPlanCode: "unknown", observedAt });
     }
     // A missing/starting/stopped local server is deliberately not a logout.
     // The last successful provider-backed plan remains active until a later

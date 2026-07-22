@@ -33,43 +33,65 @@ async function detected(value, options = {}) {
   });
 }
 
-test("Antigravity converts the provider retail plan into a sanitized plan observation", async () => {
-  const result = await detected({ userStatus: { userTier: "USER_TIER_FREE", planStatus: { planInfo: { planName: "Pro", email: "never-return@example.com" } } } });
+test("Antigravity uses the native effective tier and ignores a conflicting legacy Pro label", async () => {
+  const result = await detected({ userStatus: { userTier: { id: "free-tier" }, planStatus: { planInfo: { planName: "Pro", email: "never-return@example.com" } } } });
   assert.deepEqual(result, {
     status: "available",
     verification: "provider_backed_antigravity_language_server",
     planObservation: {
       providerId: "gemini",
       serviceSurface: "antigravity",
-      rawPlanCode: "pro",
-      evidenceType: "antigravity_local_user_status",
+      rawPlanCode: "starter",
+      evidenceType: "antigravity_local_effective_tier",
       observedAt: "2026-07-22T12:00:00.000Z"
     }
   });
 });
 
-test("Antigravity preserves the distinct Ultra capacity variants when the retail plan reports them", async () => {
-  assert.equal((await detected({ userStatus: { planStatus: { planInfo: { planName: "Ultra 5x" } } } })).planObservation.rawPlanCode, "ultra-5x");
-  assert.equal((await detected({ userStatus: { planStatus: { planInfo: { planName: "Ultra 20x" } } } })).planObservation.rawPlanCode, "ultra-20x");
+test("unverified future native tier IDs remain unknown instead of inventing a retail SKU", async () => {
+  assert.equal((await detected({ response: { paidTier: { id: "g1-pro-tier" }, currentTier: { id: "free-tier" } } })).planObservation.rawPlanCode, "unknown");
+  assert.equal((await detected({ response: { paidTier: { id: "g1-ultra-tier" }, currentTier: { id: "free-tier" } } })).planObservation.rawPlanCode, "unknown");
 });
 
-test("the current machine's free/Starter response shape is safe free-tier evidence", async () => {
+test("the current machine's Starter response remains explicitly ambiguous between Free and AI Plus", async () => {
   const result = await detected({ userStatus: { userTier: { id: "free-tier" }, planStatus: { planInfo: { planName: "Starter" } } } });
   assert.equal(result.status, "available");
-  assert.equal(result.planObservation.rawPlanCode, "free");
+  assert.equal(result.planObservation.rawPlanCode, "starter");
 });
 
-test("missing retail plan evidence retains the previously reported plan", async () => {
-  assert.deepEqual(await detected({ userStatus: { userTier: "USER_TIER_FREE" } }), {
+test("missing native tier evidence retains the previously reported plan", async () => {
+  assert.deepEqual(await detected({ userStatus: { planStatus: { planInfo: { planName: "Pro" } } } }), {
     status: "unavailable",
     reason: "provider_plan_unavailable"
   });
 });
 
-test("an authenticated but unrecognized retail plan is explicitly unknown, not guessed from userTier", async () => {
-  const result = await detected({ userStatus: { userTier: "USER_TIER_ULTRA", planStatus: { planInfo: { planName: "Provider Future Tier" } } } });
+test("an authenticated but unrecognized native tier is explicitly unknown", async () => {
+  const result = await detected({ response: { paidTier: { id: "provider-future-tier", name: "Google Future" }, currentTier: { id: "free-tier" } } });
   assert.equal(result.status, "available");
   assert.equal(result.planObservation.rawPlanCode, "unknown");
+});
+
+test("GetUserStatus remains authoritative when GetLoadCodeAssist is unavailable", async () => {
+  const requests = [];
+  const result = await detected({}, {
+    requestImpl: async (request) => {
+      requests.push(request);
+      if (request.url.endsWith("/GetLoadCodeAssist")) return response({}, 404);
+      return response({ userStatus: { userTier: { id: "free-tier" } } });
+    }
+  });
+  assert.equal(result.planObservation.rawPlanCode, "starter");
+  assert.deepEqual(requests.map((request) => request.url.split("/").at(-1)), ["GetUserStatus", "GetLoadCodeAssist"]);
+});
+
+test("conflicting primary and corroborating tiers are ambiguous and do not overwrite prior evidence", async () => {
+  const result = await detected({}, {
+    requestImpl: async (request) => request.url.endsWith("/GetUserStatus")
+      ? response({ userStatus: { userTier: { id: "free-tier" } } })
+      : response({ response: { paidTier: { id: "g1-pro-tier" } } })
+  });
+  assert.deepEqual(result, { status: "unavailable", reason: "ambiguous_provider_tier" });
 });
 
 test("a signed-out local server never falls back to stale process data", async () => {
@@ -81,7 +103,7 @@ test("a signed-out local server never falls back to stale process data", async (
     readTlsFingerprint: async () => FINGERPRINT,
     requestImpl: async () => response({ userStatus: { signedIn: false } })
   });
-  assert.deepEqual(result, { status: "unavailable", reason: "signed_out" });
+  assert.deepEqual(result, { status: "signed_out" });
 });
 
 test("malformed and non-200 local replies are non-sensitive unavailable results", async () => {
@@ -127,10 +149,15 @@ test("only the newest viable process is queried before stale candidates", async 
     platform: "win32", listProcesses: async () => [stale, current],
     detectAntigravityDesktopVersion: async () => ({ status: "supported", version: "2.3.1" }),
     readTlsFingerprint: async () => FINGERPRINT,
-    requestImpl: async (request) => { requests.push(request); return response({ userStatus: { planStatus: { planInfo: { planName: "Free" } } } }); }
+    requestImpl: async (request) => {
+      requests.push(request);
+      return request.url.endsWith("/GetUserStatus")
+        ? response({ userStatus: { userTier: { id: "free-tier" } } })
+        : response({ response: { paidTier: { id: "free-tier" } } });
+    }
   });
-  assert.equal(result.planObservation.rawPlanCode, "free");
-  assert.equal(requests.length, 1);
+  assert.equal(result.planObservation.rawPlanCode, "starter");
+  assert.equal(requests.length, 2);
   assert.match(requests[0].url, /:53775\//u);
   assert.equal(requests[0].certificateFingerprint256, FINGERPRINT);
 });

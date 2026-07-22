@@ -5,32 +5,16 @@ import { detectAntigravityDesktopVersion } from "./antigravity-desktop.mjs";
 
 const MAX_RESPONSE_BYTES = 64 * 1024;
 const DEFAULT_TIMEOUT_MS = 2_000;
+const LOAD_CODE_ASSIST_PATH = "/exa.language_server_pb.LanguageServerService/GetLoadCodeAssist";
 const USER_STATUS_PATH = "/exa.language_server_pb.LanguageServerService/GetUserStatus";
 
-// `userStatus.planStatus.planInfo` is Antigravity's retail-plan authority.
-// userTier is a separate quota-family field and must never reclassify a retail
-// subscription. Keep this list literal and conservative: unknown provider
-// names are recorded as unknown rather than guessed from their wording.
-const RETAIL_PLAN_NAMES = new Map([
-  ["free", "free"],
-  ["ai free", "free"],
-  ["google ai free", "free"],
-  ["starter", "free"],
-  ["plus", "plus"],
-  ["ai plus", "plus"],
-  ["google ai plus", "plus"],
-  ["pro", "pro"],
-  ["ai pro", "pro"],
-  ["google ai pro", "pro"],
-  ["ultra", "ultra"],
-  ["ai ultra", "ultra"],
-  ["google ai ultra", "ultra"],
-  ["ultra 5x", "ultra-5x"],
-  ["ai ultra 5x", "ultra-5x"],
-  ["google ai ultra 5x", "ultra-5x"],
-  ["ultra 20x", "ultra-20x"],
-  ["ai ultra 20x", "ultra-20x"],
-  ["google ai ultra 20x", "ultra-20x"]
+// Antigravity's native account response keeps the effective tier separate from
+// legacy Codeium capability fields such as planStatus.planInfo.planName. The
+// only live-verified native family in this adapter is its minimum Starter quota;
+// Google deliberately shares it between Free and AI Plus. Future native IDs are
+// unverified until a real provider response is added as a fixture.
+const NATIVE_TIER_IDS = new Map([
+  ["free_tier", "starter"]
 ]);
 
 function normalizedCode(value) {
@@ -39,23 +23,54 @@ function normalizedCode(value) {
   return /^[a-z0-9_]+$/u.test(normalized) ? normalized : null;
 }
 
-function planFromStatus(value) {
+function tierId(value) {
+  if (typeof value === "string") return normalizedCode(value);
+  return normalizedCode(value?.id);
+}
+
+function responseEnvelope(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value.response && typeof value.response === "object" && !Array.isArray(value.response)
+    ? value.response
+    : value;
+}
+
+function userStatusFrom(value) {
+  const envelope = responseEnvelope(value);
+  if (!envelope) return null;
   const userStatus = value.userStatus && typeof value.userStatus === "object" && !Array.isArray(value.userStatus)
     ? value.userStatus
-    : value;
+    : envelope.userStatus && typeof envelope.userStatus === "object" && !Array.isArray(envelope.userStatus)
+      ? envelope.userStatus
+      : envelope;
+  return userStatus;
+}
+
+function signedOut(value) {
+  const userStatus = userStatusFrom(value);
+  if (!userStatus) return false;
   if (userStatus.signedIn === false || userStatus.authenticated === false
     || normalizedCode(userStatus.authState) === "signed_out") {
-    return { kind: "signed_out" };
+    return true;
   }
-  const planInfo = userStatus.planStatus?.planInfo;
-  const planName = typeof planInfo?.planName === "string" && planInfo.planName.length <= 120
-    ? planInfo.planName.trim().toLowerCase().replace(/\s+/gu, " ")
-    : null;
-  // An absent planInfo can happen during local-server startup and must retain
-  // the previously reported plan rather than overwrite it with a guess.
-  if (!planName) return { kind: "unavailable" };
-  return { kind: "available", rawPlanCode: RETAIL_PLAN_NAMES.get(planName) || "unknown" };
+  return false;
+}
+
+function planFromResponses(userStatusResponse, loadCodeAssistResponse) {
+  if (signedOut(userStatusResponse) || signedOut(loadCodeAssistResponse)) return { kind: "signed_out" };
+  const userStatus = userStatusFrom(userStatusResponse);
+  const loadResponse = responseEnvelope(loadCodeAssistResponse);
+  // userTier is the primary live effective-quota authority. paidTier is useful
+  // only as corroboration; currentTier, allowedTiers, planInfo, teamsTier, and
+  // the legacy `pro` boolean are not retail subscription evidence.
+  const primaryTier = tierId(userStatus?.userTier);
+  const corroboratingTier = tierId(loadResponse?.paidTier);
+  if (primaryTier && corroboratingTier && primaryTier !== corroboratingTier) {
+    return { kind: "ambiguous" };
+  }
+  const providerTier = primaryTier || corroboratingTier;
+  if (!providerTier) return { kind: "unavailable" };
+  return { kind: "available", rawPlanCode: NATIVE_TIER_IDS.get(providerTier) || "unknown" };
 }
 
 function positivePort(value) {
@@ -144,7 +159,7 @@ function defaultTlsFingerprint({ port, timeoutMs }) {
   });
 }
 
-function defaultRequest({ url, headers, timeoutMs, maxResponseBytes, certificateFingerprint256 }) {
+function defaultRequest({ url, headers, body = "{}", timeoutMs, maxResponseBytes, certificateFingerprint256 }) {
   return new Promise((resolve, reject) => {
     const agent = new https.Agent({ keepAlive: false, maxSockets: 1 });
     agent.createConnection = (connectionOptions, callback) => {
@@ -192,7 +207,7 @@ function defaultRequest({ url, headers, timeoutMs, maxResponseBytes, certificate
     request.once("timeout", () => request.destroy(Object.assign(new Error("timeout"), { code: "ETIMEDOUT" })));
     request.once("error", reject);
     request.once("close", () => agent.destroy());
-    request.end("{}");
+    request.end(body);
   });
 }
 
@@ -245,46 +260,67 @@ export async function readAntigravityPlanStatus(options = {}) {
   let lastReason = "local_status_unavailable";
   for (const candidate of candidates) {
     for (const port of candidate.ports) {
+      let certificateFingerprint256;
       try {
-        const certificateFingerprint256 = await readTlsFingerprint({ port, timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS });
+        certificateFingerprint256 = await readTlsFingerprint({ port, timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS });
         if (typeof certificateFingerprint256 !== "string" || !/^[A-F0-9:]{95}$/iu.test(certificateFingerprint256)) {
           lastReason = "local_status_unavailable";
           continue;
         }
-        const response = await requestImpl({
-          url: `https://127.0.0.1:${port}${USER_STATUS_PATH}`,
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            accept: "application/json",
-            "x-codeium-csrf-token": candidate.csrfToken
-          },
-          body: "{}",
-          timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS,
-          maxResponseBytes: MAX_RESPONSE_BYTES,
-          certificateFingerprint256: certificateFingerprint256.toUpperCase()
-        });
-        const status = planFromStatus(parsedResponse(response));
-        if (!status) { lastReason = "invalid_response"; continue; }
-        if (status.kind === "signed_out") return { status: "unavailable", reason: "signed_out" };
-        if (status.kind === "unavailable") return { status: "unavailable", reason: "provider_plan_unavailable" };
-        return {
-          status: "available",
-          verification: "provider_backed_antigravity_language_server",
-          planObservation: {
-            providerId: "gemini",
-            serviceSurface: "antigravity",
-            rawPlanCode: status.rawPlanCode,
-            evidenceType: "antigravity_local_user_status",
-            observedAt: new Date(options.now ?? Date.now()).toISOString()
-          }
-        };
       } catch (error) {
         lastReason = error?.code === "ETIMEDOUT" || error?.message === "timeout" ? "timeout" : "local_status_unavailable";
+        continue;
       }
+      const replies = {};
+      for (const endpoint of [
+        { key: "userStatus", path: USER_STATUS_PATH, body: "{}" },
+        { key: "loadCodeAssist", path: LOAD_CODE_ASSIST_PATH, body: "{\"forceRefresh\":false}" }
+      ]) {
+        try {
+          const response = await requestImpl({
+            url: `https://127.0.0.1:${port}${endpoint.path}`,
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              accept: "application/json",
+              "x-codeium-csrf-token": candidate.csrfToken
+            },
+            body: endpoint.body,
+            timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS,
+            maxResponseBytes: MAX_RESPONSE_BYTES,
+            certificateFingerprint256: certificateFingerprint256.toUpperCase()
+          });
+          const parsed = parsedResponse(response);
+          if (!parsed) lastReason = "invalid_response";
+          else replies[endpoint.key] = parsed;
+        } catch (error) {
+          lastReason = error?.code === "ETIMEDOUT" || error?.message === "timeout" ? "timeout" : "local_status_unavailable";
+        }
+      }
+      const status = planFromResponses(replies.userStatus, replies.loadCodeAssist);
+      if (status.kind === "signed_out") return { status: "signed_out" };
+      if (status.kind === "ambiguous") return { status: "unavailable", reason: "ambiguous_provider_tier" };
+      if (status.kind === "unavailable") {
+        if (replies.userStatus || replies.loadCodeAssist) lastReason = "provider_plan_unavailable";
+        continue;
+      }
+      return {
+        status: "available",
+        verification: "provider_backed_antigravity_language_server",
+        planObservation: {
+          providerId: "gemini",
+          serviceSurface: "antigravity",
+          rawPlanCode: status.rawPlanCode,
+          evidenceType: "antigravity_local_effective_tier",
+          observedAt: new Date(options.now ?? Date.now()).toISOString()
+        }
+      };
     }
   }
   return { status: "unavailable", reason: lastReason };
 }
 
-export { USER_STATUS_PATH as ANTIGRAVITY_USER_STATUS_PATH };
+export {
+  LOAD_CODE_ASSIST_PATH as ANTIGRAVITY_LOAD_CODE_ASSIST_PATH,
+  USER_STATUS_PATH as ANTIGRAVITY_USER_STATUS_PATH
+};

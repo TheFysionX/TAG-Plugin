@@ -298,7 +298,7 @@ test("a Claude organization switch revokes the prior account plan without upload
   assert.match(runtime.state.heartbeatObservationSnapshots.plans["claude:claude_code"].accountAlias, /^[a-f0-9]{64}$/);
 });
 
-test("Antigravity retail plan evidence is sent once and retained across transient local failures", async (context) => {
+test("Antigravity native tier evidence is sent once and retained across transient local failures", async (context) => {
   const value = await fixture();
   context.after(() => fs.rm(value.temporary, { recursive: true, force: true }));
   await pairedRuntime(value, ["gemini"]);
@@ -314,7 +314,7 @@ test("Antigravity retail plan evidence is sent once and retained across transien
       planObservation: {
         providerId: "gemini",
         serviceSurface: "antigravity",
-        rawPlanCode: "pro",
+        rawPlanCode: "starter",
         observedAt: "2026-07-22T10:29:59.000Z"
       }
     }),
@@ -329,7 +329,7 @@ test("Antigravity retail plan evidence is sent once and retained across transien
   assert.deepEqual(body.providerObservations, [{
     providerId: "gemini",
     surface: "antigravity",
-    rawPlanCode: "pro",
+    rawPlanCode: "starter",
     observedAt: "2026-07-22T10:30:00.000Z"
   }]);
 
@@ -343,10 +343,10 @@ test("Antigravity retail plan evidence is sent once and retained across transien
   });
   assert.equal(body.providerObservations, undefined);
   const runtime = await loadRuntime(value.paths);
-  assert.deepEqual(runtime.state.heartbeatObservationSnapshots.plans["gemini:antigravity"], { rawPlanCode: "pro" });
+  assert.deepEqual(runtime.state.heartbeatObservationSnapshots.plans["gemini:antigravity"], { rawPlanCode: "starter" });
 });
 
-test("an authenticated unknown Antigravity retail plan closes the prior exact claim", async (context) => {
+test("an authenticated unknown Antigravity native tier closes the prior exact claim", async (context) => {
   const value = await fixture();
   context.after(() => fs.rm(value.temporary, { recursive: true, force: true }));
   await pairedRuntime(value, ["gemini"]);
@@ -379,6 +379,36 @@ test("an authenticated unknown Antigravity retail plan closes the prior exact cl
   }]);
   const updated = await loadRuntime(value.paths);
   assert.deepEqual(updated.state.heartbeatObservationSnapshots.plans["gemini:antigravity"], { rawPlanCode: "unknown" });
+});
+
+test("an explicit Antigravity logout closes the prior native tier claim", async (context) => {
+  const value = await fixture();
+  context.after(() => fs.rm(value.temporary, { recursive: true, force: true }));
+  await pairedRuntime(value, ["gemini"]);
+  const runtime = await loadRuntime(value.paths);
+  runtime.state.heartbeatObservationSnapshots.plans["gemini:antigravity"] = { rawPlanCode: "starter" };
+  await saveRuntime(value.paths, runtime);
+  let body;
+  await heartbeat({
+    home: value.home,
+    roots: value.roots,
+    now: Date.parse("2026-07-22T12:45:00.000Z"),
+    observationCollection: { providerEvidence: {}, providerObservations: [], resetObservations: [] },
+    readAntigravityPlanStatus: async () => ({ status: "signed_out" }),
+    fetchImpl: async (_url, init) => {
+      body = JSON.parse(init.body);
+      return response({}, {
+        plans: body.providerObservations.map(({ providerId, surface, observedAt }) => ({ providerId, surface, observedAt })),
+        resets: []
+      });
+    }
+  });
+  assert.deepEqual(body.providerObservations, [{
+    providerId: "gemini",
+    surface: "antigravity",
+    rawPlanCode: "unknown",
+    observedAt: "2026-07-22T12:45:00.000Z"
+  }]);
 });
 
 test("Antigravity plan detection is never probed without Gemini consent", async (context) => {
