@@ -10,12 +10,20 @@ function classify(value, allowed) {
   return allowed.has(normalized) ? normalized : null;
 }
 
+function classifyApiProvider(value) {
+  // Claude Code's first-party signed-in status is camel-cased. Keep this
+  // exact allowlist entry separate so lookalike/custom provider values remain
+  // unclassified.
+  if (value === "firstParty") return "first_party";
+  return classify(value, API_PROVIDERS);
+}
+
 export function sanitizeClaudeAccountStatus(value) {
   if (!value || typeof value !== "object" || typeof value.loggedIn !== "boolean") return null;
   return {
     loggedIn: value.loggedIn,
     authMethod: classify(value.authMethod, AUTH_METHODS),
-    apiProvider: classify(value.apiProvider, API_PROVIDERS),
+    apiProvider: classifyApiProvider(value.apiProvider),
     subscriptionType: classify(value.subscriptionType, SUBSCRIPTION_TYPES)
   };
 }

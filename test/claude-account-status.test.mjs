@@ -31,6 +31,35 @@ test("Claude auth status retains only classified plan status", async () => {
   });
 });
 
+test("Claude auth status accepts only the official firstParty signed-in provider value", async () => {
+  const result = await readClaudeAccountStatus({
+    execFileImpl: (_executable, _arguments, _options, callback) => callback(null, JSON.stringify({
+      loggedIn: true,
+      authMethod: "claude.ai",
+      apiProvider: "firstParty",
+      subscriptionType: "pro"
+    }), "")
+  });
+  assert.deepEqual(result, {
+    status: "available",
+    verification: "provider_backed_claude_auth_status",
+    loggedIn: true,
+    authMethod: "claude_ai",
+    apiProvider: "first_party",
+    subscriptionType: "pro"
+  });
+
+  const lookalike = await readClaudeAccountStatus({
+    execFileImpl: (_executable, _arguments, _options, callback) => callback(null, JSON.stringify({
+      loggedIn: true,
+      authMethod: "claude.ai",
+      apiProvider: "first-party",
+      subscriptionType: "pro"
+    }), "")
+  });
+  assert.equal(lookalike.apiProvider, null);
+});
+
 test("Claude auth status rejects unclassified fields and command failures safely", async () => {
   const sanitized = await readClaudeAccountStatus({
     execFileImpl: (_executable, _arguments, _options, callback) => callback(null, JSON.stringify({

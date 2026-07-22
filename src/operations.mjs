@@ -1187,10 +1187,12 @@ async function heartbeatObservationPlan(runtime, secrets, roots, options) {
   if (observationProviderEnabled(runtime, "claude")) {
     const readStatus = options.readClaudeAccountStatus || readClaudeAccountStatus;
     const claude = await readStatus(options.claudeAccountStatusOptions);
-    // API-key/BYOK and non-Anthropic routes are intentionally incapable of
-    // producing a subscription claim.
+    // API-key/BYOK and non-first-party routes are intentionally incapable of
+    // producing a subscription claim. Claude Code currently reports its
+    // signed-in service as `firstParty`; older releases used `anthropic`.
     if (claude?.status === "available" && claude.loggedIn === true
-      && claude.authMethod === "claude_ai" && claude.apiProvider === "anthropic"
+      && claude.authMethod === "claude_ai"
+      && (claude.apiProvider === "first_party" || claude.apiProvider === "anthropic")
       && claude.subscriptionType) {
       candidates.push({ providerId: "claude", surface: "claude_code", rawPlanCode: claude.subscriptionType, observedAt });
     }

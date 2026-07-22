@@ -143,6 +143,35 @@ test("Codex app-server adapter retains every current native PlanType", async () 
   }
 });
 
+test("Codex app-server preserves its explicit pro plan family without inferring a 5x or 20x variant", async () => {
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.stdin = new PassThrough();
+    child.stdout = new PassThrough();
+    child.kill = () => {};
+    let pending = "";
+    child.stdin.on("data", (chunk) => {
+      pending += chunk.toString("utf8");
+      let newline;
+      while ((newline = pending.indexOf("\n")) !== -1) {
+        const request = JSON.parse(pending.slice(0, newline));
+        pending = pending.slice(newline + 1);
+        if (request.id === 0) queueMicrotask(() => child.stdout.write('{"id":0,"result":{}}\n'));
+        if (request.id === 1) queueMicrotask(() => child.stdout.write('{"id":1,"result":{"summary":{"lifetimeTokens":1}}}\n'));
+        if (request.id === 2) queueMicrotask(() => child.stdout.write(JSON.stringify({
+          id: 2,
+          result: { account: { type: "chatgpt", planType: "pro" } }
+        }) + "\n"));
+        if (request.id === 3) queueMicrotask(() => child.stdout.write('{"id":3,"error":{"message":"unsupported"}}\n'));
+      }
+    });
+    return child;
+  };
+
+  const result = await readCodexAccountUsage({ spawnImpl, timeoutMs: 500 });
+  assert.deepEqual(result.account, { authSurface: "chatgpt", planType: "pro" });
+});
+
 test("Codex usage remains available when newer account methods are rejected", async () => {
   const spawnImpl = () => {
     const child = new EventEmitter();

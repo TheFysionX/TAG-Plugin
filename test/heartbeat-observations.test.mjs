@@ -60,13 +60,20 @@ test("Claude subscription observations require first-party claude.ai auth", asyn
 
   await heartbeat({
     home: value.home, roots: value.roots,
-    readClaudeAccountStatus: async () => ({ status: "available", loggedIn: true, authMethod: "claude_ai", apiProvider: "anthropic", subscriptionType: "max" }),
+    readClaudeAccountStatus: async () => ({ status: "available", loggedIn: true, authMethod: "claude_ai", apiProvider: "first_party", subscriptionType: "max" }),
     fetchImpl: async (_url, init) => {
       sent = JSON.parse(init.body);
       return response({}, { plans: sent.providerObservations.map(({ providerId, surface, observedAt }) => ({ providerId, surface, observedAt })), resets: [] });
     }
   });
   assert.deepEqual(sent.providerObservations, [{ providerId: "claude", surface: "claude_code", rawPlanCode: "max", observedAt: sent.providerObservations[0].observedAt }]);
+
+  await heartbeat({
+    home: value.home, roots: value.roots,
+    readClaudeAccountStatus: async () => ({ status: "available", loggedIn: true, authMethod: "claude_ai", apiProvider: "first-party", subscriptionType: "max" }),
+    fetchImpl: async (_url, init) => { sent = JSON.parse(init.body); return response({}); }
+  });
+  assert.equal(sent.providerObservations, undefined, "lookalike provider labels cannot produce a subscription claim");
 });
 
 test("a hosted DeepSeek model never fabricates a DeepSeek API plan", async (context) => {
