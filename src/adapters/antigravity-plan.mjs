@@ -7,14 +7,15 @@ const MAX_RESPONSE_BYTES = 64 * 1024;
 const DEFAULT_TIMEOUT_MS = 2_000;
 const LOAD_CODE_ASSIST_PATH = "/exa.language_server_pb.LanguageServerService/GetLoadCodeAssist";
 const USER_STATUS_PATH = "/exa.language_server_pb.LanguageServerService/GetUserStatus";
+const MAX_PROVIDER_TIER_TEXT_LENGTH = 64;
 
 // Antigravity's native account response keeps the effective tier separate from
 // legacy Codeium capability fields such as planStatus.planInfo.planName. The
-// only live-verified native family in this adapter is its minimum Starter quota;
-// Google deliberately shares it between Free and AI Plus. Future native IDs are
-// unverified until a real provider response is added as a fixture.
+// only live-verified native family in this adapter is its minimum Starter quota,
+// which is Antigravity's Free classification. Future native IDs retain a
+// bounded diagnostic suffix until their server mapping is registered.
 const NATIVE_TIER_IDS = new Map([
-  ["free_tier", "starter"]
+  ["free_tier", "free"]
 ]);
 
 function normalizedCode(value) {
@@ -23,9 +24,27 @@ function normalizedCode(value) {
   return /^[a-z0-9_]+$/u.test(normalized) ? normalized : null;
 }
 
-function tierId(value) {
-  if (typeof value === "string") return normalizedCode(value);
-  return normalizedCode(value?.id);
+function normalizedProviderTierText(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.normalize("NFKC")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, "_")
+    .replace(/^_+|_+$/gu, "")
+    .slice(0, MAX_PROVIDER_TIER_TEXT_LENGTH)
+    .replace(/_+$/gu, "");
+  return normalized && /^[a-z0-9_]+$/u.test(normalized) ? normalized : null;
+}
+
+function nativeTier(value) {
+  if (typeof value === "string") return normalizedProviderTierText(value);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  // The ID is the provider's stable diagnostic value. Only use a display name
+  // when the native response does not provide a usable ID; do not inspect or
+  // forward account, capability, or legacy-plan fields.
+  return normalizedProviderTierText(value.id)
+    || normalizedProviderTierText(value.displayName)
+    || normalizedProviderTierText(value.name);
 }
 
 function responseEnvelope(value) {
@@ -63,14 +82,14 @@ function planFromResponses(userStatusResponse, loadCodeAssistResponse) {
   // userTier is the primary live effective-quota authority. paidTier is useful
   // only as corroboration; currentTier, allowedTiers, planInfo, teamsTier, and
   // the legacy `pro` boolean are not retail subscription evidence.
-  const primaryTier = tierId(userStatus?.userTier);
-  const corroboratingTier = tierId(loadResponse?.paidTier);
+  const primaryTier = nativeTier(userStatus?.userTier);
+  const corroboratingTier = nativeTier(loadResponse?.paidTier);
   if (primaryTier && corroboratingTier && primaryTier !== corroboratingTier) {
     return { kind: "ambiguous" };
   }
   const providerTier = primaryTier || corroboratingTier;
   if (!providerTier) return { kind: "unavailable" };
-  return { kind: "available", rawPlanCode: NATIVE_TIER_IDS.get(providerTier) || "unknown" };
+  return { kind: "available", rawPlanCode: NATIVE_TIER_IDS.get(providerTier) || `unknown:${providerTier}` };
 }
 
 function positivePort(value) {

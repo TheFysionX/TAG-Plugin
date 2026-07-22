@@ -314,7 +314,7 @@ test("Antigravity native tier evidence is sent once and retained across transien
       planObservation: {
         providerId: "gemini",
         serviceSurface: "antigravity",
-        rawPlanCode: "starter",
+        rawPlanCode: "free",
         observedAt: "2026-07-22T10:29:59.000Z"
       }
     }),
@@ -329,7 +329,7 @@ test("Antigravity native tier evidence is sent once and retained across transien
   assert.deepEqual(body.providerObservations, [{
     providerId: "gemini",
     surface: "antigravity",
-    rawPlanCode: "starter",
+    rawPlanCode: "free",
     observedAt: "2026-07-22T10:30:00.000Z"
   }]);
 
@@ -343,7 +343,7 @@ test("Antigravity native tier evidence is sent once and retained across transien
   });
   assert.equal(body.providerObservations, undefined);
   const runtime = await loadRuntime(value.paths);
-  assert.deepEqual(runtime.state.heartbeatObservationSnapshots.plans["gemini:antigravity"], { rawPlanCode: "starter" });
+  assert.deepEqual(runtime.state.heartbeatObservationSnapshots.plans["gemini:antigravity"], { rawPlanCode: "free" });
 });
 
 test("an authenticated unknown Antigravity native tier closes the prior exact claim", async (context) => {
@@ -361,7 +361,7 @@ test("an authenticated unknown Antigravity native tier closes the prior exact cl
     observationCollection: { providerEvidence: {}, providerObservations: [], resetObservations: [] },
     readAntigravityPlanStatus: async () => ({
       status: "available",
-      planObservation: { providerId: "gemini", serviceSurface: "antigravity", rawPlanCode: "unknown" }
+      planObservation: { providerId: "gemini", serviceSurface: "antigravity", rawPlanCode: "unknown:g1_pro_tier" }
     }),
     fetchImpl: async (_url, init) => {
       body = JSON.parse(init.body);
@@ -374,11 +374,11 @@ test("an authenticated unknown Antigravity native tier closes the prior exact cl
   assert.deepEqual(body.providerObservations, [{
     providerId: "gemini",
     surface: "antigravity",
-    rawPlanCode: "unknown",
+    rawPlanCode: "unknown:g1_pro_tier",
     observedAt: "2026-07-22T12:30:00.000Z"
   }]);
   const updated = await loadRuntime(value.paths);
-  assert.deepEqual(updated.state.heartbeatObservationSnapshots.plans["gemini:antigravity"], { rawPlanCode: "unknown" });
+  assert.deepEqual(updated.state.heartbeatObservationSnapshots.plans["gemini:antigravity"], { rawPlanCode: "unknown:g1_pro_tier" });
 });
 
 test("an explicit Antigravity logout closes the prior native tier claim", async (context) => {

@@ -12,7 +12,9 @@ import {
   MAX_CODEX_LOGICAL_SESSIONS,
   MAX_CURSOR_FILES,
   MAX_MIGRATION_EXCLUSIONS,
+  MAX_RAW_PLAN_CODE_LENGTH,
   MAX_UNRESOLVED_EVENTS,
+  RAW_PLAN_CODE_PATTERN,
   SCHEMA_VERSION
 } from "./constants.mjs";
 import { ConnectorError } from "./errors.mjs";
@@ -539,7 +541,8 @@ export async function loadRuntime(paths) {
       ? Object.fromEntries(Object.entries(snapshots.plans)
           .filter(([key, value]) => /^[a-z]+:[a-z_]+$/.test(key)
             && typeof value?.rawPlanCode === "string"
-            && /^[a-z0-9]+(?:[_-][a-z0-9]+)*$/.test(value.rawPlanCode))
+            && value.rawPlanCode.length <= MAX_RAW_PLAN_CODE_LENGTH
+            && RAW_PLAN_CODE_PATTERN.test(value.rawPlanCode))
           .map(([key, value]) => [key, {
             rawPlanCode: value.rawPlanCode,
             ...(typeof value.accountAlias === "string" && /^[a-f0-9]{64}$/.test(value.accountAlias)

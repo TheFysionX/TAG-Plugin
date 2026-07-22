@@ -15,8 +15,10 @@ import {
   MAX_INGEST_CHECKPOINTS,
   MAX_INGEST_EVENTS,
   MAX_MIGRATION_EXCLUSIONS,
+  MAX_RAW_PLAN_CODE_LENGTH,
   MAX_SYNC_OUTBOX_EVENTS,
   MAX_UNRESOLVED_EVENTS,
+  RAW_PLAN_CODE_PATTERN,
   SCHEDULED_MAX_INGEST_REQUESTS
 } from "./constants.mjs";
 import { adapterStatus } from "./adapters/registry.mjs";
@@ -1114,7 +1116,8 @@ function normalizePlanObservation(value) {
   const rawPlanCode = typeof value?.rawPlanCode === "string" ? value.rawPlanCode.trim().toLowerCase() : null;
   const observedAt = normalizedObservationTime(value?.observedAt);
   if (!isObservationSurface(providerId, surface)
-    || !rawPlanCode || !/^[a-z0-9]+(?:[_-][a-z0-9]+)*$/u.test(rawPlanCode)
+    || !rawPlanCode || rawPlanCode.length > MAX_RAW_PLAN_CODE_LENGTH
+    || !RAW_PLAN_CODE_PATTERN.test(rawPlanCode)
     || !observedAt) return null;
   return { providerId, surface, rawPlanCode, observedAt };
 }

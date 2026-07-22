@@ -41,22 +41,23 @@ test("Antigravity uses the native effective tier and ignores a conflicting legac
     planObservation: {
       providerId: "gemini",
       serviceSurface: "antigravity",
-      rawPlanCode: "starter",
+      rawPlanCode: "free",
       evidenceType: "antigravity_local_effective_tier",
       observedAt: "2026-07-22T12:00:00.000Z"
     }
   });
 });
 
-test("unverified future native tier IDs remain unknown instead of inventing a retail SKU", async () => {
-  assert.equal((await detected({ response: { paidTier: { id: "g1-pro-tier" }, currentTier: { id: "free-tier" } } })).planObservation.rawPlanCode, "unknown");
-  assert.equal((await detected({ response: { paidTier: { id: "g1-ultra-tier" }, currentTier: { id: "free-tier" } } })).planObservation.rawPlanCode, "unknown");
+test("unverified native paid tier IDs retain a bounded diagnostic code instead of inventing a retail SKU", async () => {
+  assert.equal((await detected({ response: { paidTier: { id: "g1-pro-tier" }, currentTier: { id: "free-tier" } } })).planObservation.rawPlanCode, "unknown:g1_pro_tier");
+  assert.equal((await detected({ response: { paidTier: { id: "g1-ultra-5x-tier" }, currentTier: { id: "free-tier" } } })).planObservation.rawPlanCode, "unknown:g1_ultra_5x_tier");
+  assert.equal((await detected({ response: { paidTier: { id: "g1-ultra-20x-tier" }, currentTier: { id: "free-tier" } } })).planObservation.rawPlanCode, "unknown:g1_ultra_20x_tier");
 });
 
-test("the current machine's Starter response remains explicitly ambiguous between Free and AI Plus", async () => {
+test("the current machine's Starter response maps to Antigravity Free", async () => {
   const result = await detected({ userStatus: { userTier: { id: "free-tier" }, planStatus: { planInfo: { planName: "Starter" } } } });
   assert.equal(result.status, "available");
-  assert.equal(result.planObservation.rawPlanCode, "starter");
+  assert.equal(result.planObservation.rawPlanCode, "free");
 });
 
 test("missing native tier evidence retains the previously reported plan", async () => {
@@ -66,10 +67,24 @@ test("missing native tier evidence retains the previously reported plan", async 
   });
 });
 
-test("an authenticated but unrecognized native tier is explicitly unknown", async () => {
+test("an authenticated tier falls back to a normalized native display name only when its ID is absent", async () => {
+  const result = await detected({ response: { paidTier: { name: "Google AI Ultra (20x)" }, currentTier: { id: "free-tier" } } });
+  assert.equal(result.status, "available");
+  assert.equal(result.planObservation.rawPlanCode, "unknown:google_ai_ultra_20x");
+});
+
+test("unknown native tier diagnostics are normalized and bounded", async () => {
+  const result = await detected({ response: { paidTier: { id: `Provider Future Tier!!! ${"x".repeat(100)}`, name: "must-not-win" }, currentTier: { id: "free-tier" } } });
+  const code = result.planObservation.rawPlanCode;
+  assert.match(code, /^unknown:provider_future_tier_x+$/u);
+  assert.equal(code.length, "unknown:".length + 64);
+  assert.doesNotMatch(code, /must-not-win/u);
+});
+
+test("an authenticated but unrecognized native tier preserves its ID rather than another field", async () => {
   const result = await detected({ response: { paidTier: { id: "provider-future-tier", name: "Google Future" }, currentTier: { id: "free-tier" } } });
   assert.equal(result.status, "available");
-  assert.equal(result.planObservation.rawPlanCode, "unknown");
+  assert.equal(result.planObservation.rawPlanCode, "unknown:provider_future_tier");
 });
 
 test("GetUserStatus remains authoritative when GetLoadCodeAssist is unavailable", async () => {
@@ -81,7 +96,7 @@ test("GetUserStatus remains authoritative when GetLoadCodeAssist is unavailable"
       return response({ userStatus: { userTier: { id: "free-tier" } } });
     }
   });
-  assert.equal(result.planObservation.rawPlanCode, "starter");
+  assert.equal(result.planObservation.rawPlanCode, "free");
   assert.deepEqual(requests.map((request) => request.url.split("/").at(-1)), ["GetUserStatus", "GetLoadCodeAssist"]);
 });
 
@@ -156,7 +171,7 @@ test("only the newest viable process is queried before stale candidates", async 
         : response({ response: { paidTier: { id: "free-tier" } } });
     }
   });
-  assert.equal(result.planObservation.rawPlanCode, "starter");
+  assert.equal(result.planObservation.rawPlanCode, "free");
   assert.equal(requests.length, 2);
   assert.match(requests[0].url, /:53775\//u);
   assert.equal(requests[0].certificateFingerprint256, FINGERPRINT);

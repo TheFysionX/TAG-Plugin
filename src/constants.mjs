@@ -1,4 +1,4 @@
-export const CONNECTOR_VERSION = "0.1.17";
+export const CONNECTOR_VERSION = "0.1.18";
 export const SCHEMA_VERSION = 1;
 export const CODEX_ACCOUNTING_VERSION = 5;
 export const CLAUDE_ACCOUNTING_VERSION = 5;
@@ -29,6 +29,13 @@ export const INGEST_CHUNK_PACE_MS = 550;
 export const SCHEDULED_MAX_INGEST_REQUESTS = 1_000;
 export const HEARTBEAT_EVERY_INGEST_REQUESTS = 50;
 export const DEFAULT_LOCK_STALE_MS = 15 * 60 * 1_000;
+// Known plan codes remain compact provider slugs. An authenticated provider
+// value that is not mapped yet is retained as `unknown:<normalized-value>` so
+// the server can add the mapping without collecting any surrounding account
+// response. The diagnostic suffix is bounded by the adapter; this wire bound
+// is deliberately a little larger than that suffix plus the prefix.
+export const MAX_RAW_PLAN_CODE_LENGTH = 80;
+export const RAW_PLAN_CODE_PATTERN = /^(?:[a-z0-9]+(?:[_-][a-z0-9]+)*|unknown:[a-z0-9]+(?:[_-][a-z0-9]+)*)$/u;
 
 export const SUPPORTED_ADAPTERS = Object.freeze({
   codex: {
