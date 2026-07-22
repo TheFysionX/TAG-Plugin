@@ -1,9 +1,9 @@
-export const CONNECTOR_VERSION = "0.1.14";
+export const CONNECTOR_VERSION = "0.1.15";
 export const SCHEMA_VERSION = 1;
 export const CODEX_ACCOUNTING_VERSION = 5;
 export const CLAUDE_ACCOUNTING_VERSION = 5;
 export const KIMI_ACCOUNTING_VERSION = 2;
-export const ANTIGRAVITY_ACCOUNTING_VERSION = 1;
+export const ANTIGRAVITY_ACCOUNTING_VERSION = 2;
 export const GROK_BUILD_ACCOUNTING_VERSION = 1;
 export const AGGREGATE_CURSOR_VERSION = 3;
 export const CODEX_SNAPSHOT_STATE_VERSION = 1;
@@ -40,8 +40,8 @@ export const SUPPORTED_ADAPTERS = Object.freeze({
     evidence: "Claude Code project JSONL assistant usage records"
   },
   gemini: {
-    status: "prospective_partial",
-    evidence: "Antigravity CLI sanitized status-line captures; no historical backfill"
+    status: "supported_version_pinned",
+    evidence: "Antigravity Desktop 2.3.1 completed-step metadata with retained local-history scanning, plus an optional CLI sanitized status-line fallback"
   },
   kimi: {
     status: "supported",

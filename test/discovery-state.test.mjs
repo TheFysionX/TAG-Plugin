@@ -59,6 +59,41 @@ test("JSONL discovery marks a missing root unavailable without truncation", asyn
   assert.equal(discovered.truncated, false);
 });
 
+test("loading preserves the bounded Antigravity v2 high-watermark cursor", async (context) => {
+  const home = await temporaryDirectory(context, "tag-plugin-antigravity-cursor-v2-");
+  const paths = runtimePaths({ home });
+  const state = initialState();
+  const fileAlias = "a".repeat(64);
+  state.cursors.antigravity.files[fileAlias] = {
+    version: 2,
+    conversationAlias: "b".repeat(64),
+    fileIdentity: "c".repeat(64),
+    schemaIdentity: "d".repeat(64),
+    highWatermark: 10_012,
+    pending: [
+      { index: 10_012, status: "completed" },
+      { index: 7, status: "open" }
+    ],
+    lastSeenAt: 123
+  };
+  await saveRuntime(paths, { state, config: initialConfig() });
+
+  const loaded = await loadRuntime(paths);
+
+  assert.deepEqual(loaded.state.cursors.antigravity.files[fileAlias], {
+    version: 2,
+    conversationAlias: "b".repeat(64),
+    fileIdentity: "c".repeat(64),
+    schemaIdentity: "d".repeat(64),
+    highWatermark: 10_012,
+    pending: [
+      { index: 7, status: "open" },
+      { index: 10_012, status: "completed" }
+    ],
+    lastSeenAt: 123
+  });
+});
+
 test("loading a legacy global aggregate cursor resets every provider watermark", async (context) => {
   const home = await temporaryDirectory(context, "tag-plugin-state-v1-");
   const paths = runtimePaths({ home });
@@ -77,6 +112,7 @@ test("loading a legacy global aggregate cursor resets every provider watermark",
     providers: {
       codex: { through: null },
       claude: { through: null },
+      gemini: { through: null },
       kimi: { through: null }
     }
   });
@@ -103,6 +139,7 @@ test("loading a v3 aggregate cursor preserves and normalizes provider watermarks
     providers: {
       codex: { through: "2026-07-19T01:02:03.000Z" },
       claude: { through: "2026-07-19T09:05:06.000Z" },
+      gemini: { through: null },
       kimi: { through: "2026-07-20T00:00:00.250Z" }
     }
   });
@@ -253,6 +290,7 @@ test("v5 marks enabled legacy providers for one lossless raw-only backfill", asy
   assert.deepEqual(loaded.state.cursors.aggregate.providers, {
     codex: { through: null },
     claude: { through: null },
+    gemini: { through: null },
     kimi: { through: null }
   });
   assert.deepEqual(loaded.state.rawOnlyBackfill.pendingProviders, ["codex", "claude", "kimi"]);

@@ -16,6 +16,11 @@ import { readCodexAccountUsage } from "./adapters/codex-account-usage.mjs";
 import path from "node:path";
 import { parseKimiWire } from "./adapters/kimi-wire.mjs";
 import { parseAntigravityStatuslineLog } from "./adapters/antigravity-statusline.mjs";
+import {
+  detectAntigravityDesktopVersion,
+  discoverAntigravityDesktopDatabases,
+  parseAntigravityDesktopDatabase
+} from "./adapters/antigravity-desktop.mjs";
 import { discoverGrokSignalFiles, parseGrokBuildSession } from "./adapters/grok-build-sessions.mjs";
 
 const AGGREGATE_USAGE_FIELDS = ["input", "cachedInput", "cacheWriteInput", "output", "reasoningOutput"];
@@ -23,12 +28,12 @@ const WIRE_RAW_USAGE_FIELDS = ["inputTokens", "cachedInputTokens", "cacheWriteIn
 const LOGICAL_AGGREGATE_IDENTITY_SCHEMA = Object.freeze({
   codex: "session-hour-aggregate-v4",
   claude: "session-hour-aggregate-v4",
-  gemini: "session-hour-aggregate-v1",
+  gemini: "session-hour-aggregate-v2",
   grok: "session-hour-aggregate-v1",
   kimi: "session-hour-aggregate-v3",
   deepseek: "session-hour-aggregate-v1"
 });
-const AGGREGATE_COLLECTOR_GENERATION = Object.freeze({ codex: 4, claude: 4, gemini: 1, grok: 1, kimi: 3, deepseek: 1 });
+const AGGREGATE_COLLECTOR_GENERATION = Object.freeze({ codex: 4, claude: 4, gemini: 2, grok: 1, kimi: 3, deepseek: 1 });
 const HOST_PROVIDER_BY_SURFACE = Object.freeze({
   codex: "codex",
   claude_code: "claude",
@@ -225,11 +230,13 @@ function finalizeProviderCoverage(result, provider) {
   const parseLosses = Number.isSafeInteger(stats.malformed) ? stats.malformed : 0;
   scan.parseLosses = parseLosses;
   scan.progressComplete = Boolean(scan.discoveryComplete && !stats.pending);
-  scan.complete = Boolean(scan.progressComplete && parseLosses === 0);
+  scan.complete = Boolean(scan.progressComplete && parseLosses === 0 && !scan.forcePartial);
   scan.coverage = !scan.enabled
     ? "disabled"
     : (scan.complete ? "complete" : "partial");
-  if (scan.discoveryComplete && stats.pending) {
+  if (scan.forcePartial && scan.progressComplete && parseLosses === 0) {
+    scan.reason = scan.forcePartialReason || "prospective_only";
+  } else if (scan.discoveryComplete && stats.pending) {
     scan.reason = "event_limit";
   } else if (scan.progressComplete && parseLosses > 0) {
     scan.reason = "parse_loss";
@@ -237,6 +244,24 @@ function finalizeProviderCoverage(result, provider) {
   }
   stats.coverage = scan.coverage;
   stats.parseLosses = parseLosses;
+}
+
+// The active rate card is frozen each Sunday. It deliberately contains no
+  // Gemini 3.6 rates, so publishing it as attributed would fabricate R-token
+// attributed would fabricate R-token value. Keep their measured raw usage,
+// but make the wire contract unambiguously raw-only until a future card adds
+// those entries.
+function freezeUnsupportedGeminiRateCard(event) {
+  if (event?.serviceProviderId !== "gemini" || event?.provenance?.surface !== "antigravity") return event;
+  const source = typeof event.sourceModelId === "string" ? event.sourceModelId : "";
+  const unsupported = source.startsWith("gemini-3.6-");
+  if (!unsupported) return event;
+  return {
+    ...event,
+    modelId: null,
+    mode: { serviceTier: null, speed: null, fast: false, classified: false },
+    provenance: { ...event.provenance, rateCard: "raw_only_unscored" }
+  };
 }
 
 export async function collectUsage(options) {
@@ -259,7 +284,7 @@ export async function collectUsage(options) {
     codex: { accountingVersion: CODEX_ACCOUNTING_VERSION, files: {}, sessions: {} },
     claude: { accountingVersion: CLAUDE_ACCOUNTING_VERSION, seen: {} },
     kimi: { accountingVersion: KIMI_ACCOUNTING_VERSION, files: {} },
-    antigravity: { accountingVersion: ANTIGRAVITY_ACCOUNTING_VERSION },
+    antigravity: { accountingVersion: ANTIGRAVITY_ACCOUNTING_VERSION, files: {} },
     grok: { accountingVersion: GROK_BUILD_ACCOUNTING_VERSION, sessions: {} }
   });
   nextCursors.codex = nextCursors.codex || { accountingVersion: CODEX_ACCOUNTING_VERSION, files: {}, sessions: {} };
@@ -274,6 +299,7 @@ export async function collectUsage(options) {
   nextCursors.kimi.files = nextCursors.kimi.files || {};
   nextCursors.antigravity = nextCursors.antigravity || { accountingVersion: ANTIGRAVITY_ACCOUNTING_VERSION };
   nextCursors.antigravity.accountingVersion = ANTIGRAVITY_ACCOUNTING_VERSION;
+  nextCursors.antigravity.files = nextCursors.antigravity.files || {};
   nextCursors.grok = nextCursors.grok || { accountingVersion: GROK_BUILD_ACCOUNTING_VERSION, sessions: {} };
   nextCursors.grok.accountingVersion = GROK_BUILD_ACCOUNTING_VERSION;
   nextCursors.grok.sessions = nextCursors.grok.sessions || {};
@@ -287,7 +313,7 @@ export async function collectUsage(options) {
     stats: {
       codex: { files: 0, events: 0, pending: false, malformed: 0, duplicateSnapshots: 0, cumulativeResets: 0, cumulativeMismatches: 0, inheritedSnapshots: 0, ambiguousLineage: 0, unclassifiedModes: 0, unavailable: false, collector: "local_log_fallback" },
       claude: { files: 0, events: 0, pending: false, malformed: 0, unavailable: false, collector: "local_log_fallback" },
-      gemini: { status: "opt_in_required", collector: "antigravity_statusline_v1_prospective", historicalCompleteness: "none" },
+      gemini: { files: 0, events: 0, pending: false, malformed: 0, unavailable: false, collector: "antigravity_desktop_sqlite_v1", historicalCompleteness: "retained_completed_metadata_only" },
       kimi: { files: 0, events: 0, pending: false, malformed: 0, unavailable: false, collector: "kimi_v0_28_wire_usage_record_fallback" },
       grok: { status: "opt_in_required", collector: "grok_build_local_session_summary", historicalCompleteness: "none", accounting: "informational_only" }
     }
@@ -502,35 +528,119 @@ export async function collectUsage(options) {
   }
   nextCursors.kimi.files = newestEntries(nextCursors.kimi.files, MAX_CURSOR_FILES, "lastSeenAt");
 
-  // Antigravity never reads the product's raw status-line input from disk.
-  // The only accepted source is the future wrapper's sanitized append-only
-  // capture file. It is prospective: absence is expected before opt-in.
-  const antigravityEnabled = enabledFallbacks.gemini === true || enabledFallbacks.antigravity === true;
+  // Antigravity desktop exposes completed usage metadata in per-conversation
+  // SQLite files. Its adapter reads only `steps(idx,status,metadata)`, never
+  // prompt/response payloads. The old sanitized CLI status-line capture stays
+  // supported as a separate prospective source.
+  // Desktop collection is read-only and follows the account's Gemini/Antigravity
+  // authorization. The optional CLI status-line source stays separately opt-in
+  // and must not gate desktop collection.
+  const antigravityDesktopEnabled = options.enabledProviders?.gemini === true;
+  const antigravityStatuslineEnabled = enabledFallbacks.gemini === true || enabledFallbacks.antigravity === true;
+  const antigravityEnabled = antigravityDesktopEnabled || antigravityStatuslineEnabled;
+  const detectAntigravityVersion = options.detectAntigravityDesktopVersion || detectAntigravityDesktopVersion;
+  const antigravityDesktopVersion = antigravityDesktopEnabled
+    ? await detectAntigravityVersion(options.antigravityDesktopVersionOptions)
+    : { status: "unavailable", version: null, reason: "disabled" };
+  const findAntigravityDesktopDatabases = options.discoverAntigravityDesktopDatabases || discoverAntigravityDesktopDatabases;
+  const antigravityDesktopDiscovery = antigravityDesktopEnabled
+    && antigravityDesktopVersion.status === "supported"
+    && typeof roots.antigravityDesktop === "string"
+    ? await findAntigravityDesktopDatabases(roots.antigravityDesktop)
+    : { status: "unavailable", reason: antigravityDesktopVersion.reason || "desktop_root_unavailable", truncated: false, files: [] };
+  // The database discovery itself is bounded at MAX_CURSOR_FILES. At the
+  // boundary, preserve correctness by declaring coverage partial rather than
+  // claiming there cannot be another conversation file.
+  const antigravityDesktopTruncated = Boolean(antigravityDesktopDiscovery.truncated);
+  const antigravityDesktopUnavailable = antigravityDesktopDiscovery.status === "unavailable";
   result.providerScans.gemini = {
     enabled: antigravityEnabled,
-    discoveryComplete: antigravityEnabled,
+    discoveryComplete: false,
     complete: false,
-    reason: antigravityEnabled ? "prospective_statusline_capture" : "disabled",
+    reason: !antigravityEnabled
+      ? "disabled"
+      : (antigravityDesktopUnavailable ? "unavailable" : (antigravityDesktopTruncated ? "truncated" : "prospective_only")),
     range: aggregateRanges?.gemini || null,
-    historicalCompleteness: "none"
+    historicalCompleteness: "retained_completed_metadata_only"
   };
   if (antigravityEnabled) {
-    const parsed = await parseAntigravityStatuslineLog(roots.antigravity, {
-      dedupNamespaceKey,
-      canonicalModelId: options.canonicalModelId
-    });
-    result.events.push(...parsed.events);
-    result.providerObservations.push(...parsed.planObservations);
-    result.resetObservations.push(...parsed.resetObservations);
+    const desktopRange = aggregateRanges?.gemini || null;
+    const parseAntigravityDesktop = options.parseAntigravityDesktopDatabase || parseAntigravityDesktopDatabase;
+    let remainingAntigravityEvents = maximumEventsPerProvider;
+    let desktopCaptures = 0;
+    let desktopParseUnavailable = false;
+    for (const filePath of antigravityDesktopDiscovery.files) {
+      if (!aggregator && remainingAntigravityEvents <= 0) {
+        result.stats.gemini.pending = true;
+        break;
+      }
+      const fileAlias = hmacAlias(secrets.localAliasKey, "antigravity-desktop-file", filePath);
+      const capacity = remainingAntigravityEvents;
+      const parsed = await parseAntigravityDesktop(filePath, {
+        localAliasKey: secrets.localAliasKey,
+        dedupNamespaceKey,
+        canonicalModelId: options.canonicalModelId,
+        desktopVersion: antigravityDesktopVersion.version,
+        cursor: nextCursors.antigravity.files[fileAlias],
+        maximumEvents: aggregator ? undefined : remainingAntigravityEvents,
+        minimumObservedAtInclusive: desktopRange?.start,
+        maximumObservedAtExclusive: desktopRange?.end
+      });
+      desktopParseUnavailable ||= parsed.status !== "available_version_pinned";
+      nextCursors.antigravity.files[fileAlias] = { ...parsed.cursor, lastSeenAt: now };
+      const events = parsed.events.map(freezeUnsupportedGeminiRateCard);
+      if (aggregator) events.forEach((event) => aggregator.add(event));
+      else result.events.push(...events);
+      result.stats.gemini.files += 1;
+      result.stats.gemini.events += events.length;
+      result.stats.gemini.malformed += parsed.malformed || 0;
+      desktopCaptures += parsed.captures || 0;
+      remainingAntigravityEvents -= events.length;
+      if (parsed.partial === true || parsed.status === "partial") result.stats.gemini.pending = true;
+      if (!aggregator && events.length >= capacity && parsed.captures > events.length) {
+        result.stats.gemini.pending = true;
+        break;
+      }
+    }
+    const statusline = antigravityStatuslineEnabled
+      ? await parseAntigravityStatuslineLog(roots.antigravity, {
+        dedupNamespaceKey,
+        canonicalModelId: options.canonicalModelId
+      })
+      : { status: "unavailable", reason: "statusline_not_consented", events: [], planObservations: [], resetObservations: [], captures: 0, malformed: 0 };
+    const allStatuslineEvents = statusline.events.map(freezeUnsupportedGeminiRateCard);
+    const statuslineEvents = aggregator ? allStatuslineEvents : allStatuslineEvents.slice(0, remainingAntigravityEvents);
+    if (aggregator) statuslineEvents.forEach((event) => aggregator.add(event));
+    else result.events.push(...statuslineEvents);
+    if (!aggregator && statuslineEvents.length < allStatuslineEvents.length) result.stats.gemini.pending = true;
+    result.providerObservations.push(...statusline.planObservations);
+    result.resetObservations.push(...statusline.resetObservations);
+    const desktopSourceComplete = antigravityDesktopDiscovery.status === "available"
+      && !antigravityDesktopTruncated
+      && !desktopParseUnavailable;
+    const statuslineSourceComplete = statusline.status === "available_prospective";
+    result.providerScans.gemini.discoveryComplete = desktopSourceComplete || statuslineSourceComplete;
+    result.providerScans.gemini.reason = result.providerScans.gemini.discoveryComplete
+      ? "complete"
+      : (antigravityDesktopTruncated
+          ? "truncated"
+          : (desktopParseUnavailable ? "unsupported_or_unreadable_schema" : (antigravityDesktopDiscovery.reason || statusline.reason)));
     result.stats.gemini = {
-      status: parsed.status,
-      reason: parsed.reason,
-      captures: parsed.captures,
-      events: parsed.events.length,
-      malformed: parsed.malformed,
-      collector: "antigravity_statusline_v1_prospective",
-      historicalCompleteness: "none"
+      ...result.stats.gemini,
+      status: desktopSourceComplete
+        ? "available_version_pinned"
+        : (statuslineEvents.length > 0 ? "available_prospective" : statusline.status),
+      reason: desktopSourceComplete || statuslineEvents.length > 0
+        ? null
+        : (antigravityDesktopDiscovery.reason || statusline.reason),
+      captures: desktopCaptures + (statusline.captures || 0),
+      events: result.stats.gemini.events + statuslineEvents.length,
+      malformed: result.stats.gemini.malformed + (statusline.malformed || 0),
+      collector: "antigravity_desktop_sqlite_v1",
+      desktopVersion: antigravityDesktopVersion.version,
+      historicalCompleteness: desktopSourceComplete ? "retained_completed_metadata_only" : "prospective_only"
     };
+    nextCursors.antigravity.files = newestEntries(nextCursors.antigravity.files, MAX_CURSOR_FILES, "lastSeenAt");
   }
 
   // Grok Build's signals are intentionally surfaced only as a local usage
@@ -572,7 +682,7 @@ export async function collectUsage(options) {
     };
   }
 
-  for (const provider of ["codex", "claude", "kimi"]) {
+  for (const provider of ["codex", "claude", "gemini", "kimi"]) {
     finalizeProviderCoverage(result, provider);
   }
 

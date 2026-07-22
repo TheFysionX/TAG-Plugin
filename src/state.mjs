@@ -3,12 +3,14 @@ import path from "node:path";
 import { randomBytes } from "node:crypto";
 import {
   AGGREGATE_CURSOR_VERSION,
+  ANTIGRAVITY_ACCOUNTING_VERSION,
   CLAUDE_ACCOUNTING_VERSION,
   CODEX_ACCOUNTING_VERSION,
   CODEX_SNAPSHOT_STATE_VERSION,
   DEFAULT_LOCK_STALE_MS,
   KIMI_ACCOUNTING_VERSION,
   MAX_CODEX_LOGICAL_SESSIONS,
+  MAX_CURSOR_FILES,
   MAX_MIGRATION_EXCLUSIONS,
   MAX_UNRESOLVED_EVENTS,
   SCHEMA_VERSION
@@ -30,7 +32,7 @@ const UNRESOLVED_EVENT_KEYS = new Set([
 ]);
 const SOURCE_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,119}$/;
 const TOKEN_COUNT_PATTERN = /^\d{1,30}$/;
-const AGGREGATE_PROVIDERS = ["codex", "claude", "kimi"];
+const AGGREGATE_PROVIDERS = ["codex", "claude", "gemini", "kimi"];
 
 function isCanonicalUtcDate(value) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value || "")) return false;
@@ -323,6 +325,50 @@ function normalizedCodexSessions(value) {
     }]));
 }
 
+function normalizedAntigravityFiles(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const valid = [];
+  for (const [fileAlias, cursor] of Object.entries(value)) {
+    if (!/^[a-f0-9]{64}$/.test(fileAlias)
+      || cursor?.version !== 2
+      || !/^[a-f0-9]{64}$/.test(cursor.conversationAlias || "")
+      || !/^[a-f0-9]{64}$/.test(cursor.fileIdentity || "")
+      || !/^[a-f0-9]{64}$/.test(cursor.schemaIdentity || "")
+      || !Number.isSafeInteger(cursor.highWatermark)
+      || cursor.highWatermark < -1
+      || !Array.isArray(cursor.pending)
+      || cursor.pending.length > 10_000) continue;
+    const indexes = new Set();
+    const pending = [];
+    let pendingValid = true;
+    for (const entry of cursor.pending) {
+      if (!Number.isSafeInteger(entry?.index)
+        || entry.index < 0
+        || entry.index > cursor.highWatermark
+        || !["open", "completed"].includes(entry?.status)
+        || indexes.has(entry.index)) {
+        pendingValid = false;
+        break;
+      }
+      indexes.add(entry.index);
+      pending.push({ index: entry.index, status: entry.status });
+    }
+    if (!pendingValid) continue;
+    valid.push([fileAlias, {
+      version: 2,
+      conversationAlias: cursor.conversationAlias,
+      fileIdentity: cursor.fileIdentity,
+      schemaIdentity: cursor.schemaIdentity,
+      highWatermark: cursor.highWatermark,
+      pending: pending.sort((left, right) => left.index - right.index),
+      lastSeenAt: Number.isFinite(cursor.lastSeenAt) ? cursor.lastSeenAt : 0
+    }]);
+  }
+  return Object.fromEntries(valid
+    .sort((left, right) => (right[1]?.lastSeenAt || 0) - (left[1]?.lastSeenAt || 0))
+    .slice(0, MAX_CURSOR_FILES));
+}
+
 function normalizedUnresolvedEvent(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   if (!Object.keys(value).every((key) => UNRESOLVED_EVENT_KEYS.has(key))) return null;
@@ -372,6 +418,7 @@ export function initialState() {
       codex: { accountingVersion: CODEX_ACCOUNTING_VERSION, files: {}, sessions: {} },
       claude: { accountingVersion: CLAUDE_ACCOUNTING_VERSION, seen: {} },
       kimi: { accountingVersion: KIMI_ACCOUNTING_VERSION, files: {} },
+      antigravity: { accountingVersion: ANTIGRAVITY_ACCOUNTING_VERSION, files: {} },
       aggregate: initialAggregateCursors()
     },
     lastSyncAt: null,
@@ -386,6 +433,10 @@ export function initialConfig() {
     endpoint: null,
     allowedPlatforms: [],
     supportedProviders: [],
+    // Desktop collection is read-only. This separate consent is required
+    // before TAG may modify Antigravity CLI settings for the optional
+    // statusLine fallback.
+    antigravityStatuslineConsent: false,
     transcriptFallbacks: {
       codex: false,
       claude: false,
@@ -415,6 +466,7 @@ export async function loadRuntime(paths) {
   const requiresRawOnlyBackfill = state.cursors.codex?.accountingVersion !== CODEX_ACCOUNTING_VERSION
     || state.cursors.claude?.accountingVersion !== CLAUDE_ACCOUNTING_VERSION
     || state.cursors.kimi?.accountingVersion !== KIMI_ACCOUNTING_VERSION
+    || state.cursors.antigravity?.accountingVersion !== ANTIGRAVITY_ACCOUNTING_VERSION
     || state.cursors.aggregate?.version !== AGGREGATE_CURSOR_VERSION;
   state.providerEvidenceHashes = state.providerEvidenceHashes || {};
   state.codexCheckpointSnapshot = normalizeCodexCheckpointSnapshot(state.codexCheckpointSnapshot);
@@ -427,6 +479,7 @@ export async function loadRuntime(paths) {
   state.cursors.codex.sessions = normalizedCodexSessions(state.cursors.codex.sessions);
   state.cursors.claude = state.cursors.claude || { seen: {} };
   state.cursors.kimi = state.cursors.kimi || { accountingVersion: KIMI_ACCOUNTING_VERSION, files: {} };
+  state.cursors.antigravity = state.cursors.antigravity || { accountingVersion: ANTIGRAVITY_ACCOUNTING_VERSION, files: {} };
   state.cursors.aggregate = normalizedAggregateCursors(state.cursors.aggregate);
   if (state.cursors.codex.accountingVersion !== CODEX_ACCOUNTING_VERSION) {
     // v5 performs one stable-ID rescan so usage withheld by the retired
@@ -460,7 +513,15 @@ export async function loadRuntime(paths) {
       ? state.cursors.kimi.files
       : {};
   }
+  if (state.cursors.antigravity.accountingVersion !== ANTIGRAVITY_ACCOUNTING_VERSION) {
+    state.cursors.antigravity = { accountingVersion: ANTIGRAVITY_ACCOUNTING_VERSION, files: {} };
+    state.cursors.aggregate.providers.gemini.through = null;
+  } else {
+    state.cursors.antigravity.accountingVersion = ANTIGRAVITY_ACCOUNTING_VERSION;
+    state.cursors.antigravity.files = normalizedAntigravityFiles(state.cursors.antigravity.files);
+  }
   const configuredFallbacks = config.transcriptFallbacks || {};
+  config.antigravityStatuslineConsent = config.antigravityStatuslineConsent === true;
   config.transcriptFallbacks = {
     codex: Boolean(configuredFallbacks.codex),
     claude: Boolean(configuredFallbacks.claude),

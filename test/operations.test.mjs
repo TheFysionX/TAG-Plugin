@@ -814,6 +814,7 @@ test("an explicitly consented Antigravity capture reaches the sync outbox", asyn
   config.allowedPlatforms = ["gemini"];
   config.supportedProviders = ["gemini"];
   config.transcriptFallbacks = { codex: false, claude: false, kimi: false, gemini: true };
+  config.antigravityStatuslineConsent = true;
   await saveSecrets(fixture.paths, secrets);
   await saveRuntime(fixture.paths, { state, config });
   const uploaded = [];
@@ -837,6 +838,47 @@ test("an explicitly consented Antigravity capture reaches the sync outbox", asyn
   assert.equal(uploaded[0].provider, "gemini");
   assert.equal(uploaded[0].serviceProviderId, "gemini");
   assert.equal(uploaded[0].surface, "antigravity");
+});
+
+test("Antigravity desktop authorization cannot read an existing statusline capture without separate consent", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  fixture.roots.antigravity = path.join(fixture.temporary, "tag-plugin-statusline.jsonl");
+  await fs.writeFile(fixture.roots.antigravity, JSON.stringify({
+    kind: "tag.antigravity.statusline.v1",
+    observedAt: "2026-07-21T10:00:00.000Z",
+    sessionAlias: "a".repeat(64),
+    sourceModelId: "gemini-3-pro",
+    executionMode: "fast",
+    quotaResets: [],
+    usage: { input: 12, cachedInput: 3, cacheWriteInput: 0, output: 5 }
+  }) + "\n", "utf8");
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_antigravity_desktop_only";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["gemini"];
+  config.supportedProviders = ["gemini"];
+  // Simulate an old pairing that left the legacy fallback bit set. The new
+  // explicit consent flag remains false and must override it.
+  config.transcriptFallbacks = { codex: false, claude: false, kimi: false, gemini: true };
+  config.antigravityStatuslineConsent = false;
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+
+  const result = await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    officialEvidence: false,
+    fetchImpl: async () => { throw new Error("an unconsented statusline capture must never upload"); }
+  });
+
+  assert.equal(result.sent, 0);
+  assert.equal(result.adapters.gemini.events, 0);
+  assert.equal((await loadRuntime(fixture.paths)).config.antigravityStatuslineConsent, false);
 });
 
 test("persisted outboxes reject invalid service-provider and surface combinations", async (context) => {
@@ -3925,13 +3967,49 @@ test("preview is local-only and journal reads require pairing authorization", as
   });
   assert.equal(result.records, 0);
   assert.equal(result.adapters.codex.status, "opt_in_required");
-  assert.equal(result.localReadSurfaces.find((surface) => surface.provider === "gemini").source,
-    "Antigravity sanitized statusLine capture");
+  assert.equal(result.localReadSurfaces.find((surface) => surface.source === "Antigravity desktop 2.3.1 completed-step SQLite metadata").enabled,
+    false);
+  assert.equal(result.localReadSurfaces.find((surface) => surface.source === "Antigravity CLI sanitized statusLine fallback").enabled,
+    false);
   assert.equal(result.networkPerformed, false);
   const diagnostics = await doctor({ home: fixture.home, roots: fixture.roots });
-  assert.equal(diagnostics.sources.gemini.status, "antigravity_sanitized_statusline_capture");
+  assert.equal(diagnostics.sources.gemini.status, "antigravity_desktop_sqlite_v1");
+  assert.equal(diagnostics.sources.gemini.settingsMutationAuthorized, false);
   assert.equal(diagnostics.sources.grok.status, "local_session_summary_only");
   assert.equal(diagnostics.sources.deepseek.status, "hosted_model_attribution_or_explicit_api_evidence_only");
+});
+
+test("Antigravity desktop authorization never installs the CLI status-line wrapper without separate consent", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const runtime = await loadRuntime(fixture.paths);
+  runtime.state.paired = true;
+  runtime.state.deviceId = "device_antigravity_desktop_only";
+  runtime.config.endpoint = "https://artificial-games.example";
+  runtime.config.allowedPlatforms = ["gemini"];
+  runtime.config.supportedProviders = ["gemini"];
+  runtime.config.antigravityStatuslineConsent = false;
+  await saveRuntime(fixture.paths, runtime);
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  await saveSecrets(fixture.paths, secrets);
+  const settingsPath = path.join(fixture.temporary, "antigravity-settings.json");
+  await fs.writeFile(settingsPath, JSON.stringify({ statusLine: "user-owned-statusline" }), "utf8");
+
+  const result = await install({
+    home: fixture.home,
+    platform: "linux",
+    releaseRoot: connectorRoot,
+    userHome: fixture.temporary,
+    xdgConfigHome: path.join(fixture.temporary, "config"),
+    antigravitySettingsPath: settingsPath,
+    confirmInstall: true,
+    runCommand: async () => {}
+  });
+
+  assert.deepEqual(result.antigravity, { installed: false, reason: "statusline_not_consented" });
+  assert.deepEqual(JSON.parse(await fs.readFile(settingsPath, "utf8")), { statusLine: "user-owned-statusline" });
+  assert.equal(await fs.access(path.join(fixture.home, "antigravity-statusline-state.json")).then(() => true).catch(() => false), false);
 });
 
 test("scheduler mutation is preview-only until the exact confirmation flag", async (context) => {

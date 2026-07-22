@@ -6,7 +6,7 @@
     "repository": "https://github.com/TheFysionX/TAG-Plugin",
     "package": "@the-artificial-games/tag-plugin"
   },
-  "connectorVersion": "0.1.14",
+  "connectorVersion": "0.1.15",
   "runtime": {
     "name": "Node.js",
     "minimumMajor": 22,
@@ -22,7 +22,7 @@
     "failurePolicy": "an update failure never rolls back or invalidates an already committed sync or heartbeat; the current and previous releases remain available"
   },
   "releaseArtifact": {
-    "archiveName": "tag-plugin-0.1.14.tgz",
+    "archiveName": "tag-plugin-0.1.15.tgz",
     "includesSyntheticTestSuite": true,
     "testCommand": "npm test",
     "releaseContract": "require package @the-artificial-games/tag-plugin; reject -local; require tag v<package-version>; require package, runtime constant, and manifest versions to match; require archive tag-plugin-<package-version>.tgz",
@@ -98,11 +98,28 @@
     },
     {
       "provider": "gemini",
+      "surface": "Antigravity desktop app.asar root package metadata",
+      "contentFree": true,
+      "default": false,
+      "requiresExplicitOptIn": true,
+      "purpose": "bounded integrity-checked read of product name and version only; used to enforce the exact supported desktop-version allowlist before opening usage metadata"
+    },
+    {
+      "provider": "gemini",
+      "surface": "Antigravity desktop 2.3.1 conversation SQLite metadata (completed steps only)",
+      "contentFree": true,
+      "default": false,
+      "requiresExplicitOptIn": true,
+      "verifiedVersion": "2.3.1",
+      "purpose": "version-pinned retained local token usage; reads only steps.idx, steps.status, and steps.metadata; no prompt, transcript, payload, or render fields"
+    },
+    {
+      "provider": "gemini",
       "surface": "Antigravity CLI statusLine JSON through TAG's consented wrapper",
       "contentFree": true,
       "default": false,
       "requiresExplicitOptIn": true,
-      "purpose": "prospective usage, plan, and quota-window observations; no historical backfill"
+      "purpose": "prospective fallback only; no historical backfill and no plan-detection claim; requires separate explicit antigravityStatuslineConsent before TAG modifies Antigravity CLI settings"
     },
     {
       "provider": "grok",
@@ -126,7 +143,7 @@
     "launcher.mjs (stable current-user release launcher)",
     "update.lock (ephemeral auto-update owner-token lease)",
     "antigravity-statusline-state.json (only after explicit Antigravity wrapper installation; saves prior statusLine value for restoration)",
-    "<Antigravity home>/tag-plugin-statusline.jsonl (sanitized prospective capture only after explicit Antigravity wrapper installation)",
+    "<Antigravity CLI home>/tag-plugin-statusline.jsonl (sanitized prospective fallback only after explicit wrapper installation)",
     "connector.lock (ephemeral owner-token lease during state-changing commands)",
     "sync-pages/<batch-id>/*.json (temporary content-free future pages during catch-up)",
     "versions/<connector-version>/**",
@@ -149,15 +166,15 @@
     "pairingRecovery": "short-lived code, public key, endpoint, device label, connector version, approved fallbacks, private key, and fixed exchange request are stored only in the restricted pending-secret journal until config-first/state-last commit succeeds",
     "syncRecovery": "signed heartbeat hydration reads the current Codex account snapshot before every eligible plan; Codex snapshot generations follow, with generationId equal to SHA-256(parentGenerationId plus NUL plus the canonical snapshot digest), only changed daily values tagged daily_delta, and one final lifetime commit marker carrying the generation, parent, full snapshot digest, and delta count; every checkpoint requires exact canonical-digest acknowledgement and the marker additionally requires active-generation proof; stale-parent recovery hydrates the winner, retires only checkpoint work, and preserves durable event pages; the submitted generation, digest, lifetime value, and daily map persist locally only after proof and the final outbox item succeed; then newest-first catch-up pages capped at 5000 hourly aggregate events each; active page embedded in state and future content-free pages stored privately under sync-pages/<batch-id> with an event-count/digest manifest; fixed active request plus disjoint chunks of at most 3 events or 2 checkpoints, paced 550 ms apart; missing or corrupt pages fail closed; collection cursors commit only after the final page; interactive sync processes at most 100 requests; scheduled runs process at most 1000 ingest requests, heartbeat every 50 and once at the end even with backlog",
     "historyImport": "all safely discoverable retained journal history from the Unix epoch, independently of the server score-eligibility horizon; local source-ID deduplication; stable provider/source-session/UTC-hour/raw-model/raw-mode/surface aggregation without sharding; disabled, unavailable, truncated, or event-limited providers retain their prior through-watermark; malformed or oversized records keep coverage explicitly partial with a privacy-safe count while a completed scan range may advance so later valid usage is not pinned; later runs normally scan only newly settled hours",
-    "aggregateWatermarks": "independent Codex, Claude, and Kimi settled-through times staged per complete provider and committed only after the final sync page",
+    "aggregateWatermarks": "independent Codex, Claude, Kimi, and version-pinned Antigravity desktop settled-through times staged per complete provider and committed only after the final sync page",
     "unresolvedModels": "unknown-model or unknown-mode usage uploads immediately as an atomic raw-only event without a local queue; modelId and serviceMode are both the unknown sentinel, attribution is raw_only, source model tokens never upload, and a one-time stable-ID backfill repairs the retired queue generation",
     "eventIdentity": "raw source IDs are account-scoped HMACs over content-independent source identity and deduplicate locally; Codex and Claude logical aggregates retain the released v4 identity domain and Kimi retains v3, binding provider, stable source-session scope, UTC hour, raw source-model token, raw mode token, and coding surface independently of parser/accounting generation and raw-versus-attributed classification; source-ID set, totals, canonical model mapping, and collector provenance are excluded from identity but changed canonical observation fields produce a new payload revision under the same event ID; raw source IDs and identity inputs do not upload as separate fields",
-    "planAndResetObservations": "a signed heartbeat may contain bounded content-free provider plan observations and actual quota-window reset observations. Codex plan/rate-window values come from official app-server account RPCs. Claude signed-in status comes from claude auth status JSON; when that command exposes only a coarse family, an exact Max 5x or Max 20x tier may come from a recent bounded Claude Desktop account-bootstrap cache entry. Only the allowlisted tier leaves the computer. Antigravity values come only from the explicitly installed sanitized statusLine wrapper. A scheduled reset is emitted when a previously observed quota-window boundary advances. Within the same future window, a manual reset is emitted only after a locally retained usage percentage falls by at least 30 percentage points; percentages never leave the computer. DeepSeek api_payg is reported only when explicit API evidence exists; a hosted DeepSeek model never creates that entitlement.",
+    "planAndResetObservations": "a signed heartbeat may contain bounded content-free provider plan observations and actual quota-window reset observations. Codex plan/rate-window values come from official app-server account RPCs. Claude signed-in status comes from claude auth status JSON; when that command exposes only a coarse family, an exact Max 5x or Max 20x tier may come from a recent bounded Claude Desktop account-bootstrap cache entry. Only the allowlisted tier leaves the computer. Antigravity desktop usage parsing does not detect or report plans. Its optional CLI statusLine fallback may report only an allowlisted observed tier and quota-window boundary; this is not a desktop plan-detection claim. A scheduled reset is emitted when a previously observed quota-window boundary advances. Within the same future window, a manual reset is emitted only after a locally retained usage percentage falls by at least 30 percentage points; percentages never leave the computer. DeepSeek api_payg is reported only when explicit API evidence exists; a hosted DeepSeek model never creates that entitlement.",
     "claudePlanEvidence": "the detector requires a current successful first-party login, checks at most 512 candidate files no larger than 8 MiB and no older than 14 days under Claude Desktop's own account cache within separate 64 MiB cumulative actual-read and declared-decompressed-input budgets, bounds each decompression to 32 MiB, deserializes the exact account/membership/organization path, matches the current organization ID, requires the claude_max capability and allowlisted billing type for a positive claim, accepts only default_claude_max_5x or default_claude_max_20x, and fails closed on stale, malformed, conflicting, wrong-account, or unknown evidence; a temporary same-account miss emits no coarse replacement, while a same-account non-Max membership, logout, API-key/third-party auth route, or organization switch closes the prior claim through an unverified observation; only an installation-keyed account HMAC is persisted locally; cache contents, raw account identity, and paths are never persisted, logged, or uploaded",
     "operationLock": "random owner token, open-handle lease renewed every stale-window quarter, live-PID stale-takeover guard, atomic rename/revalidation, and ownership-checked release",
     "atomicWriteRecovery": "atomic rename is the only replacement step; Windows EEXIST or EPERM retries that same primitive five times with bounded delay, then fails closed without unlinking the prior committed JSON and removes only that operation's temp; after the 15-minute lease window, state-changing startup may remove only exact known runtime-JSON temp names under connector home, only while proving ownership of the canonical overlap lock, only when both the temp and its unchanged committed counterpart are regular files and the encoded PID is no longer live; a temp that is the sole recovery copy is preserved; root and direct sync-page scans are non-recursive and bounded",
     "pathPrivacy": "raw paths are not persisted; installation-keyed HMAC aliases are persisted locally as cursor keys",
-    "cursorReplacementDetection": "file metadata, complete-line boundary, and rolling prefix digest over allowlisted usage/model/mode fields only; prompt/tool content is never hashed",
+    "cursorReplacementDetection": "Codex and Kimi use file metadata, complete-line boundaries, and rolling prefix digests over allowlisted usage/model/mode fields only. Antigravity desktop uses an installation-keyed HMAC of the database file instance plus bounded HMAC identities over step index, timestamp, model enum, and token counters; it fails visibly at cursor capacity instead of evicting and replaying. Prompt/tool content is never hashed.",
     "maximumJournalLineBytes": 1048576
   },
   "network": {
@@ -248,7 +265,7 @@
     "removesScheduler": true,
     "removesAllVersionedReleases": true,
     "removesLocalState": false,
-    "antigravityStatusLine": "when TAG still owns the configured wrapper, uninstall restores the saved prior statusLine (or removes TAG's entry if none existed). A later user change is preserved; TAG only removes its private capture/state files."
+    "antigravityStatusLine": "the optional CLI statusLine wrapper is never installed merely because Antigravity desktop collection is authorized. It requires separate explicit antigravityStatuslineConsent. When TAG still owns a consented wrapper, uninstall restores the saved prior statusLine (or removes TAG's entry if none existed). A later user change is preserved; TAG only removes its private capture/state files."
   },
   "codingAgentPrompt": {
     "providerMayReceiveAndRetainPrompt": true,

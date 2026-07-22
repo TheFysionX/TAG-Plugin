@@ -382,6 +382,12 @@ function allowedFallbacks(requested, allowedPlatforms) {
   ]));
 }
 
+function consentedFallbacks(config, requested) {
+  const fallbacks = requestedFallbacks(requested);
+  if (config?.antigravityStatuslineConsent !== true) fallbacks.gemini = false;
+  return fallbacks;
+}
+
 function stagedRawOnlyBackfill(state, providerScans, nextUnresolvedEvents, scannedAt) {
   const pending = new Set(state.rawOnlyBackfill?.pendingProviders || []);
   const hadPendingProviders = pending.size > 0;
@@ -1144,7 +1150,10 @@ function deepseekUsageEvidencePresent(value) {
 
 async function collectHeartbeatObservationInputs(runtime, secrets, roots, options) {
   if (options.observationCollection) return options.observationCollection;
-  const enabledFallbacks = allowedFallbacks(runtime.config.transcriptFallbacks, runtime.config.allowedPlatforms);
+  const enabledFallbacks = allowedFallbacks(
+    consentedFallbacks(runtime.config, runtime.config.transcriptFallbacks),
+    runtime.config.allowedPlatforms
+  );
   return collectUsage({
     roots,
     state: runtime.state,
@@ -1154,7 +1163,10 @@ async function collectHeartbeatObservationInputs(runtime, secrets, roots, option
     readCodexAccountUsage: options.readCodexAccountUsage,
     codexAccountUsageOptions: options.codexAccountUsageOptions,
     enabledFallbacks,
-    enabledProviders: { codex: observationProviderEnabled(runtime, "codex") },
+    enabledProviders: {
+      codex: observationProviderEnabled(runtime, "codex"),
+      gemini: observationProviderEnabled(runtime, "gemini")
+    },
     dedupNamespaceKey: secrets.dedupNamespaceKey,
     discoverJsonlFiles: options.discoverJsonlFiles,
     discoverGrokSignalFiles: options.discoverGrokSignalFiles
@@ -1771,7 +1783,10 @@ export async function preview(options = {}) {
   const { state, config } = await loadRuntime(paths);
   const existingSecrets = await loadSecrets(paths);
   const secrets = existingSecrets || createDeviceSecrets();
-  const enabledFallbacks = requestedFallbacks(options.enabledFallbacks || config.transcriptFallbacks);
+  const enabledFallbacks = consentedFallbacks(
+    config,
+    options.enabledFallbacks || config.transcriptFallbacks
+  );
   const collection = await collectUsage({
     roots,
     state,
@@ -1782,7 +1797,8 @@ export async function preview(options = {}) {
     codexAccountUsageOptions: options.codexAccountUsageOptions,
     enabledFallbacks,
     enabledProviders: {
-      codex: (config.allowedPlatforms || []).includes("codex")
+      codex: (config.allowedPlatforms || []).includes("codex"),
+      gemini: (config.allowedPlatforms || []).includes("gemini")
     },
     dedupNamespaceKey: existingSecrets?.dedupNamespaceKey
       || Buffer.from(secrets.localAliasKey, "base64").toString("base64url")
@@ -1794,7 +1810,8 @@ export async function preview(options = {}) {
       { provider: "codex", source: "~/.codex/sessions/**/*.jsonl", sensitiveJournal: true, enabled: enabledFallbacks.codex },
       { provider: "claude", source: "~/.claude/projects/**/*.jsonl", sensitiveJournal: true, enabled: enabledFallbacks.claude },
       { provider: "kimi", source: "~/.kimi-code/sessions/**/agents/*/wire.jsonl", sensitiveJournal: true, enabled: enabledFallbacks.kimi },
-      { provider: "gemini", source: "Antigravity sanitized statusLine capture", sensitiveJournal: false, enabled: enabledFallbacks.gemini === true },
+      { provider: "gemini", source: "Antigravity desktop 2.3.1 completed-step SQLite metadata", sensitiveJournal: false, enabled: (config.allowedPlatforms || []).includes("gemini") },
+      { provider: "gemini", source: "Antigravity CLI sanitized statusLine fallback", sensitiveJournal: false, enabled: config.antigravityStatuslineConsent === true && enabledFallbacks.gemini === true },
       { provider: "grok", source: "Grok Build local session summary", sensitiveJournal: false, enabled: enabledFallbacks.grok === true }
     ],
     networkPerformed: false
@@ -1884,6 +1901,10 @@ export async function pair(options = {}) {
         }
         runtime.config.allowedPlatforms = allowedPlatforms;
         runtime.config.supportedProviders = supportedProviders;
+        if (options.antigravityStatuslineConsent !== undefined) {
+          runtime.config.antigravityStatuslineConsent = options.antigravityStatuslineConsent === true
+            && allowedPlatforms.includes("gemini");
+        }
         runtime.config.transcriptFallbacks = allowedFallbacks(
           requestedFallbacks(options.enabledFallbacks ?? runtime.config.transcriptFallbacks),
           allowedPlatforms
@@ -1897,7 +1918,8 @@ export async function pair(options = {}) {
           deviceId: runtime.state.deviceId,
           allowedPlatforms,
           supportedProviders,
-          transcriptFallbacks: runtime.config.transcriptFallbacks
+          transcriptFallbacks: runtime.config.transcriptFallbacks,
+          antigravityStatuslineConsent: runtime.config.antigravityStatuslineConsent
         };
       }
       if (options.enabledFallbacks !== undefined) {
@@ -1907,13 +1929,19 @@ export async function pair(options = {}) {
         );
         await saveRuntime(paths, runtime);
       }
+      if (options.antigravityStatuslineConsent !== undefined) {
+        runtime.config.antigravityStatuslineConsent = options.antigravityStatuslineConsent === true
+          && runtime.config.allowedPlatforms.includes("gemini");
+        await saveRuntime(paths, runtime);
+      }
       return {
         paired: true,
         alreadyPaired: true,
         deviceId: runtime.state.deviceId,
         allowedPlatforms: runtime.config.allowedPlatforms,
         supportedProviders: runtime.config.supportedProviders,
-        transcriptFallbacks: runtime.config.transcriptFallbacks
+        transcriptFallbacks: runtime.config.transcriptFallbacks,
+        antigravityStatuslineConsent: runtime.config.antigravityStatuslineConsent
       };
     }
     let secrets = await loadPendingSecrets(paths);
@@ -1958,7 +1986,8 @@ export async function pair(options = {}) {
           deviceLabel,
           connectorVersion: CONNECTOR_VERSION
         },
-        approvedFallbacks: requestedFallbacks(options.enabledFallbacks)
+        approvedFallbacks: requestedFallbacks(options.enabledFallbacks),
+        antigravityStatuslineConsent: options.antigravityStatuslineConsent === true
       };
       secrets.pairingRequest = pending;
       runtime.state.pendingPair = {
@@ -2042,6 +2071,8 @@ export async function pair(options = {}) {
     runtime.config.endpoint = pending.endpoint;
     runtime.config.allowedPlatforms = allowedPlatforms;
     runtime.config.supportedProviders = supportedProviders;
+    runtime.config.antigravityStatuslineConsent = pending.antigravityStatuslineConsent === true
+      && allowedPlatforms.includes("gemini");
     const pendingRecoverySecrets = { ...secrets, dedupNamespaceKey };
     const activeSecrets = { ...pendingRecoverySecrets };
     delete activeSecrets.pairingRequest;
@@ -2072,7 +2103,8 @@ export async function pair(options = {}) {
       deviceId,
       allowedPlatforms,
       supportedProviders,
-      transcriptFallbacks: runtime.config.transcriptFallbacks
+      transcriptFallbacks: runtime.config.transcriptFallbacks,
+      antigravityStatuslineConsent: runtime.config.antigravityStatuslineConsent
     };
   });
 }
@@ -2156,7 +2188,7 @@ export async function sync(options = {}) {
       return { skipped: true, reason: "paused" };
     }
     const configuredFallbacks = allowedFallbacks(
-      runtime.config.transcriptFallbacks,
+      consentedFallbacks(runtime.config, runtime.config.transcriptFallbacks),
       runtime.config.allowedPlatforms
     );
     const allowedProviderSet = new Set(runtime.config.allowedPlatforms || []);
@@ -2182,7 +2214,8 @@ export async function sync(options = {}) {
       canonicalModelId: resolveModel,
       enabledFallbacks,
       enabledProviders: {
-        codex: allowedProviderSet.has("codex")
+        codex: allowedProviderSet.has("codex"),
+        gemini: allowedProviderSet.has("gemini")
       },
       dedupNamespaceKey: secrets.dedupNamespaceKey,
       maximumEventsPerProvider: options.maximumEventsPerProvider,
@@ -2396,8 +2429,9 @@ async function applyAutomaticUpdate(value, options = {}) {
         const runtime = await loadRuntime(paths);
         const installed = await fetchAndInstallUpdate(paths, release, options);
         await activateRelease(paths, release, installed.receipt);
-        let antigravity = { installed: false, reason: "gemini_not_consented" };
-        if ((runtime.config.allowedPlatforms || []).includes("gemini")) {
+        let antigravity = { installed: false, reason: "statusline_not_consented" };
+        if ((runtime.config.allowedPlatforms || []).includes("gemini")
+          && runtime.config.antigravityStatuslineConsent === true) {
           try {
             antigravity = await installAntigravityStatusline({
               paths,
@@ -2608,8 +2642,11 @@ export async function doctor(options = {}) {
         accessible: !kimi.unavailable
       },
       gemini: {
-        status: "antigravity_sanitized_statusline_capture",
-        fallbackEnabled: connectorStatus.transcriptFallbacks.gemini === true
+        status: "antigravity_desktop_sqlite_v1",
+        desktopEnabled: (connectorStatus.allowedPlatforms || []).includes("gemini"),
+        statuslineFallbackEnabled: connectorStatus.antigravityStatuslineConsent === true
+          && connectorStatus.transcriptFallbacks.gemini === true,
+        settingsMutationAuthorized: connectorStatus.antigravityStatuslineConsent === true
       },
       grok: {
         status: "local_session_summary_only",
@@ -2804,6 +2841,7 @@ export async function install(options = {}) {
     const activeRelease = await activateRelease(paths, { version: CONNECTOR_VERSION });
     const result = await applyScheduler(previewResult.plan, options);
     const antigravity = (runtime.config.allowedPlatforms || []).includes("gemini")
+      && runtime.config.antigravityStatuslineConsent === true
       ? await installAntigravityStatusline({
           paths,
           roots,
@@ -2811,7 +2849,7 @@ export async function install(options = {}) {
           settingsPath: options.antigravitySettingsPath,
           nodeExecutable: options.nodeExecutable
         })
-      : { installed: false, reason: "gemini_not_consented" };
+      : { installed: false, reason: "statusline_not_consented" };
     return {
       executed: true,
       ...result,

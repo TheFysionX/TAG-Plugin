@@ -54,7 +54,7 @@ function help() {
     usage: "tag-plugin <command> [options]",
     commands: {
       preview: "Show the exact aggregate usage fields that would be sent; no upload or state changes.",
-      pair: "Pair explicitly: pair --endpoint https://... --code SHORT_CODE; resume with pair alone or intentionally replace with --replace-pending-pair.",
+      pair: "Pair explicitly: pair --endpoint https://... --code SHORT_CODE. The optional Antigravity CLI status-line wrapper additionally requires --enable-antigravity-statusline; resume with pair alone or intentionally replace with --replace-pending-pair.",
       sync: "Collect and explicitly send new allowlisted usage records.",
       heartbeat: "Explicitly send one signed health heartbeat.",
       status: "Show local status; no network.",
@@ -90,6 +90,7 @@ async function main() {
         code: flags.code,
         deviceLabel: flags["device-label"],
         enabledFallbacks: parseProviderList(flags["allow-journal-fallbacks"]),
+        antigravityStatuslineConsent: flags["enable-antigravity-statusline"] === true ? true : undefined,
         replacePendingPair: Boolean(flags["replace-pending-pair"])
       });
       break;

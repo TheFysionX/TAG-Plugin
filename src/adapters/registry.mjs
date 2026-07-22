@@ -17,10 +17,14 @@ export function adapterStatus() {
     },
     gemini: {
       ...SUPPORTED_ADAPTERS.gemini,
-      preference: ["antigravity_sanitized_statusline_capture"],
-      active: "antigravity_sanitized_statusline_capture",
+      preference: ["antigravity_desktop_sqlite_v1", "antigravity_sanitized_statusline_capture"],
+      active: "antigravity_desktop_sqlite_v1",
       requiresExplicitOptIn: true,
-      historicalCompleteness: "none"
+      supportedDesktopVersions: ["2.3.1"],
+      historicalCompleteness: "retained_completed_metadata_only",
+      fallback: "antigravity_cli_statusline_prospective",
+      planDetection: "not_supported",
+      unknownModelOrMode: "raw_only"
     },
     kimi: {
       ...SUPPORTED_ADAPTERS.kimi,
