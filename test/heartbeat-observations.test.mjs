@@ -167,6 +167,82 @@ test("reset evidence advances only at the scheduled boundary and precedes a new 
   assert.equal(body.resetObservations, undefined);
 });
 
+test("a large same-window Codex percentage drop produces a private, retry-safe manual reset observation", async (context) => {
+  const value = await fixture();
+  context.after(() => fs.rm(value.temporary, { recursive: true, force: true }));
+  await pairedRuntime(value, ["codex"]);
+  const runtime = await loadRuntime(value.paths);
+  runtime.state.heartbeatObservationSnapshots.resetWindows["codex:codex:primary"] = {
+    resetAt: "2026-07-21T17:00:00.000Z",
+    usedPercent: 82
+  };
+  await saveRuntime(value.paths, runtime);
+  const now = Date.parse("2026-07-21T13:00:00.000Z");
+  const usage = async () => ({
+    status: "available",
+    rateLimits: { primary: { usedPercent: 42, windowMinutes: 300, resetAt: "2026-07-21T17:00:00.000Z" } }
+  });
+  let firstBody;
+  await assert.rejects(() => heartbeat({
+    home: value.home, roots: value.roots, now, readCodexAccountUsage: usage,
+    fetchImpl: async (_url, init) => { firstBody = init.body; throw new Error("offline"); }
+  }));
+  const firstPayload = JSON.parse(firstBody);
+  assert.deepEqual(firstPayload.resetObservations, [{
+    providerId: "codex",
+    surface: "codex",
+    windowKey: "primary",
+    observedAt: "2026-07-21T13:00:00.000Z",
+    resetAt: "2026-07-21T13:00:00.000Z"
+  }]);
+  assert.equal(firstBody.includes("usedPercent"), false);
+  const pending = await loadRuntime(value.paths);
+  assert.equal(pending.state.heartbeatObservationSnapshots.resetWindows["codex:codex:primary"].usedPercent, 82);
+
+  let replayed;
+  await heartbeat({
+    home: value.home, roots: value.roots, now, readCodexAccountUsage: usage,
+    fetchImpl: async (_url, init) => {
+      replayed = init.body;
+      const body = JSON.parse(init.body);
+      return response({}, {
+        plans: [],
+        resets: body.resetObservations.map(({ providerId, surface, windowKey, observedAt }) => ({ providerId, surface, windowKey, observedAt }))
+      });
+    }
+  });
+  assert.equal(replayed, firstBody);
+  const committed = await loadRuntime(value.paths);
+  assert.equal(committed.state.pendingRequest, null);
+  assert.deepEqual(committed.state.heartbeatObservationSnapshots.resetWindows["codex:codex:primary"], {
+    resetAt: "2026-07-21T17:00:00.000Z",
+    usedPercent: 42
+  });
+});
+
+test("Codex reset snapshots ignore first samples and percentage drops below the manual-reset threshold", async (context) => {
+  const value = await fixture();
+  context.after(() => fs.rm(value.temporary, { recursive: true, force: true }));
+  await pairedRuntime(value, ["codex"]);
+  const resetAt = "2026-07-21T17:00:00.000Z";
+  let first;
+  await heartbeat({
+    home: value.home, roots: value.roots, now: Date.parse("2026-07-21T13:00:00.000Z"),
+    readCodexAccountUsage: async () => ({ status: "available", rateLimits: { primary: { usedPercent: 80, windowMinutes: 300, resetAt } } }),
+    fetchImpl: async (_url, init) => { first = JSON.parse(init.body); return response({}); }
+  });
+  assert.equal(first.resetObservations, undefined);
+  let noise;
+  await heartbeat({
+    home: value.home, roots: value.roots, now: Date.parse("2026-07-21T13:05:00.000Z"),
+    readCodexAccountUsage: async () => ({ status: "available", rateLimits: { primary: { usedPercent: 59, windowMinutes: 300, resetAt } } }),
+    fetchImpl: async (_url, init) => { noise = JSON.parse(init.body); return response({}); }
+  });
+  assert.equal(noise.resetObservations, undefined);
+  const committed = await loadRuntime(value.paths);
+  assert.deepEqual(committed.state.heartbeatObservationSnapshots.resetWindows["codex:codex:primary"], { resetAt, usedPercent: 59 });
+});
+
 test("Antigravity statusLine restoration preserves user ownership and bounds stdin", async (context) => {
   const value = await fixture();
   context.after(() => fs.rm(value.temporary, { recursive: true, force: true }));

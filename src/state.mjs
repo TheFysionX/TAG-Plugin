@@ -486,7 +486,15 @@ export async function loadRuntime(paths) {
           .filter(([key, value]) => /^[a-z]+:[a-z_]+:[a-z]+$/.test(key)
             && typeof value?.resetAt === "string"
             && Number.isFinite(Date.parse(value.resetAt)))
-          .map(([key, value]) => [key, { resetAt: new Date(value.resetAt).toISOString() }]))
+          .map(([key, value]) => [key, {
+            resetAt: new Date(value.resetAt).toISOString(),
+            ...(typeof value.usedPercent === "number"
+              && Number.isFinite(value.usedPercent)
+              && value.usedPercent >= 0
+              && value.usedPercent <= 100
+              ? { usedPercent: value.usedPercent }
+              : {})
+          }]))
       : {}
   };
   config.allowedPlatforms = Array.isArray(config.allowedPlatforms) ? config.allowedPlatforms : [];

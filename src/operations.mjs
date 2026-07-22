@@ -1078,6 +1078,10 @@ const OBSERVATION_PROVIDER_SURFACES = Object.freeze({
 });
 const RESET_WINDOW_KEYS = new Set(["primary", "secondary", "session", "daily", "weekly", "api"]);
 const RESET_BOUNDARY_GRACE_MS = 5 * 60 * 1_000;
+// Provider percentages are rounded to two decimals. Require a 30-point fall
+// before treating an unchanged reset window as a manual quota reset; this is
+// intentionally far above refresh jitter or ordinary rounding noise.
+const MANUAL_RESET_MIN_PERCENTAGE_POINT_DROP = 30;
 
 function normalizedObservationTime(value) {
   if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) return null;
@@ -1107,7 +1111,13 @@ function normalizeResetCandidate(value) {
   const resetAt = normalizedObservationTime(value?.resetAt ?? value?.resetAtAfter);
   if (!isObservationSurface(providerId, surface) || !RESET_WINDOW_KEYS.has(windowKey)
     || !observedAt || !resetAt) return null;
-  return { providerId, surface, windowKey, observedAt, resetAt };
+  const usedPercent = typeof value?.usedPercent === "number"
+    && Number.isFinite(value.usedPercent)
+    && value.usedPercent >= 0
+    && value.usedPercent <= 100
+    ? value.usedPercent
+    : null;
+  return { providerId, surface, windowKey, observedAt, resetAt, usedPercent };
 }
 
 function observationProviderEnabled(runtime, providerId) {
@@ -1153,9 +1163,16 @@ async function heartbeatObservationPlan(runtime, secrets, roots, options) {
     if (planType) candidates.push({ providerId: "codex", surface: "codex", rawPlanCode: planType, observedAt });
     for (const windowKey of ["primary", "secondary"]) {
       const window = codex.rateLimits?.[windowKey];
-      // usedPercent and credit availability deliberately remain local evidence
-      // only. The reset boundary is the provider's next scheduled reset time.
-      if (window?.resetAt) resetCandidates.push({ providerId: "codex", surface: "codex", windowKey, observedAt, resetAt: window.resetAt });
+      // usedPercent is retained only in the local snapshot for reset detection;
+      // it is never copied into the heartbeat wire payload.
+      if (window?.resetAt) resetCandidates.push({
+        providerId: "codex",
+        surface: "codex",
+        windowKey,
+        observedAt,
+        resetAt: window.resetAt,
+        usedPercent: window.usedPercent
+      });
     }
   }
   if (observationProviderEnabled(runtime, "claude")) {
@@ -1204,15 +1221,30 @@ async function heartbeatObservationPlan(runtime, secrets, roots, options) {
     const prior = snapshots.resetWindows[key];
     const priorMs = Date.parse(prior?.resetAt || "");
     const nextMs = Date.parse(candidate.resetAt);
-    // A new future reset time means a quota window rolled only when we have
-    // reached (or are close enough to) the previous boundary. A percentage
-    // drop inside the same window is deliberately not evidence of a reset.
+    const priorUsedPercent = typeof prior?.usedPercent === "number" && Number.isFinite(prior.usedPercent)
+      ? prior.usedPercent
+      : null;
+    const sameWindowManualReset = Number.isFinite(priorMs)
+      && nextMs === priorMs
+      && nextMs > Date.parse(candidate.observedAt)
+      && priorUsedPercent !== null
+      && candidate.usedPercent !== null
+      && priorUsedPercent - candidate.usedPercent >= MANUAL_RESET_MIN_PERCENTAGE_POINT_DROP;
+    // A new future reset time means a scheduled quota window rolled only when
+    // we have reached (or are close enough to) the previous boundary. A
+    // same-window percentage drop is handled separately only at the strict
+    // manual-reset threshold above.
     if (Number.isFinite(priorMs) && nextMs > priorMs
       && Date.parse(candidate.observedAt) >= priorMs - RESET_BOUNDARY_GRACE_MS) {
       // The event is the boundary that just elapsed, not the provider's next
       // future reset. Keep both so the server receives the causal boundary
       // while local detection advances to the next scheduled window.
       actualResets.push([key, { ...candidate, resetAt: prior.resetAt }, candidate.resetAt]);
+    } else if (sameWindowManualReset) {
+      // The provider still reports the same valid window boundary, but the
+      // locally retained usage fell too far to be rounding noise. The current
+      // observation time is the only defensible effective reset boundary.
+      actualResets.push([key, { ...candidate, resetAt: candidate.observedAt }, candidate.resetAt]);
     } else {
       baselineResetSnapshots.push([key, candidate]);
     }
@@ -1220,11 +1252,23 @@ async function heartbeatObservationPlan(runtime, secrets, roots, options) {
   // A reset that did not fit in this heartbeat remains pending on the next
   // collection; never mark it sent merely because it exceeded the server cap.
   for (const [key, candidate, nextResetAt] of actualResets.slice(0, 4)) {
-    resetObservations.push(candidate);
-    snapshots.resetWindows[key] = { resetAt: nextResetAt };
+    resetObservations.push({
+      providerId: candidate.providerId,
+      surface: candidate.surface,
+      windowKey: candidate.windowKey,
+      observedAt: candidate.observedAt,
+      resetAt: candidate.resetAt
+    });
+    snapshots.resetWindows[key] = {
+      resetAt: nextResetAt,
+      ...(candidate.usedPercent !== null ? { usedPercent: candidate.usedPercent } : {})
+    };
   }
   for (const [key, candidate] of baselineResetSnapshots) {
-    snapshots.resetWindows[key] = { resetAt: candidate.resetAt };
+    snapshots.resetWindows[key] = {
+      resetAt: candidate.resetAt,
+      ...(candidate.usedPercent !== null ? { usedPercent: candidate.usedPercent } : {})
+    };
   }
   return {
     providerObservations,

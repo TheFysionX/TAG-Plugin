@@ -3894,7 +3894,7 @@ test("scheduler mutation is preview-only until the exact confirmation flag", asy
   assert.match(commands[0].join(" "), /SetAccessRuleProtection/);
   assert.match(commands[0].join(" "), /Current-user-only ACL verification failed/);
   assert.equal(commands[1][0], "schtasks.exe");
-  assert.match(commands[1].join(" "), /versions[\\/]0\.1\.8[\\/]src[\\/]cli\.mjs/);
+  assert.match(commands[1].join(" "), /versions[\\/]0\.1\.9[\\/]src[\\/]cli\.mjs/);
   assert.match(commands[1].join(" "), /scheduled-run --home/);
   assert.equal(await fs.access(path.join(installed.installedRelease, "package.json")).then(() => true), true);
   assert.equal(await fs.access(path.join(installed.installedRelease, "RELEASING.md")).then(() => true), true);
@@ -3932,7 +3932,7 @@ test("Windows installation fails closed before copying or scheduling when ACL ha
   }), (error) => error.code === "WINDOWS_ACL_HARDENING_FAILED");
   assert.equal(commands.length, 1);
   assert.match(commands[0][0], /powershell\.exe$/i);
-  const installedPath = path.join(fixture.home, "versions", "0.1.8");
+  const installedPath = path.join(fixture.home, "versions", "0.1.9");
   assert.equal(await fs.access(installedPath).then(() => true).catch(() => false), false);
 });
 
@@ -3965,7 +3965,7 @@ test("confirmed install and uninstall refuse to overlap another connector operat
 
   assert.deepEqual(commands, []);
   assert.equal(
-    await fs.access(path.join(fixture.home, "versions", "0.1.8")).then(() => true).catch(() => false),
+    await fs.access(path.join(fixture.home, "versions", "0.1.9")).then(() => true).catch(() => false),
     false
   );
 });

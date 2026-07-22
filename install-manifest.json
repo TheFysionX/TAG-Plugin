@@ -6,14 +6,14 @@
     "repository": "https://github.com/TheFysionX/TAG-Plugin",
     "package": "@the-artificial-games/tag-plugin"
   },
-  "connectorVersion": "0.1.8",
+  "connectorVersion": "0.1.9",
   "runtime": {
     "name": "Node.js",
     "minimumMajor": 22,
     "thirdPartyDependencies": []
   },
   "releaseArtifact": {
-    "archiveName": "tag-plugin-0.1.8.tgz",
+    "archiveName": "tag-plugin-0.1.9.tgz",
     "includesSyntheticTestSuite": true,
     "testCommand": "npm test",
     "releaseContract": "require package @the-artificial-games/tag-plugin; reject -local; require tag v<package-version>; require package, runtime constant, and manifest versions to match; require archive tag-plugin-<package-version>.tgz",
@@ -130,7 +130,7 @@
     "aggregateWatermarks": "independent Codex, Claude, and Kimi settled-through times staged per complete provider and committed only after the final sync page",
     "unresolvedModels": "unknown-model or unknown-mode usage uploads immediately as an atomic raw-only event without a local queue; modelId and serviceMode are both the unknown sentinel, attribution is raw_only, source model tokens never upload, and a one-time stable-ID backfill repairs the retired queue generation",
     "eventIdentity": "raw source IDs are account-scoped HMACs over content-independent source identity and deduplicate locally; Codex and Claude logical aggregates retain the released v4 identity domain and Kimi retains v3, binding provider, stable source-session scope, UTC hour, raw source-model token, raw mode token, and coding surface independently of parser/accounting generation and raw-versus-attributed classification; source-ID set, totals, canonical model mapping, and collector provenance are excluded from identity but changed canonical observation fields produce a new payload revision under the same event ID; raw source IDs and identity inputs do not upload as separate fields",
-    "planAndResetObservations": "a signed heartbeat may contain bounded content-free provider plan observations and actual quota-window reset observations. Codex plan/rate-window values come from official app-server account RPCs; Claude plan comes from claude auth status JSON; Antigravity values come only from the explicitly installed sanitized statusLine wrapper. A reset is emitted only when a previously observed quota-window boundary advances, never merely because a percentage changes. DeepSeek api_payg is reported only when explicit API evidence exists; a hosted DeepSeek model never creates that entitlement.",
+    "planAndResetObservations": "a signed heartbeat may contain bounded content-free provider plan observations and actual quota-window reset observations. Codex plan/rate-window values come from official app-server account RPCs; Claude plan comes from claude auth status JSON; Antigravity values come only from the explicitly installed sanitized statusLine wrapper. A scheduled reset is emitted when a previously observed quota-window boundary advances. Within the same future window, a manual reset is emitted only after a locally retained usage percentage falls by at least 30 percentage points; percentages never leave the computer. DeepSeek api_payg is reported only when explicit API evidence exists; a hosted DeepSeek model never creates that entitlement.",
     "operationLock": "random owner token, open-handle lease renewed every stale-window quarter, live-PID stale-takeover guard, atomic rename/revalidation, and ownership-checked release",
     "atomicWriteRecovery": "atomic rename is the only replacement step; Windows EEXIST or EPERM retries that same primitive five times with bounded delay, then fails closed without unlinking the prior committed JSON and removes only that operation's temp; after the 15-minute lease window, state-changing startup may remove only exact known runtime-JSON temp names under connector home, only while proving ownership of the canonical overlap lock, only when both the temp and its unchanged committed counterpart are regular files and the encoded PID is no longer live; a temp that is the sole recovery copy is preserved; root and direct sync-page scans are non-recursive and bounded",
     "pathPrivacy": "raw paths are not persisted; installation-keyed HMAC aliases are persisted locally as cursor keys",
