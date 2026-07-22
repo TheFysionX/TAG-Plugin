@@ -479,7 +479,12 @@ export async function loadRuntime(paths) {
           .filter(([key, value]) => /^[a-z]+:[a-z_]+$/.test(key)
             && typeof value?.rawPlanCode === "string"
             && /^[a-z0-9]+(?:[_-][a-z0-9]+)*$/.test(value.rawPlanCode))
-          .map(([key, value]) => [key, { rawPlanCode: value.rawPlanCode }]))
+          .map(([key, value]) => [key, {
+            rawPlanCode: value.rawPlanCode,
+            ...(typeof value.accountAlias === "string" && /^[a-f0-9]{64}$/.test(value.accountAlias)
+              ? { accountAlias: value.accountAlias }
+              : {})
+          }]))
       : {},
     resetWindows: snapshots?.resetWindows && typeof snapshots.resetWindows === "object" && !Array.isArray(snapshots.resetWindows)
       ? Object.fromEntries(Object.entries(snapshots.resetWindows)

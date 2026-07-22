@@ -11,6 +11,8 @@ import { initialConfig, initialState, loadRuntime, saveRuntime, saveSecrets } fr
 import { installAntigravityStatusline, readStdinBounded, uninstallAntigravityStatusline } from "../src/antigravity-wrapper.mjs";
 
 const dedupNamespaceKey = Buffer.alloc(32, 13).toString("base64url");
+const CLAUDE_ORG_A = "01234567-89ab-4cde-8f01-23456789abcd";
+const CLAUDE_ORG_B = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 
 async function fixture() {
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-heartbeat-observation-"));
@@ -54,19 +56,34 @@ test("Claude subscription observations require first-party claude.ai auth", asyn
   await heartbeat({
     home: value.home, roots: value.roots,
     readClaudeAccountStatus: async () => ({ status: "available", loggedIn: true, authMethod: "api_key", apiProvider: "anthropic", subscriptionType: "max" }),
-    fetchImpl: async (_url, init) => { sent = JSON.parse(init.body); return response({}); }
+    fetchImpl: async (_url, init) => {
+      sent = JSON.parse(init.body);
+      return response({}, {
+        plans: sent.providerObservations.map(({ providerId, surface, observedAt }) => ({ providerId, surface, observedAt })),
+        resets: []
+      });
+    }
   });
-  assert.equal(sent.providerObservations, undefined);
+  assert.deepEqual(sent.providerObservations, [{
+    providerId: "claude", surface: "claude_code", rawPlanCode: "unknown", observedAt: sent.providerObservations[0].observedAt
+  }]);
 
   await heartbeat({
     home: value.home, roots: value.roots,
     readClaudeAccountStatus: async () => ({ status: "available", loggedIn: true, authMethod: "claude_ai", apiProvider: "first_party", subscriptionType: "max" }),
+    fetchImpl: async (_url, init) => { sent = JSON.parse(init.body); return response({}); }
+  });
+  assert.equal(sent.providerObservations, undefined, "coarse Claude families cannot alter an entitlement");
+
+  await heartbeat({
+    home: value.home, roots: value.roots,
+    readClaudeAccountStatus: async () => ({ status: "available", loggedIn: true, authMethod: "claude_ai", apiProvider: "first_party", subscriptionType: "max", rawPlanCode: "max-20x" }),
     fetchImpl: async (_url, init) => {
       sent = JSON.parse(init.body);
       return response({}, { plans: sent.providerObservations.map(({ providerId, surface, observedAt }) => ({ providerId, surface, observedAt })), resets: [] });
     }
   });
-  assert.deepEqual(sent.providerObservations, [{ providerId: "claude", surface: "claude_code", rawPlanCode: "max", observedAt: sent.providerObservations[0].observedAt }]);
+  assert.deepEqual(sent.providerObservations, [{ providerId: "claude", surface: "claude_code", rawPlanCode: "max-20x", observedAt: sent.providerObservations[0].observedAt }]);
 
   await heartbeat({
     home: value.home, roots: value.roots,
@@ -74,6 +91,211 @@ test("Claude subscription observations require first-party claude.ai auth", asyn
     fetchImpl: async (_url, init) => { sent = JSON.parse(init.body); return response({}); }
   });
   assert.equal(sent.providerObservations, undefined, "lookalike provider labels cannot produce a subscription claim");
+});
+
+test("a successful Claude logout reconciles an unknown plan without sending account identity", async (context) => {
+  const value = await fixture();
+  context.after(() => fs.rm(value.temporary, { recursive: true, force: true }));
+  await pairedRuntime(value, ["claude"]);
+  let body;
+  await heartbeat({
+    home: value.home,
+    roots: value.roots,
+    now: Date.parse("2026-07-22T10:30:00.000Z"),
+    readClaudeAccountStatus: async () => ({ status: "available", loggedIn: false }),
+    fetchImpl: async (_url, init) => {
+      body = JSON.parse(init.body);
+      return response({}, {
+        plans: body.providerObservations.map(({ providerId, surface, observedAt }) => ({ providerId, surface, observedAt })),
+        resets: []
+      });
+    }
+  });
+  assert.deepEqual(body.providerObservations, [{
+    providerId: "claude", surface: "claude_code", rawPlanCode: "unknown", observedAt: "2026-07-22T10:30:00.000Z"
+  }]);
+  assert.equal(JSON.stringify(body).includes("organizationId"), false);
+  assert.equal(JSON.stringify(body).includes("accountAlias"), false);
+  const runtime = await loadRuntime(value.paths);
+  assert.deepEqual(runtime.state.heartbeatObservationSnapshots.plans["claude:claude_code"], { rawPlanCode: "unknown" });
+});
+
+test("an unbound legacy Claude Max snapshot is revoked when a different authenticated account lacks exact evidence", async (context) => {
+  const value = await fixture();
+  context.after(() => fs.rm(value.temporary, { recursive: true, force: true }));
+  await pairedRuntime(value, ["claude"]);
+  const legacy = await loadRuntime(value.paths);
+  legacy.state.heartbeatObservationSnapshots.plans["claude:claude_code"] = { rawPlanCode: "max-20x" };
+  await saveRuntime(value.paths, legacy);
+  let body;
+  await heartbeat({
+    home: value.home,
+    roots: value.roots,
+    now: Date.parse("2026-07-22T10:30:00.000Z"),
+    readClaudeAccountStatus: async () => ({
+      status: "available", loggedIn: true, authMethod: "claude_ai", apiProvider: "first_party",
+      subscriptionType: "pro", organizationId: CLAUDE_ORG_A
+    }),
+    fetchImpl: async (_url, init) => {
+      body = JSON.parse(init.body);
+      return response({}, {
+        plans: body.providerObservations.map(({ providerId, surface, observedAt }) => ({ providerId, surface, observedAt })),
+        resets: []
+      });
+    }
+  });
+  assert.deepEqual(body.providerObservations, [{
+    providerId: "claude", surface: "claude_code", rawPlanCode: "unknown", observedAt: "2026-07-22T10:30:00.000Z"
+  }]);
+  assert.equal(JSON.stringify(body).includes(CLAUDE_ORG_A), false);
+  assert.equal(JSON.stringify(body).includes("accountAlias"), false);
+  const runtime = await loadRuntime(value.paths);
+  assert.equal(runtime.state.heartbeatObservationSnapshots.plans["claude:claude_code"].rawPlanCode, "unknown");
+  assert.match(runtime.state.heartbeatObservationSnapshots.plans["claude:claude_code"].accountAlias, /^[a-f0-9]{64}$/);
+});
+
+test("a Claude Max entitlement is revoked when the signed-in route switches to BYOK", async (context) => {
+  const value = await fixture();
+  context.after(() => fs.rm(value.temporary, { recursive: true, force: true }));
+  await pairedRuntime(value, ["claude"]);
+  let body;
+  await heartbeat({
+    home: value.home,
+    roots: value.roots,
+    now: Date.parse("2026-07-22T10:30:00.000Z"),
+    readClaudeAccountStatus: async () => ({
+      status: "available", loggedIn: true, authMethod: "claude_ai", apiProvider: "first_party",
+      subscriptionType: "max", rawPlanCode: "max-20x", organizationId: CLAUDE_ORG_A
+    }),
+    fetchImpl: async (_url, init) => {
+      body = JSON.parse(init.body);
+      return response({}, {
+        plans: body.providerObservations.map(({ providerId, surface, observedAt }) => ({ providerId, surface, observedAt })),
+        resets: []
+      });
+    }
+  });
+  await heartbeat({
+    home: value.home,
+    roots: value.roots,
+    now: Date.parse("2026-07-22T11:30:00.000Z"),
+    readClaudeAccountStatus: async () => ({
+      status: "available", loggedIn: true, authMethod: "api_key", apiProvider: "anthropic"
+    }),
+    fetchImpl: async (_url, init) => {
+      body = JSON.parse(init.body);
+      return response({}, {
+        plans: body.providerObservations.map(({ providerId, surface, observedAt }) => ({ providerId, surface, observedAt })),
+        resets: []
+      });
+    }
+  });
+  assert.deepEqual(body.providerObservations, [{
+    providerId: "claude", surface: "claude_code", rawPlanCode: "unknown", observedAt: "2026-07-22T11:30:00.000Z"
+  }]);
+  assert.equal(JSON.stringify(body).includes(CLAUDE_ORG_A), false);
+  assert.equal(JSON.stringify(body).includes("accountAlias"), false);
+  const runtime = await loadRuntime(value.paths);
+  assert.deepEqual(runtime.state.heartbeatObservationSnapshots.plans["claude:claude_code"], { rawPlanCode: "unknown" });
+});
+
+test("Claude exact Max 20x evidence replaces the coarse account family", async (context) => {
+  const value = await fixture();
+  context.after(() => fs.rm(value.temporary, { recursive: true, force: true }));
+  await pairedRuntime(value, ["claude"]);
+  let sent;
+  await heartbeat({
+    home: value.home,
+    roots: value.roots,
+    now: Date.parse("2026-07-22T10:30:00.000Z"),
+    readClaudeAccountStatus: async () => ({
+      status: "available",
+      loggedIn: true,
+      authMethod: "claude_ai",
+      apiProvider: "first_party",
+      subscriptionType: "max",
+      rawPlanCode: "max-20x",
+      organizationId: CLAUDE_ORG_A
+    }),
+    fetchImpl: async (_url, init) => {
+      sent = JSON.parse(init.body);
+      return response({}, {
+        plans: sent.providerObservations.map(({ providerId, surface, observedAt }) => ({ providerId, surface, observedAt })),
+        resets: []
+      });
+    }
+  });
+  assert.deepEqual(sent.providerObservations, [{
+    providerId: "claude",
+    surface: "claude_code",
+    rawPlanCode: "max-20x",
+    observedAt: "2026-07-22T10:30:00.000Z"
+  }]);
+  assert.equal(JSON.stringify(sent).includes(CLAUDE_ORG_A), false);
+  assert.equal(JSON.stringify(sent).includes("accountAlias"), false);
+
+  await heartbeat({
+    home: value.home,
+    roots: value.roots,
+    now: Date.parse("2026-07-22T11:30:00.000Z"),
+    readClaudeAccountStatus: async () => ({
+      status: "available",
+      loggedIn: true,
+      authMethod: "claude_ai",
+      apiProvider: "first_party",
+      subscriptionType: "pro",
+      organizationId: CLAUDE_ORG_A
+    }),
+    fetchImpl: async (_url, init) => {
+      sent = JSON.parse(init.body);
+      return response({});
+    }
+  });
+  assert.equal(sent.providerObservations, undefined, "a temporary exact-evidence miss cannot demote Max 20x to coarse Pro");
+  const persisted = await loadRuntime(value.paths);
+  assert.equal(persisted.state.heartbeatObservationSnapshots.plans["claude:claude_code"].rawPlanCode, "max-20x");
+  assert.match(persisted.state.heartbeatObservationSnapshots.plans["claude:claude_code"].accountAlias, /^[a-f0-9]{64}$/);
+});
+
+test("a Claude organization switch revokes the prior account plan without uploading account identity", async (context) => {
+  const value = await fixture();
+  context.after(() => fs.rm(value.temporary, { recursive: true, force: true }));
+  await pairedRuntime(value, ["claude"]);
+  let body;
+  await heartbeat({
+    home: value.home,
+    roots: value.roots,
+    now: Date.parse("2026-07-22T10:30:00.000Z"),
+    readClaudeAccountStatus: async () => ({
+      status: "available", loggedIn: true, authMethod: "claude_ai", apiProvider: "first_party",
+      subscriptionType: "max", rawPlanCode: "max-20x", organizationId: CLAUDE_ORG_A
+    }),
+    fetchImpl: async (_url, init) => {
+      body = JSON.parse(init.body);
+      return response({}, { plans: body.providerObservations.map(({ providerId, surface, observedAt }) => ({ providerId, surface, observedAt })), resets: [] });
+    }
+  });
+  await heartbeat({
+    home: value.home,
+    roots: value.roots,
+    now: Date.parse("2026-07-22T11:30:00.000Z"),
+    readClaudeAccountStatus: async () => ({
+      status: "available", loggedIn: true, authMethod: "claude_ai", apiProvider: "first_party",
+      subscriptionType: "pro", organizationId: CLAUDE_ORG_B
+    }),
+    fetchImpl: async (_url, init) => {
+      body = JSON.parse(init.body);
+      return response({}, { plans: body.providerObservations.map(({ providerId, surface, observedAt }) => ({ providerId, surface, observedAt })), resets: [] });
+    }
+  });
+  assert.deepEqual(body.providerObservations, [{
+    providerId: "claude", surface: "claude_code", rawPlanCode: "unknown", observedAt: "2026-07-22T11:30:00.000Z"
+  }]);
+  assert.equal(JSON.stringify(body).includes(CLAUDE_ORG_B), false);
+  assert.equal(JSON.stringify(body).includes("accountAlias"), false);
+  const runtime = await loadRuntime(value.paths);
+  assert.equal(runtime.state.heartbeatObservationSnapshots.plans["claude:claude_code"].rawPlanCode, "unknown");
+  assert.match(runtime.state.heartbeatObservationSnapshots.plans["claude:claude_code"].accountAlias, /^[a-f0-9]{64}$/);
 });
 
 test("a hosted DeepSeek model never fabricates a DeepSeek API plan", async (context) => {
@@ -110,7 +332,7 @@ test("heartbeat observation bodies replay byte-identically and commit only after
   let firstBody;
   await assert.rejects(() => heartbeat({
     home: value.home, roots: value.roots,
-    readClaudeAccountStatus: async () => ({ status: "available", loggedIn: true, authMethod: "claude_ai", apiProvider: "anthropic", subscriptionType: "pro" }),
+    readClaudeAccountStatus: async () => ({ status: "available", loggedIn: true, authMethod: "claude_ai", apiProvider: "anthropic", subscriptionType: "max", rawPlanCode: "max-20x" }),
     fetchImpl: async (_url, init) => { firstBody = init.body; throw new Error("offline"); }
   }));
   const pending = await loadRuntime(value.paths);
@@ -127,7 +349,7 @@ test("heartbeat observation bodies replay byte-identically and commit only after
   assert.equal(replayed, firstBody);
   const committed = await loadRuntime(value.paths);
   assert.equal(committed.state.pendingRequest, null);
-  assert.equal(committed.state.heartbeatObservationSnapshots.plans["claude:claude_code"].rawPlanCode, "pro");
+  assert.equal(committed.state.heartbeatObservationSnapshots.plans["claude:claude_code"].rawPlanCode, "max-20x");
 });
 
 test("reset evidence advances only at the scheduled boundary and precedes a new usage outbox", async (context) => {

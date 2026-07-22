@@ -1,10 +1,12 @@
 import { execFile as nodeExecFile } from "node:child_process";
+import { readClaudePlanEvidence } from "./claude-plan-evidence.mjs";
 
 const AUTH_METHODS = new Set(["claude_ai", "api_key"]);
 const API_PROVIDERS = new Set(["anthropic", "bedrock", "vertex"]);
 const SUBSCRIPTION_TYPES = new Set(["free", "pro", "max", "team", "enterprise"]);
 const WINDOWS_CLAUDE_SHIMS = new Set(["claude", "claude.cmd"]);
 const WINDOWS_CLAUDE_STATUS_COMMAND = "claude.cmd auth status --json";
+const EXACT_NON_MAX_SUBSCRIPTIONS = new Set(["free", "pro", "team", "enterprise"]);
 
 function classify(value, allowed) {
   if (typeof value !== "string") return null;
@@ -18,6 +20,12 @@ function classifyApiProvider(value) {
   // unclassified.
   if (value === "firstParty") return "first_party";
   return classify(value, API_PROVIDERS);
+}
+
+function classifyOrganizationId(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return /^[a-z0-9][a-z0-9_-]{7,127}$/iu.test(normalized) ? normalized : null;
 }
 
 export function sanitizeClaudeAccountStatus(value) {
@@ -56,7 +64,7 @@ export async function readClaudeAccountStatus(options = {}) {
   if (!invocation) {
     return { status: "unavailable", reason: "unsafe_executable" };
   }
-  return new Promise((resolve) => {
+  const commandResult = await new Promise((resolve) => {
     execFileImpl(invocation.executable, invocation.arguments_, {
       windowsHide: true,
       timeout: timeoutMs,
@@ -68,13 +76,70 @@ export async function readClaudeAccountStatus(options = {}) {
         return;
       }
       try {
-        const status = sanitizeClaudeAccountStatus(JSON.parse(typeof stdout === "string" ? stdout : String(stdout || "")));
+        const parsed = JSON.parse(typeof stdout === "string" ? stdout : String(stdout || ""));
+        const status = sanitizeClaudeAccountStatus(parsed);
         resolve(status
-          ? { status: "available", verification: "provider_backed_claude_auth_status", ...status }
+          ? {
+              status: "available",
+              verification: "provider_backed_claude_auth_status",
+              ...status,
+              organizationId: classifyOrganizationId(parsed.orgId)
+            }
           : { status: "unavailable", reason: "invalid_response" });
       } catch {
         resolve({ status: "unavailable", reason: "invalid_response" });
       }
     });
   });
+  const publicCommandResult = commandResult.status === "available"
+    ? {
+        status: commandResult.status,
+        verification: commandResult.verification,
+        loggedIn: commandResult.loggedIn,
+        authMethod: commandResult.authMethod,
+        apiProvider: commandResult.apiProvider,
+        subscriptionType: commandResult.subscriptionType
+      }
+    : commandResult;
+  const withLocalAccountIdentity = (value) => options.includeLocalAccountIdentity && commandResult.organizationId
+    ? { ...value, organizationId: commandResult.organizationId }
+    : value;
+  const currentFirstPartyAccount = commandResult.status === "available"
+    && commandResult.loggedIn === true
+    && commandResult.authMethod === "claude_ai"
+    && (commandResult.apiProvider === "first_party" || commandResult.apiProvider === "anthropic")
+    && commandResult.organizationId;
+  if (!currentFirstPartyAccount) return withLocalAccountIdentity(publicCommandResult);
+  const readPlan = options.readPlanEvidence || readClaudePlanEvidence;
+  const planEvidence = await readPlan({
+    ...(options.planEvidenceOptions || {}),
+    env: options.planEvidenceOptions?.env ?? options.env,
+    platform: options.planEvidenceOptions?.platform ?? options.platform,
+    expectedOrgId: commandResult.organizationId
+  });
+  if (planEvidence?.status === "available") {
+    if (planEvidence.maxEntitled === false) {
+      if (!EXACT_NON_MAX_SUBSCRIPTIONS.has(commandResult.subscriptionType)) {
+        return withLocalAccountIdentity(publicCommandResult);
+      }
+      return withLocalAccountIdentity({
+        ...publicCommandResult,
+        verification: planEvidence.verification,
+        rawPlanCode: commandResult.subscriptionType,
+        cacheUpdatedAt: planEvidence.cacheUpdatedAt
+      });
+    }
+    return withLocalAccountIdentity({
+      status: "available",
+      verification: planEvidence.verification,
+      loggedIn: commandResult.loggedIn,
+      authMethod: commandResult.authMethod,
+      apiProvider: commandResult.apiProvider,
+      subscriptionType: planEvidence.subscriptionType,
+      rateLimitTier: planEvidence.rateLimitTier,
+      rawPlanCode: planEvidence.rawPlanCode,
+      cacheUpdatedAt: planEvidence.cacheUpdatedAt
+    });
+  }
+  return withLocalAccountIdentity(publicCommandResult);
 }

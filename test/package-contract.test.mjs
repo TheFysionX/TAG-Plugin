@@ -24,7 +24,7 @@ test("package and install manifest remain dependency-free", async () => {
   assert.equal(manifest.product.name, "TAG Plugin");
   assert.equal(manifest.product.publisher, "The Artificial Games");
   assert.equal(manifest.product.repository, "https://github.com/TheFysionX/TAG-Plugin");
-  assert.equal(manifest.releaseArtifact.archiveName, "tag-plugin-0.1.13.tgz");
+  assert.equal(manifest.releaseArtifact.archiveName, "tag-plugin-0.1.14.tgz");
   assert.match(manifest.releaseArtifact.releaseContract, /@the-artificial-games\/tag-plugin/);
   assert.equal(manifest.releaseArtifact.testCommand, "npm test");
   assert.deepEqual(
@@ -54,6 +54,10 @@ test("package and install manifest remain dependency-free", async () => {
     linuxTimer: "tag-plugin.timer"
   });
   assert.match(manifest.localState.cursorReplacementDetection, /rolling prefix digest.*allowlisted/i);
+  assert.match(manifest.localState.claudePlanEvidence, /512 candidate files.*8 MiB.*14 days.*64 MiB.*declared-decompressed.*32 MiB.*fails closed/i);
+  const claudeDesktopRead = manifest.localReads.find((entry) => entry.surface === "Claude Desktop account-bootstrap IndexedDB cache");
+  assert.equal(claudeDesktopRead?.sensitiveLocalStore, true);
+  assert.equal(claudeDesktopRead?.outboundContentFree, true);
   assert.match(manifest.permissions.windowsSecretAcl, /before pairing traffic.*before pairing commit/i);
   assert.equal(manifest.releaseArtifact.installedEntries.includes("RELEASING.md"), true);
   const onePrompt = await fs.readFile(path.join(root, "ONE_PROMPT_INSTALL.md"), "utf8");

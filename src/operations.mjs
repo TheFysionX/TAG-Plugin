@@ -22,7 +22,7 @@ import {
 import { adapterStatus } from "./adapters/registry.mjs";
 import { readClaudeAccountStatus } from "./adapters/claude-account-status.mjs";
 import { aggregatePreview, collectUsage, hasRawTokenUsage, toWireEvent } from "./collector.mjs";
-import { createDeviceSecrets, payloadHash, sha256 } from "./crypto.mjs";
+import { createDeviceSecrets, hmacAlias, payloadHash, sha256 } from "./crypto.mjs";
 import { discoverJsonlFiles } from "./discovery.mjs";
 import { ConnectorError } from "./errors.mjs";
 import { signedPost, validateEndpoint } from "./http.mjs";
@@ -1167,6 +1167,7 @@ async function heartbeatObservationPlan(runtime, secrets, roots, options) {
   const resetCandidates = [...(collection.resetObservations || [])].map(normalizeResetCandidate).filter(Boolean);
   const codex = collection.providerEvidence?.codex;
   const observedAt = new Date(options.now ?? Date.now()).toISOString();
+  const priorPlanSnapshots = runtime.state.heartbeatObservationSnapshots?.plans || {};
   if (observationProviderEnabled(runtime, "codex") && codex?.status === "available") {
     const planType = codex.account?.authSurface === "chatgpt" ? codex.account.planType : null;
     if (planType) candidates.push({ providerId: "codex", surface: "codex", rawPlanCode: planType, observedAt });
@@ -1186,15 +1187,55 @@ async function heartbeatObservationPlan(runtime, secrets, roots, options) {
   }
   if (observationProviderEnabled(runtime, "claude")) {
     const readStatus = options.readClaudeAccountStatus || readClaudeAccountStatus;
-    const claude = await readStatus(options.claudeAccountStatusOptions);
+    const claude = await readStatus({
+      ...(options.claudeAccountStatusOptions || {}),
+      includeLocalAccountIdentity: true
+    });
+    const priorClaude = priorPlanSnapshots["claude:claude_code"];
+    const accountAlias = typeof claude?.organizationId === "string" && secrets.localAliasKey
+      ? hmacAlias(secrets.localAliasKey, "claude-account", claude.organizationId)
+      : null;
     // API-key/BYOK and non-first-party routes are intentionally incapable of
     // producing a subscription claim. Claude Code currently reports its
     // signed-in service as `firstParty`; older releases used `anthropic`.
     if (claude?.status === "available" && claude.loggedIn === true
       && claude.authMethod === "claude_ai"
       && (claude.apiProvider === "first_party" || claude.apiProvider === "anthropic")
-      && claude.subscriptionType) {
-      candidates.push({ providerId: "claude", surface: "claude_code", rawPlanCode: claude.subscriptionType, observedAt });
+      && claude.rawPlanCode) {
+      candidates.push({
+        providerId: "claude",
+        surface: "claude_code",
+        // Claude's public auth status can collapse Max 20x into the coarse word
+        // `pro`. Only an account-bound exact code is durable enough to alter
+        // the server entitlement; a temporary cache miss therefore cannot
+        // demote a previously observed exact Max plan.
+        rawPlanCode: claude.rawPlanCode,
+        observedAt,
+        ...(accountAlias ? { accountAlias } : {})
+      });
+    } else if (claude?.status === "available" && claude.loggedIn === false) {
+      // A successful current auth-status response that says logged out is an
+      // explicit revocation. Unknown closes the old plan without inventing a
+      // replacement subscription.
+      candidates.push({ providerId: "claude", surface: "claude_code", rawPlanCode: "unknown", observedAt });
+    } else if (claude?.status === "available" && claude.loggedIn === true
+      && (claude.authMethod === "api_key" || claude.apiProvider === "bedrock" || claude.apiProvider === "vertex")) {
+      // A successful BYOK or third-party route is authoritative evidence that
+      // this Claude Code session is not using a claude.ai subscription.
+      candidates.push({ providerId: "claude", surface: "claude_code", rawPlanCode: "unknown", observedAt });
+    } else if (priorClaude && accountAlias
+      && priorClaude.accountAlias !== accountAlias) {
+      // The current authenticated Claude organization changed but exact plan
+      // evidence for the new account is not ready yet. A legacy snapshot with
+      // no alias is deliberately treated as unbound. Revoke the old account's
+      // entitlement immediately and retain only a local HMAC account alias.
+      candidates.push({
+        providerId: "claude",
+        surface: "claude_code",
+        rawPlanCode: "unknown",
+        observedAt,
+        accountAlias
+      });
     }
   }
   const deepseekEvidence = options.deepseekEvidence ?? collection.providerEvidence?.deepseek;
@@ -1213,13 +1254,18 @@ async function heartbeatObservationPlan(runtime, secrets, roots, options) {
   const providerObservations = [];
   const changedPlans = [];
   for (const [key, candidate] of [...plansBySurface.entries()].sort(([left], [right]) => left.localeCompare(right))) {
-    if (snapshots.plans[key]?.rawPlanCode !== candidate.rawPlanCode) {
+    if (snapshots.plans[key]?.rawPlanCode !== candidate.rawPlanCode
+      || (candidate.accountAlias && snapshots.plans[key]?.accountAlias !== candidate.accountAlias)) {
       changedPlans.push([key, candidate]);
     }
   }
   for (const [key, candidate] of changedPlans.slice(0, 4)) {
-    providerObservations.push(candidate);
-    snapshots.plans[key] = { rawPlanCode: candidate.rawPlanCode };
+    const { accountAlias: localAccountAlias, ...wireCandidate } = candidate;
+    providerObservations.push(wireCandidate);
+    snapshots.plans[key] = {
+      rawPlanCode: candidate.rawPlanCode,
+      ...(localAccountAlias ? { accountAlias: localAccountAlias } : {})
+    };
   }
   const resetsByWindow = new Map();
   for (const candidate of resetCandidates) {

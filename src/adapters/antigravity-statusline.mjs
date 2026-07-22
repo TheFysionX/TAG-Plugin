@@ -1,4 +1,3 @@
-import fs from "node:fs/promises";
 import { accountScopedEventId, hmacAlias, payloadHash } from "../crypto.mjs";
 import { canonicalModelId, providerForModelId } from "../model-registry.mjs";
 import { normalizeMode, normalizeTimestamp, normalizeUsage, readCompleteJsonLines, safeNonNegativeInteger } from "./shared.mjs";
