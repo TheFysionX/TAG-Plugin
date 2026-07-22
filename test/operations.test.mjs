@@ -20,9 +20,9 @@ import {
   chunkSyncPayloads,
   doctor,
   pair,
-  scheduledRun,
-  sync,
-  heartbeat,
+  scheduledRun as scheduledRunOperation,
+  sync as syncOperation,
+  heartbeat as heartbeatOperation,
   install,
   preview,
   status,
@@ -34,6 +34,26 @@ import { atomicWriteJson, initialConfig, initialState, loadRuntime, saveRuntime,
 const fixtureDirectory = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const connectorRoot = path.resolve(fixtureDirectory, "..", "..");
 const dedupNamespaceKey = Buffer.alloc(32, 9).toString("base64url");
+const unavailableClaudeAccountStatus = async () => ({ status: "unavailable", reason: "test_fixture" });
+
+// Keep this broad integration suite independent from whichever Claude account
+// happens to be signed in on the machine running it. Focused tests that need a
+// provider-backed observation pass their own readClaudeAccountStatus override.
+function withIsolatedClaudeStatus(options = {}) {
+  return { readClaudeAccountStatus: unavailableClaudeAccountStatus, ...options };
+}
+
+function sync(options = {}) {
+  return syncOperation(withIsolatedClaudeStatus(options));
+}
+
+function heartbeat(options = {}) {
+  return heartbeatOperation(withIsolatedClaudeStatus(options));
+}
+
+function scheduledRun(options = {}) {
+  return scheduledRunOperation(withIsolatedClaudeStatus(options));
+}
 
 test("journal collection is independent from the server retroactive scoring policy", () => {
   assert.equal(SERVER_MAX_AUTO_SCORED_RETROACTIVE_DAYS, 90);
@@ -4019,7 +4039,7 @@ test("Windows installation fails closed before copying or scheduling when ACL ha
   }), (error) => error.code === "WINDOWS_ACL_HARDENING_FAILED");
   assert.equal(commands.length, 1);
   assert.match(commands[0][0], /powershell\.exe$/i);
-  const installedPath = path.join(fixture.home, "versions", "0.1.12");
+  const installedPath = path.join(fixture.home, "versions", "0.1.13");
   assert.equal(await fs.access(installedPath).then(() => true).catch(() => false), false);
 });
 
@@ -4052,7 +4072,7 @@ test("confirmed install and uninstall refuse to overlap another connector operat
 
   assert.deepEqual(commands, []);
   assert.equal(
-    await fs.access(path.join(fixture.home, "versions", "0.1.12")).then(() => true).catch(() => false),
+    await fs.access(path.join(fixture.home, "versions", "0.1.13")).then(() => true).catch(() => false),
     false
   );
 });

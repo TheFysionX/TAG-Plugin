@@ -3,6 +3,8 @@ import { execFile as nodeExecFile } from "node:child_process";
 const AUTH_METHODS = new Set(["claude_ai", "api_key"]);
 const API_PROVIDERS = new Set(["anthropic", "bedrock", "vertex"]);
 const SUBSCRIPTION_TYPES = new Set(["free", "pro", "max", "team", "enterprise"]);
+const WINDOWS_CLAUDE_SHIMS = new Set(["claude", "claude.cmd"]);
+const WINDOWS_CLAUDE_STATUS_COMMAND = "claude.cmd auth status --json";
 
 function classify(value, allowed) {
   if (typeof value !== "string") return null;
@@ -28,12 +30,34 @@ export function sanitizeClaudeAccountStatus(value) {
   };
 }
 
+function buildClaudeInvocation(options) {
+  const executable = options.executable || process.env.CLAUDE_BINARY || "claude";
+  if ((options.platform || process.platform) !== "win32") {
+    return { executable, arguments_: ["auth", "status", "--json"] };
+  }
+
+  // npm exposes Claude Code as a .cmd shim on Windows. node:child_process
+  // cannot execute that shim through execFile directly, so invoke cmd.exe with
+  // a completely static command. Do not interpolate CLAUDE_BINARY into the
+  // shell command: only the standard shim names are accepted.
+  if (typeof executable !== "string" || !WINDOWS_CLAUDE_SHIMS.has(executable.trim().toLowerCase())) {
+    return null;
+  }
+  return {
+    executable: options.comSpec || process.env.ComSpec || "cmd.exe",
+    arguments_: ["/d", "/c", WINDOWS_CLAUDE_STATUS_COMMAND]
+  };
+}
+
 export async function readClaudeAccountStatus(options = {}) {
   const execFileImpl = options.execFileImpl || nodeExecFile;
-  const executable = options.executable || process.env.CLAUDE_BINARY || "claude";
   const timeoutMs = options.timeoutMs || 2_000;
+  const invocation = buildClaudeInvocation(options);
+  if (!invocation) {
+    return { status: "unavailable", reason: "unsafe_executable" };
+  }
   return new Promise((resolve) => {
-    execFileImpl(executable, ["auth", "status", "--json"], {
+    execFileImpl(invocation.executable, invocation.arguments_, {
       windowsHide: true,
       timeout: timeoutMs,
       maxBuffer: 64 * 1024,
