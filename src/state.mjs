@@ -8,6 +8,7 @@ import {
   CODEX_ACCOUNTING_VERSION,
   CODEX_SNAPSHOT_STATE_VERSION,
   DEFAULT_LOCK_STALE_MS,
+  HEARTBEAT_OBSERVATION_STATE_VERSION,
   KIMI_ACCOUNTING_VERSION,
   MAX_CODEX_LOGICAL_SESSIONS,
   MAX_CURSOR_FILES,
@@ -406,7 +407,7 @@ export function initialState() {
     // These are privacy-minimal observation identities, never raw provider
     // responses. They are advanced only after the signed heartbeat echoes the
     // exact submitted observations back to us.
-    heartbeatObservationSnapshots: { version: 1, plans: {}, resetWindows: {} },
+    heartbeatObservationSnapshots: { version: HEARTBEAT_OBSERVATION_STATE_VERSION, plans: {}, resetWindows: {} },
     pendingPair: null,
     syncOutbox: null,
     quarantinedEventIds: [],
@@ -535,21 +536,31 @@ export async function loadRuntime(paths) {
     ...(Object.hasOwn(configuredFallbacks, "deepseek") ? { deepseek: Boolean(configuredFallbacks.deepseek) } : {})
   };
   const snapshots = state.heartbeatObservationSnapshots;
+  const priorHeartbeatObservationVersion = Number.isInteger(snapshots?.version)
+    ? snapshots.version
+    : 1;
+  const normalizedPlanSnapshots = snapshots?.plans && typeof snapshots.plans === "object" && !Array.isArray(snapshots.plans)
+    ? Object.fromEntries(Object.entries(snapshots.plans)
+        .filter(([key, value]) => /^[a-z]+:[a-z_]+$/.test(key)
+          && typeof value?.rawPlanCode === "string"
+          && value.rawPlanCode.length <= MAX_RAW_PLAN_CODE_LENGTH
+          && RAW_PLAN_CODE_PATTERN.test(value.rawPlanCode))
+        .map(([key, value]) => [key, {
+          rawPlanCode: value.rawPlanCode,
+          ...(typeof value.accountAlias === "string" && /^[a-f0-9]{64}$/.test(value.accountAlias)
+            ? { accountAlias: value.accountAlias }
+            : {})
+        }]))
+    : {};
+  if (priorHeartbeatObservationVersion < HEARTBEAT_OBSERVATION_STATE_VERSION
+    && ["pro", "prolite"].includes(normalizedPlanSnapshots["codex:codex"]?.rawPlanCode)) {
+    // Force one automatic heartbeat after upgrading an existing installation.
+    // The raw native value did not change, but its exact server classification did.
+    delete normalizedPlanSnapshots["codex:codex"];
+  }
   state.heartbeatObservationSnapshots = {
-    version: 1,
-    plans: snapshots?.plans && typeof snapshots.plans === "object" && !Array.isArray(snapshots.plans)
-      ? Object.fromEntries(Object.entries(snapshots.plans)
-          .filter(([key, value]) => /^[a-z]+:[a-z_]+$/.test(key)
-            && typeof value?.rawPlanCode === "string"
-            && value.rawPlanCode.length <= MAX_RAW_PLAN_CODE_LENGTH
-            && RAW_PLAN_CODE_PATTERN.test(value.rawPlanCode))
-          .map(([key, value]) => [key, {
-            rawPlanCode: value.rawPlanCode,
-            ...(typeof value.accountAlias === "string" && /^[a-f0-9]{64}$/.test(value.accountAlias)
-              ? { accountAlias: value.accountAlias }
-              : {})
-          }]))
-      : {},
+    version: HEARTBEAT_OBSERVATION_STATE_VERSION,
+    plans: normalizedPlanSnapshots,
     resetWindows: snapshots?.resetWindows && typeof snapshots.resetWindows === "object" && !Array.isArray(snapshots.resetWindows)
       ? Object.fromEntries(Object.entries(snapshots.resetWindows)
           .filter(([key, value]) => /^[a-z]+:[a-z_]+:[a-z]+$/.test(key)

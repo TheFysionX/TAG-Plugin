@@ -143,7 +143,7 @@ test("Codex app-server adapter retains every current native PlanType", async () 
   }
 });
 
-test("Codex app-server preserves its explicit pro plan family without inferring a 5x or 20x variant", async () => {
+test("Codex app-server preserves the exact native pro PlanType for downstream Pro 20x mapping", async () => {
   const spawnImpl = () => {
     const child = new EventEmitter();
     child.stdin = new PassThrough();

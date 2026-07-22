@@ -9,6 +9,7 @@ import {
   CONNECTOR_VERSION,
   GENESIS_HASH,
   HEARTBEAT_EVERY_INGEST_REQUESTS,
+  HEARTBEAT_OBSERVATION_STATE_VERSION,
   HISTORY_SETTLE_MINUTES,
   INGEST_CHUNK_PACE_MS,
   JOURNAL_HISTORY_START,
@@ -1288,8 +1289,12 @@ async function heartbeatObservationPlan(runtime, secrets, roots, options) {
     && deepseekUsageEvidencePresent(deepseekEvidence)) {
     candidates.push({ providerId: "deepseek", surface: "deepseek_api", rawPlanCode: "api_payg", observedAt });
   }
-  const snapshots = structuredClone(runtime.state.heartbeatObservationSnapshots || { version: 1, plans: {}, resetWindows: {} });
-  snapshots.version = 1;
+  const snapshots = structuredClone(runtime.state.heartbeatObservationSnapshots || {
+    version: HEARTBEAT_OBSERVATION_STATE_VERSION,
+    plans: {},
+    resetWindows: {}
+  });
+  snapshots.version = HEARTBEAT_OBSERVATION_STATE_VERSION;
   snapshots.plans ||= {};
   snapshots.resetWindows ||= {};
   const plansBySurface = new Map();

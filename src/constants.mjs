@@ -1,4 +1,4 @@
-export const CONNECTOR_VERSION = "0.1.18";
+export const CONNECTOR_VERSION = "0.1.19";
 export const SCHEMA_VERSION = 1;
 export const CODEX_ACCOUNTING_VERSION = 5;
 export const CLAUDE_ACCOUNTING_VERSION = 5;
@@ -7,6 +7,9 @@ export const ANTIGRAVITY_ACCOUNTING_VERSION = 2;
 export const GROK_BUILD_ACCOUNTING_VERSION = 1;
 export const AGGREGATE_CURSOR_VERSION = 3;
 export const CODEX_SNAPSHOT_STATE_VERSION = 1;
+// v2 replays Codex `pro`/`prolite` once because those native PlanType values
+// now resolve to exact Pro 20x/5x entitlements instead of legacy placeholders.
+export const HEARTBEAT_OBSERVATION_STATE_VERSION = 2;
 export const GENESIS_HASH = "0".repeat(64);
 export const MAX_LOG_BYTES = 256 * 1024;
 export const MAX_CURSOR_FILES = 5_000;

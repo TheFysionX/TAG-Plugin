@@ -48,6 +48,60 @@ function response(body, observations = { plans: [], resets: [] }) {
   }) };
 }
 
+test("legacy Codex Pro snapshots replay the exact native PlanType automatically", async (context) => {
+  const value = await fixture();
+  context.after(() => fs.rm(value.temporary, { recursive: true, force: true }));
+  await pairedRuntime(value, ["codex"]);
+  const legacy = await loadRuntime(value.paths);
+  legacy.state.heartbeatObservationSnapshots = {
+    version: 1,
+    plans: { "codex:codex": { rawPlanCode: "pro" } },
+    resetWindows: {}
+  };
+  await saveRuntime(value.paths, legacy);
+
+  let sent;
+  const send = async (_url, init) => {
+    sent = JSON.parse(init.body);
+    return response({}, {
+      plans: (sent.providerObservations || []).map(({ providerId, surface, observedAt }) => ({ providerId, surface, observedAt })),
+      resets: []
+    });
+  };
+  await heartbeat({
+    home: value.home,
+    roots: value.roots,
+    now: Date.parse("2026-07-22T10:30:00.000Z"),
+    readCodexAccountUsage: async () => ({
+      status: "available",
+      account: { authSurface: "chatgpt", planType: "pro" }
+    }),
+    fetchImpl: send
+  });
+  assert.deepEqual(sent.providerObservations, [{
+    providerId: "codex", surface: "codex", rawPlanCode: "pro", observedAt: "2026-07-22T10:30:00.000Z"
+  }]);
+  let persisted = await loadRuntime(value.paths);
+  assert.equal(persisted.state.heartbeatObservationSnapshots.version, 2);
+  assert.deepEqual(persisted.state.heartbeatObservationSnapshots.plans["codex:codex"], { rawPlanCode: "pro" });
+
+  await heartbeat({
+    home: value.home,
+    roots: value.roots,
+    now: Date.parse("2026-07-22T11:30:00.000Z"),
+    readCodexAccountUsage: async () => ({
+      status: "available",
+      account: { authSurface: "chatgpt", planType: "prolite" }
+    }),
+    fetchImpl: send
+  });
+  assert.deepEqual(sent.providerObservations, [{
+    providerId: "codex", surface: "codex", rawPlanCode: "prolite", observedAt: "2026-07-22T11:30:00.000Z"
+  }]);
+  persisted = await loadRuntime(value.paths);
+  assert.deepEqual(persisted.state.heartbeatObservationSnapshots.plans["codex:codex"], { rawPlanCode: "prolite" });
+});
+
 test("Claude subscription observations require first-party claude.ai auth", async (context) => {
   const value = await fixture();
   context.after(() => fs.rm(value.temporary, { recursive: true, force: true }));
