@@ -23,7 +23,7 @@ export function adapterStatus() {
       supportedDesktopVersions: ["2.3.1"],
       historicalCompleteness: "retained_completed_metadata_only",
       fallback: "antigravity_cli_statusline_prospective",
-      planDetection: "not_supported",
+      planDetection: "provider_backed_local_account_status",
       unknownModelOrMode: "raw_only"
     },
     kimi: {

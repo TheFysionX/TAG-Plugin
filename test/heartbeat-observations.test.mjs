@@ -298,6 +298,106 @@ test("a Claude organization switch revokes the prior account plan without upload
   assert.match(runtime.state.heartbeatObservationSnapshots.plans["claude:claude_code"].accountAlias, /^[a-f0-9]{64}$/);
 });
 
+test("Antigravity retail plan evidence is sent once and retained across transient local failures", async (context) => {
+  const value = await fixture();
+  context.after(() => fs.rm(value.temporary, { recursive: true, force: true }));
+  await pairedRuntime(value, ["gemini"]);
+  const emptyCollection = { providerEvidence: {}, providerObservations: [], resetObservations: [] };
+  let body;
+  await heartbeat({
+    home: value.home,
+    roots: value.roots,
+    now: Date.parse("2026-07-22T10:30:00.000Z"),
+    observationCollection: emptyCollection,
+    readAntigravityPlanStatus: async () => ({
+      status: "available",
+      planObservation: {
+        providerId: "gemini",
+        serviceSurface: "antigravity",
+        rawPlanCode: "pro",
+        observedAt: "2026-07-22T10:29:59.000Z"
+      }
+    }),
+    fetchImpl: async (_url, init) => {
+      body = JSON.parse(init.body);
+      return response({}, {
+        plans: body.providerObservations.map(({ providerId, surface, observedAt }) => ({ providerId, surface, observedAt })),
+        resets: []
+      });
+    }
+  });
+  assert.deepEqual(body.providerObservations, [{
+    providerId: "gemini",
+    surface: "antigravity",
+    rawPlanCode: "pro",
+    observedAt: "2026-07-22T10:30:00.000Z"
+  }]);
+
+  await heartbeat({
+    home: value.home,
+    roots: value.roots,
+    now: Date.parse("2026-07-22T11:30:00.000Z"),
+    observationCollection: emptyCollection,
+    readAntigravityPlanStatus: async () => ({ status: "unavailable", reason: "timeout" }),
+    fetchImpl: async (_url, init) => { body = JSON.parse(init.body); return response({}); }
+  });
+  assert.equal(body.providerObservations, undefined);
+  const runtime = await loadRuntime(value.paths);
+  assert.deepEqual(runtime.state.heartbeatObservationSnapshots.plans["gemini:antigravity"], { rawPlanCode: "pro" });
+});
+
+test("an authenticated unknown Antigravity retail plan closes the prior exact claim", async (context) => {
+  const value = await fixture();
+  context.after(() => fs.rm(value.temporary, { recursive: true, force: true }));
+  await pairedRuntime(value, ["gemini"]);
+  const runtime = await loadRuntime(value.paths);
+  runtime.state.heartbeatObservationSnapshots.plans["gemini:antigravity"] = { rawPlanCode: "ultra-20x" };
+  await saveRuntime(value.paths, runtime);
+  let body;
+  await heartbeat({
+    home: value.home,
+    roots: value.roots,
+    now: Date.parse("2026-07-22T12:30:00.000Z"),
+    observationCollection: { providerEvidence: {}, providerObservations: [], resetObservations: [] },
+    readAntigravityPlanStatus: async () => ({
+      status: "available",
+      planObservation: { providerId: "gemini", serviceSurface: "antigravity", rawPlanCode: "unknown" }
+    }),
+    fetchImpl: async (_url, init) => {
+      body = JSON.parse(init.body);
+      return response({}, {
+        plans: body.providerObservations.map(({ providerId, surface, observedAt }) => ({ providerId, surface, observedAt })),
+        resets: []
+      });
+    }
+  });
+  assert.deepEqual(body.providerObservations, [{
+    providerId: "gemini",
+    surface: "antigravity",
+    rawPlanCode: "unknown",
+    observedAt: "2026-07-22T12:30:00.000Z"
+  }]);
+  const updated = await loadRuntime(value.paths);
+  assert.deepEqual(updated.state.heartbeatObservationSnapshots.plans["gemini:antigravity"], { rawPlanCode: "unknown" });
+});
+
+test("Antigravity plan detection is never probed without Gemini consent", async (context) => {
+  const value = await fixture();
+  context.after(() => fs.rm(value.temporary, { recursive: true, force: true }));
+  await pairedRuntime(value, ["codex"]);
+  let called = false;
+  let body;
+  await heartbeat({
+    home: value.home,
+    roots: value.roots,
+    observationCollection: { providerEvidence: {}, providerObservations: [], resetObservations: [] },
+    readAntigravityPlanStatus: async () => { called = true; return { status: "available" }; },
+    fetchImpl: async (_url, init) => { body = JSON.parse(init.body); return response({}); }
+  });
+  assert.equal(called, false);
+  assert.equal(body.providerObservations, undefined);
+});
+
 test("a hosted DeepSeek model never fabricates a DeepSeek API plan", async (context) => {
   const value = await fixture();
   context.after(() => fs.rm(value.temporary, { recursive: true, force: true }));

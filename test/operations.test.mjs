@@ -822,6 +822,7 @@ test("an explicitly consented Antigravity capture reaches the sync outbox", asyn
     home: fixture.home,
     roots: fixture.roots,
     officialEvidence: false,
+    readAntigravityPlanStatus: async () => ({ status: "unavailable", reason: "test_fixture" }),
     fetchImpl: async (_url, init) => {
       const body = JSON.parse(init.body);
       uploaded.push(...body.events);
@@ -873,6 +874,7 @@ test("Antigravity desktop authorization cannot read an existing statusline captu
     home: fixture.home,
     roots: fixture.roots,
     officialEvidence: false,
+    readAntigravityPlanStatus: async () => ({ status: "unavailable", reason: "test_fixture" }),
     fetchImpl: async () => { throw new Error("an unconsented statusline capture must never upload"); }
   });
 

@@ -21,6 +21,7 @@ import {
 } from "./constants.mjs";
 import { adapterStatus } from "./adapters/registry.mjs";
 import { readClaudeAccountStatus } from "./adapters/claude-account-status.mjs";
+import { readAntigravityPlanStatus } from "./adapters/antigravity-plan.mjs";
 import { aggregatePreview, collectUsage, hasRawTokenUsage, toWireEvent } from "./collector.mjs";
 import { createDeviceSecrets, hmacAlias, payloadHash, sha256 } from "./crypto.mjs";
 import { discoverJsonlFiles } from "./discovery.mjs";
@@ -1249,6 +1250,30 @@ async function heartbeatObservationPlan(runtime, secrets, roots, options) {
         accountAlias
       });
     }
+  }
+  if (observationProviderEnabled(runtime, "gemini")) {
+    const readStatus = options.readAntigravityPlanStatus || readAntigravityPlanStatus;
+    const antigravity = await readStatus({
+      ...(options.antigravityPlanStatusOptions || {}),
+      now: options.now
+    });
+    const planObservation = antigravity?.status === "available"
+      ? antigravity.planObservation
+      : null;
+    if (planObservation?.providerId === "gemini"
+      && (planObservation.serviceSurface === "antigravity" || planObservation.surface === "antigravity")
+      && planObservation.rawPlanCode) {
+      candidates.push({
+        providerId: "gemini",
+        surface: "antigravity",
+        rawPlanCode: planObservation.rawPlanCode,
+        observedAt
+      });
+    }
+    // A missing/starting/stopped local server is deliberately not a logout.
+    // The last successful provider-backed plan remains active until a later
+    // authenticated status response supplies an exact plan or explicit
+    // `unknown` code.
   }
   const deepseekEvidence = options.deepseekEvidence ?? collection.providerEvidence?.deepseek;
   if (observationProviderEnabled(runtime, "deepseek")
