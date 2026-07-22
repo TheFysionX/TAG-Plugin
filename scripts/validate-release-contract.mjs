@@ -11,6 +11,8 @@ export function validateReleaseContract({
   connectorVersion,
   manifestVersion,
   manifestArchiveName,
+  updaterProtocol,
+  runtimeStateSchema,
   tag
 }) {
   if (packageName !== RELEASE_PACKAGE_NAME) {
@@ -33,6 +35,9 @@ export function validateReleaseContract({
   if (manifestArchiveName !== expectedArchiveName) {
     throw new Error(`Release archive must exactly equal ${expectedArchiveName}.`);
   }
+  if (updaterProtocol !== 1 || runtimeStateSchema !== 1) {
+    throw new Error("Release auto-update compatibility must remain updater protocol 1 and runtime state schema 1.");
+  }
   return {
     version: packageVersion,
     tag: expectedTag,
@@ -53,6 +58,8 @@ async function main() {
     connectorVersion: CONNECTOR_VERSION,
     manifestVersion: manifest.connectorVersion,
     manifestArchiveName: manifest.releaseArtifact?.archiveName,
+    updaterProtocol: manifest.updates?.updaterProtocol,
+    runtimeStateSchema: manifest.updates?.runtimeStateSchema,
     tag: process.argv[2] || process.env.GITHUB_REF_NAME
   });
   process.stdout.write(`Validated release ${result.tag}.\n`);

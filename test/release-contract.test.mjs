@@ -14,6 +14,8 @@ test("release contract requires exact matching production versions and tag", () 
     connectorVersion: "1.2.3",
     manifestVersion: "1.2.3",
     manifestArchiveName: "tag-plugin-1.2.3.tgz",
+    updaterProtocol: 1,
+    runtimeStateSchema: 1,
     tag: "v1.2.3"
   }), {
     version: "1.2.3",
@@ -61,6 +63,16 @@ test("release contract requires exact matching production versions and tag", () 
     manifestArchiveName: "tokenboard-connector-1.2.3.tgz",
     tag: "v1.2.3"
   }), /archive/);
+  assert.throws(() => validateReleaseContract({
+    packageName: "@the-artificial-games/tag-plugin",
+    packageVersion: "1.2.3",
+    connectorVersion: "1.2.3",
+    manifestVersion: "1.2.3",
+    manifestArchiveName: "tag-plugin-1.2.3.tgz",
+    updaterProtocol: 2,
+    runtimeStateSchema: 1,
+    tag: "v1.2.3"
+  }), /auto-update compatibility/);
 });
 
 test("release workflow validates the contract before npm pack", async () => {

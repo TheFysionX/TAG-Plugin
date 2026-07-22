@@ -17,7 +17,7 @@ The connector must live in its own **public** GitHub repository with the content
    ```text
    npm run check
    npm run pack:dry-run
-   node scripts/validate-release-contract.mjs v0.1.9
+   node scripts/validate-release-contract.mjs v<version>
    ```
 
 3. Commit the exact reviewed source and push the commit to `main`.
@@ -26,8 +26,8 @@ The connector must live in its own **public** GitHub repository with the content
 6. Download the published asset and verify it independently:
 
    ```text
-   gh release download v0.1.9 -R TheFysionX/TAG-Plugin
-   gh attestation verify tag-plugin-0.1.9.tgz -R TheFysionX/TAG-Plugin
+   gh release download v<version> -R TheFysionX/TAG-Plugin
+   gh attestation verify tag-plugin-<version>.tgz -R TheFysionX/TAG-Plugin
    ```
 
    Also compute the archive SHA-256 and require it to match `SHA256SUMS`.
@@ -35,12 +35,15 @@ The connector must live in its own **public** GitHub repository with the content
 
    ```text
    CONNECTOR_REPOSITORY_URL=https://github.com/TheFysionX/TAG-Plugin
-   CONNECTOR_RELEASE_TAG=v0.1.9
+   CONNECTOR_RELEASE_TAG=v<version>
    CONNECTOR_RELEASE_COMMIT=<full 40-character tag commit SHA>
-   CONNECTOR_RELEASE_ASSET=tag-plugin-0.1.9.tgz
+   CONNECTOR_RELEASE_ASSET=tag-plugin-<version>.tgz
    CONNECTOR_RELEASE_SHA256=<64-character SHA-256 from SHA256SUMS>
    ```
 
-8. Generate one-message pairing prompts only after the deployed site reports that exact release configuration as ready.
+8. Deploy only after the site reports that exact release configuration as ready. Its heartbeat response must offer the exact repository, version/tag, full commit, asset name, SHA-256, updater protocol, and runtime-state schema; never offer a mutable branch, command, or URL controlled by arbitrary release text.
+9. Generate one-message pairing prompts only after the deployed site reports that exact release configuration as ready. The initial-install copy must explicitly disclose consent for later verified stable updates after successful signed heartbeats.
+
+The first updater-capable release needs one explicit bootstrap installation on machines still running `v0.1.9`, because that version has no updater. Once installed, the hourly launcher can move only to a newer stable release after it independently verifies the official GitHub tag/release/asset and SHA-256 plus the package contract. Do not claim that the local updater verifies GitHub artifact attestations or an offline release-envelope signature: the release workflow provides provenance, while the runtime updater currently verifies the pinned GitHub metadata, archive checksum, and package contract.
 
 If the workflow fails after creating its draft, inspect or delete only the unpublished draft and rerun from the same unchanged tag. Never replace an asset on a published release; increment the connector version and publish a new release instead.

@@ -36,6 +36,8 @@ test("the exact packed artifact contains and can run its synthetic test suite", 
   const packageDirectory = path.join(extractDirectory, "package");
   await fs.access(path.join(packageDirectory, "test", "fixtures", "codex-rollout.jsonl"));
   await fs.access(path.join(packageDirectory, ".github", "workflows", "release.yml"));
+  await fs.access(path.join(packageDirectory, "src", "launcher.mjs"));
+  await fs.access(path.join(packageDirectory, "src", "update.mjs"));
   await execFile(process.execPath, [process.env.npm_execpath, "test", "--prefix", packageDirectory], {
     cwd: packageDirectory,
     env: { ...process.env, TAG_PLUGIN_PACK_ARTIFACT_CHILD: "1" },

@@ -1,19 +1,28 @@
 {
-  "schemaVersion": 4,
+  "schemaVersion": 5,
   "product": {
     "name": "TAG Plugin",
     "publisher": "The Artificial Games",
     "repository": "https://github.com/TheFysionX/TAG-Plugin",
     "package": "@the-artificial-games/tag-plugin"
   },
-  "connectorVersion": "0.1.9",
+  "connectorVersion": "0.1.10",
   "runtime": {
     "name": "Node.js",
     "minimumMajor": 22,
     "thirdPartyDependencies": []
   },
+  "updates": {
+    "updaterProtocol": 1,
+    "runtimeStateSchema": 1,
+    "channel": "stable",
+    "trigger": "after each successfully committed signed heartbeat",
+    "trust": "The server may offer only the exact official GitHub repository, stable version, tag, full commit, asset name, and SHA-256. The plugin independently resolves the official GitHub tag and published release, downloads through a bounded GitHub redirect chain, verifies SHA-256, and validates/extracts the archive without links or traversal.",
+    "activation": "an immutable versions/<version> directory plus one atomic active-release.json switch through the stable current-user launcher",
+    "failurePolicy": "an update failure never rolls back or invalidates an already committed sync or heartbeat; the current and previous releases remain available"
+  },
   "releaseArtifact": {
-    "archiveName": "tag-plugin-0.1.9.tgz",
+    "archiveName": "tag-plugin-0.1.10.tgz",
     "includesSyntheticTestSuite": true,
     "testCommand": "npm test",
     "releaseContract": "require package @the-artificial-games/tag-plugin; reject -local; require tag v<package-version>; require package, runtime constant, and manifest versions to match; require archive tag-plugin-<package-version>.tgz",
@@ -103,6 +112,10 @@
     ".<known-runtime-json>.<pid>.<12-hex>.tmp (atomic write only; stale exact files are reclaimed under the overlap lock only when the committed counterpart remains a regular file)",
     "connector.log.jsonl",
     "connector.log.jsonl.1",
+    "active-release.json (atomic current/previous immutable release pointer)",
+    "update-state.json (privacy-safe version/result/error-code telemetry only)",
+    "launcher.mjs (stable current-user release launcher)",
+    "update.lock (ephemeral auto-update owner-token lease)",
     "antigravity-statusline-state.json (only after explicit Antigravity wrapper installation; saves prior statusLine value for restoration)",
     "<Antigravity home>/tag-plugin-statusline.jsonl (sanitized prospective capture only after explicit Antigravity wrapper installation)",
     "connector.lock (ephemeral owner-token lease during state-changing commands)",
@@ -206,12 +219,12 @@
   "scheduler": {
     "scope": "current user",
     "cadence": "hourly",
-    "command": "node <connector-home>/versions/<connector-version>/src/cli.mjs scheduled-run --home <connector-home>",
+    "command": "node <connector-home>/launcher.mjs scheduled-run --home <connector-home>",
     "elevation": false,
     "defaultAction": "dry-run",
     "applyFlag": "--confirm-install",
     "removeFlag": "--confirm-uninstall",
-    "postInstall": "send one immediate allowlisted usage sync and signed heartbeat before the first hourly trigger",
+    "postInstall": "send one immediate allowlisted usage sync and signed heartbeat before the first hourly trigger; that heartbeat also checks the pinned stable update offer",
     "identifiers": {
       "windowsTask": "TAG Plugin",
       "macOSLaunchAgent": "com.theartificialgames.tag-plugin",
@@ -224,7 +237,7 @@
   },
   "uninstall": {
     "removesScheduler": true,
-    "removesCurrentVersionedRelease": true,
+    "removesAllVersionedReleases": true,
     "removesLocalState": false,
     "antigravityStatusLine": "when TAG still owns the configured wrapper, uninstall restores the saved prior statusLine (or removes TAG's entry if none existed). A later user change is preserved; TAG only removes its private capture/state files."
   },

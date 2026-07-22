@@ -24,7 +24,7 @@ test("package and install manifest remain dependency-free", async () => {
   assert.equal(manifest.product.name, "TAG Plugin");
   assert.equal(manifest.product.publisher, "The Artificial Games");
   assert.equal(manifest.product.repository, "https://github.com/TheFysionX/TAG-Plugin");
-  assert.equal(manifest.releaseArtifact.archiveName, "tag-plugin-0.1.9.tgz");
+  assert.equal(manifest.releaseArtifact.archiveName, "tag-plugin-0.1.10.tgz");
   assert.match(manifest.releaseArtifact.releaseContract, /@the-artificial-games\/tag-plugin/);
   assert.equal(manifest.releaseArtifact.testCommand, "npm test");
   assert.deepEqual(
@@ -32,7 +32,12 @@ test("package and install manifest remain dependency-free", async () => {
     ["claude-project.jsonl", "codex-lineage-copies.json", "codex-rollout.jsonl", "kimi-wire.jsonl"]
   );
   assert.deepEqual(manifest.runtime.thirdPartyDependencies, []);
+  assert.equal(manifest.updates.updaterProtocol, 1);
+  assert.equal(manifest.updates.runtimeStateSchema, 1);
+  assert.match(manifest.updates.activation, /immutable versions.*atomic active-release\.json/is);
+  assert.match(manifest.updates.failurePolicy, /never rolls back or invalidates.*heartbeat/is);
   assert.equal(manifest.scheduler.elevation, false);
+  assert.match(manifest.scheduler.command, /launcher\.mjs scheduled-run --home/);
   assert.match(manifest.localState.syncRecovery, /3 events or 2 checkpoints/);
   assert.match(manifest.localState.syncRecovery, /1000 ingest requests.*heartbeat every 50/i);
   assert.match(manifest.localState.syncRecovery, /daily_delta.*commit marker.*generation.*digest.*delta count/i);

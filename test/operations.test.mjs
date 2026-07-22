@@ -3842,6 +3842,59 @@ test("heartbeat uses the same monotonic request chain", async (context) => {
   assert.equal(updated.state.previousRequestDigest, "digest_next_1234567890");
 });
 
+test("a failed automatic update cannot roll back a committed heartbeat", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_12345678";
+  state.nextSequence = 9;
+  state.previousRequestDigest = "digest_previous_update_test";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+  await fs.copyFile(path.join(connectorRoot, "src", "launcher.mjs"), fixture.paths.launcher);
+  const update = {
+    available: true,
+    release: {
+      repository: "https://github.com/TheFysionX/TAG-Plugin",
+      version: "0.2.0",
+      tag: "v0.2.0",
+      commit: "a".repeat(40),
+      asset: "tag-plugin-0.2.0.tgz",
+      sha256: "b".repeat(64),
+      updaterProtocol: 1,
+      runtimeStateSchema: 1
+    }
+  };
+  const result = await heartbeat({
+    home: fixture.home,
+    fetchImpl: async () => jsonResponse({
+      request: { digest: "digest_committed_before_update" },
+      heartbeat: { nextExpectedAt: "2026-07-19T13:00:00.000Z" },
+      device: { continuityState: "continuous" },
+      update
+    }),
+    updateFetchImpl: async () => { throw new Error("GitHub unavailable for test"); },
+    now: Date.parse("2026-07-19T12:00:00.000Z"),
+    nonce: "heartbeat-update-failure"
+  });
+  assert.equal(result.sent, true);
+  assert.equal(result.update.status, "failed");
+  assert.equal(result.update.code, "UPDATE_GITHUB_UNAVAILABLE");
+  const updated = await loadRuntime(fixture.paths);
+  assert.equal(updated.state.nextSequence, 10);
+  assert.equal(updated.state.previousRequestDigest, "digest_committed_before_update");
+  assert.equal(updated.state.pendingRequest, null);
+  assert.equal(await fs.access(fixture.paths.activeRelease).then(() => true).catch(() => false), false);
+  const updateState = JSON.parse(await fs.readFile(fixture.paths.updateState, "utf8"));
+  assert.equal(updateState.lastResult, "failed");
+  assert.equal(updateState.permanentFailure, false);
+});
+
 test("preview is local-only and journal reads require pairing authorization", async (context) => {
   const fixture = await setup();
   context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
@@ -3894,8 +3947,10 @@ test("scheduler mutation is preview-only until the exact confirmation flag", asy
   assert.match(commands[0].join(" "), /SetAccessRuleProtection/);
   assert.match(commands[0].join(" "), /Current-user-only ACL verification failed/);
   assert.equal(commands[1][0], "schtasks.exe");
-  assert.match(commands[1].join(" "), /versions[\\/]0\.1\.9[\\/]src[\\/]cli\.mjs/);
+  assert.match(commands[1].join(" "), /[\\/]launcher\.mjs/);
   assert.match(commands[1].join(" "), /scheduled-run --home/);
+  assert.equal(await fs.access(fixture.paths.launcher).then(() => true), true);
+  assert.equal(await fs.access(fixture.paths.activeRelease).then(() => true), true);
   assert.equal(await fs.access(path.join(installed.installedRelease, "package.json")).then(() => true), true);
   assert.equal(await fs.access(path.join(installed.installedRelease, "RELEASING.md")).then(() => true), true);
   assert.equal(await fs.access(path.join(installed.installedRelease, "test", "operations.test.mjs")).then(() => true), true);
@@ -3905,6 +3960,38 @@ test("scheduler mutation is preview-only until the exact confirmation flag", asy
   assert.equal(removed.executed, true);
   assert.equal(commands.length, 3);
   assert.equal(await fs.access(installed.installedRelease).then(() => true).catch(() => false), false);
+});
+
+test("confirmed install reuses only an identical immutable version directory", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const runtime = await loadRuntime(fixture.paths);
+  runtime.state.paired = true;
+  runtime.state.deviceId = "device_12345678";
+  runtime.config.endpoint = "https://artificial-games.example";
+  const installSecrets = createDeviceSecrets();
+  installSecrets.dedupNamespaceKey = dedupNamespaceKey;
+  await saveSecrets(fixture.paths, installSecrets);
+  await saveRuntime(fixture.paths, runtime);
+  const options = {
+    home: fixture.home,
+    platform: "linux",
+    releaseRoot: connectorRoot,
+    userHome: fixture.temporary,
+    xdgConfigHome: path.join(fixture.temporary, "config"),
+    confirmInstall: true,
+    runCommand: async () => {}
+  };
+  const first = await install(options);
+  const second = await install(options);
+  assert.equal(first.installedRelease, second.installedRelease);
+  await fs.writeFile(path.join(first.installedRelease, "README.md"), "tampered\n", "utf8");
+  await assert.rejects(
+    () => install(options),
+    (error) => error?.code === "VERSION_IDENTITY_CONFLICT"
+  );
+  await uninstall({ ...options, confirmUninstall: true });
+  assert.equal(await fs.access(path.join(fixture.home, "versions")).then(() => true).catch(() => false), false);
 });
 
 test("Windows installation fails closed before copying or scheduling when ACL hardening fails", async (context) => {
@@ -3932,7 +4019,7 @@ test("Windows installation fails closed before copying or scheduling when ACL ha
   }), (error) => error.code === "WINDOWS_ACL_HARDENING_FAILED");
   assert.equal(commands.length, 1);
   assert.match(commands[0][0], /powershell\.exe$/i);
-  const installedPath = path.join(fixture.home, "versions", "0.1.9");
+  const installedPath = path.join(fixture.home, "versions", "0.1.10");
   assert.equal(await fs.access(installedPath).then(() => true).catch(() => false), false);
 });
 
@@ -3965,7 +4052,7 @@ test("confirmed install and uninstall refuse to overlap another connector operat
 
   assert.deepEqual(commands, []);
   assert.equal(
-    await fs.access(path.join(fixture.home, "versions", "0.1.9")).then(() => true).catch(() => false),
+    await fs.access(path.join(fixture.home, "versions", "0.1.10")).then(() => true).catch(() => false),
     false
   );
 });

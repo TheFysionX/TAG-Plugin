@@ -8,6 +8,10 @@
 4. Confirm Node.js 22 or newer is already installed.
 5. Run `npm test` and `node src/cli.mjs doctor`.
 
+The confirmed installation also consents to later **stable TAG Plugin updates**. After every successfully committed signed heartbeat, the installed launcher may accept only a newer offer for the exact official GitHub repository, version tag, full commit, asset name, and SHA-256. It independently rechecks those GitHub release facts, safely validates the package contract, installs it as a new immutable version directory, and atomically switches the local launcher pointer. It does not run a mutable branch or an arbitrary server-provided command. A failed update leaves the already committed heartbeat, active release, pairing, state, and pending outbox intact.
+
+Existing `v0.1.9` installations do not contain this updater. They need one explicit, normal install of the first updater-capable release; subsequent compatible stable releases use the hourly heartbeat path above.
+
 Do not use `curl ... | sh`, PowerShell download-and-execute commands, administrator/root elevation, browser-cookie extraction, or provider API/auth credentials. The connector reuses the installed Codex command only through its official app-server RPC; it does not read Codex authentication files.
 
 ## Pair one connector
@@ -54,7 +58,7 @@ node src/cli.mjs heartbeat
 - macOS: creates one user LaunchAgent.
 - Linux: creates one `systemd --user` service and timer.
 
-The confirmed install first acquires the connector overlap lock, reclaims only stale exact runtime-JSON atomic temps that pass the lock/age/dead-PID safety checks, copies the already verified release into `<connector-home>/versions/<connector-version>`, and makes the scheduler target that stable copy. Every scheduler command includes `--home <connector-home>`, including when a custom home was supplied. On Windows, a local non-interactive PowerShell ACL operation disables inheritance, replaces all access rules with one full-control grant for the resolved current user, and verifies the resulting SID/rule before continuing; installation stops before copying or scheduling if that operation fails.
+The confirmed install first acquires the connector overlap lock, reclaims only stale exact runtime-JSON atomic temps that pass the lock/age/dead-PID safety checks, copies the already verified release into `<connector-home>/versions/<connector-version>`, writes the stable `launcher.mjs` and atomic `active-release.json` pointer, and makes the scheduler target that launcher. Later verified updates use a separate update lock/state and do not overwrite an existing version directory. Every scheduler command includes `--home <connector-home>`, including when a custom home was supplied. On Windows, a local non-interactive PowerShell ACL operation disables inheritance, replaces all access rules with one full-control grant for the resolved current user, and verifies the resulting SID/rule before continuing; installation stops before copying or scheduling if that operation fails.
 
 The immediate sync uploads the available allowlisted usage records, and the heartbeat establishes continuity without waiting for the first hourly trigger. No platform path uses an administrator, root, SYSTEM account, highest-run-level flag, or system-wide service directory.
 
@@ -67,4 +71,4 @@ node src/cli.mjs uninstall --dry-run
 node src/cli.mjs uninstall --confirm-uninstall
 ```
 
-Uninstall removes the scheduler registration and the current versioned release copy. If TAG still owns an installed Antigravity wrapper, it restores the saved prior `statusLine`; a newer user-owned value is preserved. It deliberately preserves normal local state, pending recovery journals, and the device key so an accidental uninstall can be recovered. Revoke the device from your account with The Artificial Games before deleting preserved state. There is no implicit local-state deletion command.
+Uninstall removes the scheduler registration, stable launcher/pointer, and all TAG Plugin versioned release copies. If TAG still owns an installed Antigravity wrapper, it restores the saved prior `statusLine`; a newer user-owned value is preserved. It deliberately preserves normal local state, update state, pending recovery journals, and the device key so an accidental uninstall can be recovered. Revoke the device from your account with The Artificial Games before deleting preserved state. There is no implicit local-state deletion command.

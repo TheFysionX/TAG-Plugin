@@ -34,6 +34,15 @@ import { applyScheduler, removeScheduler, schedulerPlan } from "./scheduler.mjs"
 import { hardenWindowsConnectorHome, hardenWindowsSecrets } from "./windows-security.mjs";
 import { installAntigravityStatusline, uninstallAntigravityStatusline } from "./antigravity-wrapper.mjs";
 import {
+  activateRelease,
+  fetchAndInstallUpdate,
+  installStableLauncher,
+  readUpdateState,
+  updateOfferDigest,
+  validateUpdateOffer,
+  writeUpdateState
+} from "./update.mjs";
+import {
   atomicWriteJson,
   cleanupStaleAtomicWriteTemps,
   ensureRuntimeDirectory,
@@ -1467,6 +1476,7 @@ async function sendHeartbeatRequest(runtime, secrets, paths, options) {
     sequence,
     nextExpectedAt: response?.heartbeat?.nextExpectedAt || null,
     continuityState: response?.device?.continuityState || null,
+    updateOffer: response?.update || null,
     ...(options.hydrateCodexSnapshot === true
       ? { codexSnapshotHydrated: true }
       : {})
@@ -2301,7 +2311,103 @@ export async function sync(options = {}) {
   });
 }
 
-export async function heartbeat(options = {}) {
+async function applyAutomaticUpdate(value, options = {}) {
+  const { paths, roots } = runtimeOptions(options);
+  const release = validateUpdateOffer(value, CONNECTOR_VERSION);
+  if (!release) {
+    if (value?.available === true) {
+      await safeLog(paths.log, { action: "update", status: "rejected", code: "UPDATE_OFFER_INVALID" });
+      return { checked: true, status: "rejected", code: "UPDATE_OFFER_INVALID" };
+    }
+    return {
+      checked: true,
+      status: "current",
+      installed: false,
+      latestVersion: typeof value?.latestVersion === "string" ? value.latestVersion : null
+    };
+  }
+  const digest = updateOfferDigest(release);
+  await ensureRuntimeDirectory(paths);
+  try {
+    return await withLock(paths.lock, async () => withLock(paths.updateLock, async () => {
+      const prior = await readUpdateState(paths);
+      if (prior.permanentFailure === true && prior.lastOfferDigest === digest) {
+        return {
+          checked: true,
+          status: "blocked",
+          installed: false,
+          version: release.version,
+          code: prior.safeErrorCode || "UPDATE_PREVIOUSLY_REJECTED"
+        };
+      }
+      try {
+        const launcherStat = await fs.lstat(paths.launcher);
+        if (!launcherStat.isFile() || launcherStat.isSymbolicLink()) {
+          throw new ConnectorError("UPDATE_LAUNCHER_INVALID", "The stable TAG Plugin launcher is unavailable.");
+        }
+        const runtime = await loadRuntime(paths);
+        const installed = await fetchAndInstallUpdate(paths, release, options);
+        await activateRelease(paths, release, installed.receipt);
+        let antigravity = { installed: false, reason: "gemini_not_consented" };
+        if ((runtime.config.allowedPlatforms || []).includes("gemini")) {
+          try {
+            antigravity = await installAntigravityStatusline({
+              paths,
+              roots,
+              wrapperPath: path.join(installed.destination, "src", "antigravity-wrapper.mjs"),
+              settingsPath: options.antigravitySettingsPath,
+              nodeExecutable: options.nodeExecutable
+            });
+          } catch {
+            antigravity = { installed: false, reason: "wrapper_refresh_failed" };
+          }
+        }
+        await writeUpdateState(paths, {
+          installedVersion: release.version,
+          lastOfferDigest: digest,
+          lastCheckedAt: new Date().toISOString(),
+          lastResult: installed.reused ? "verified_existing" : "installed",
+          safeErrorCode: null,
+          permanentFailure: false
+        });
+        await safeLog(paths.log, {
+          action: "update",
+          status: installed.reused ? "verified_existing" : "installed"
+        });
+        return {
+          checked: true,
+          status: installed.reused ? "verified_existing" : "installed",
+          installed: true,
+          version: release.version,
+          antigravity
+        };
+      } catch (error) {
+        const code = error instanceof ConnectorError ? error.code : "UPDATE_UNEXPECTED_FAILURE";
+        const permanentFailure = !(error instanceof ConnectorError) || !error.retryable;
+        try {
+          await writeUpdateState(paths, {
+            installedVersion: prior.installedVersion || CONNECTOR_VERSION,
+            lastOfferDigest: digest,
+            lastCheckedAt: new Date().toISOString(),
+            lastResult: "failed",
+            safeErrorCode: code,
+            permanentFailure
+          });
+        } catch {
+          // Update telemetry must never turn an already-committed heartbeat into a failure.
+        }
+        await safeLog(paths.log, { action: "update", status: "failed", code });
+        return { checked: true, status: "failed", installed: false, version: release.version, code };
+      }
+    }));
+  } catch (error) {
+    const code = error instanceof ConnectorError ? error.code : "UPDATE_UNEXPECTED_FAILURE";
+    await safeLog(paths.log, { action: "update", status: "deferred", code }).catch(() => {});
+    return { checked: true, status: "deferred", installed: false, version: release.version, code };
+  }
+}
+
+async function heartbeatCore(options = {}) {
   const { paths, roots } = runtimeOptions(options);
   await ensureRuntimeDirectory(paths);
   return withLock(paths.lock, async (lease) => {
@@ -2317,11 +2423,19 @@ export async function heartbeat(options = {}) {
         sent: true,
         sequence: recovered.pending.sequence,
         nextExpectedAt: recovered.response?.heartbeat?.nextExpectedAt || null,
-        continuityState: recovered.response?.device?.continuityState || null
+        continuityState: recovered.response?.device?.continuityState || null,
+        updateOffer: recovered.response?.update || null
       };
     }
     return sendHeartbeatRequest(runtime, secrets, paths, { ...options, roots });
   });
+}
+
+export async function heartbeat(options = {}) {
+  const result = await heartbeatCore(options);
+  if (options.skipAutomaticUpdate === true) return result;
+  const update = await applyAutomaticUpdate(result.updateOffer, options);
+  return { ...result, update };
 }
 
 export async function scheduledRun(options = {}) {
@@ -2351,7 +2465,10 @@ export async function scheduledRun(options = {}) {
 
 export async function status(options = {}) {
   const { paths } = runtimeOptions(options);
-  const { state, config } = await loadRuntime(paths);
+  const [{ state, config }, updateState] = await Promise.all([
+    loadRuntime(paths),
+    readUpdateState(paths)
+  ]);
   const quarantinedEventIds = new Set([
     ...(Array.isArray(state.quarantinedEventIds) ? state.quarantinedEventIds : []),
     ...(Array.isArray(state.syncOutbox?.quarantinedEventIds)
@@ -2389,7 +2506,13 @@ export async function status(options = {}) {
     allowedPlatforms: config.allowedPlatforms || [],
     supportedProviders: config.supportedProviders || [],
     transcriptFallbacks: config.transcriptFallbacks,
-    adapters: adapterStatus()
+    adapters: adapterStatus(),
+    updates: {
+      installedVersion: updateState.installedVersion,
+      lastCheckedAt: updateState.lastCheckedAt,
+      lastResult: updateState.lastResult,
+      safeErrorCode: updateState.safeErrorCode
+    }
   };
 }
 
@@ -2476,7 +2599,6 @@ export function installDryRun(options = {}) {
   const runningCliPath = options.cliPath || fileURLToPath(new URL("./cli.mjs", import.meta.url));
   const releaseRoot = path.resolve(options.releaseRoot || path.join(path.dirname(runningCliPath), ".."));
   const installDirectory = path.join(paths.home, "versions", CONNECTOR_VERSION);
-  const installedCliPath = path.join(installDirectory, "src", "cli.mjs");
   return {
     executed: false,
     releaseCopy: {
@@ -2487,9 +2609,12 @@ export function installDryRun(options = {}) {
     plan: schedulerPlan({
       platform: options.platform,
       nodeExecutable: options.nodeExecutable,
-      cliPath: installedCliPath,
+      cliPath: paths.launcher,
       home: paths.home,
-      env: options.env
+      env: options.env,
+      userHome: options.userHome,
+      xdgConfigHome: options.xdgConfigHome,
+      uid: options.uid
     })
   };
 }
@@ -2500,14 +2625,18 @@ export function uninstallDryRun(options = {}) {
   const plan = schedulerPlan({
     platform: options.platform,
     nodeExecutable: options.nodeExecutable,
-    cliPath: path.join(installDirectory, "src", "cli.mjs"),
+    cliPath: paths.launcher,
     home: paths.home,
-    env: options.env
+    env: options.env,
+    userHome: options.userHome,
+    xdgConfigHome: options.xdgConfigHome,
+    uid: options.uid
   });
   return {
     executed: false,
     removesScheduler: plan.remove,
     removesInstalledRelease: installDirectory,
+    removesInstalledReleases: path.join(paths.home, "versions"),
     removesLocalState: false,
     localStateRequiresSeparateExplicitApproval: true
   };
@@ -2545,7 +2674,6 @@ async function copyVerifiedRelease(source, destination) {
   }
   const parent = path.dirname(destination);
   const staging = path.join(parent, ".staging-" + CONNECTOR_VERSION + "-" + randomBytes(6).toString("hex"));
-  const backup = destination + ".previous";
   await fs.mkdir(parent, { recursive: true, mode: 0o700 });
   await fs.mkdir(staging, { recursive: false, mode: 0o700 });
   try {
@@ -2556,20 +2684,49 @@ async function copyVerifiedRelease(source, destination) {
         force: false
       });
     }
-    await fs.rm(backup, { recursive: true, force: true });
-    const destinationExists = await fs.access(destination).then(() => true).catch(() => false);
-    if (destinationExists) await fs.rename(destination, backup);
-    try {
-      await fs.rename(staging, destination);
-    } catch (error) {
-      if (destinationExists) await fs.rename(backup, destination);
-      throw error;
+    const destinationStat = await fs.lstat(destination).catch((error) => error?.code === "ENOENT" ? null : Promise.reject(error));
+    if (destinationStat) {
+      if (!destinationStat.isDirectory() || destinationStat.isSymbolicLink()) {
+        throw new ConnectorError("VERSION_IDENTITY_CONFLICT", "The installed TAG Plugin version has another identity.");
+      }
+      const releaseTreeIdentity = async (root) => {
+        const identity = [];
+        const visit = async (relative) => {
+          const absolute = path.join(root, relative);
+          const stat = await fs.lstat(absolute);
+          if (stat.isSymbolicLink()) {
+            throw new ConnectorError("VERSION_IDENTITY_CONFLICT", "The installed TAG Plugin version contains a symbolic link.");
+          }
+          if (stat.isDirectory()) {
+            identity.push([relative.split(path.sep).join("/"), "directory"]);
+            const children = (await fs.readdir(absolute)).sort((left, right) => left.localeCompare(right));
+            for (const child of children) await visit(path.join(relative, child));
+            return;
+          }
+          if (!stat.isFile()) {
+            throw new ConnectorError("VERSION_IDENTITY_CONFLICT", "The installed TAG Plugin version contains an unsupported entry.");
+          }
+          identity.push([relative.split(path.sep).join("/"), sha256(await fs.readFile(absolute))]);
+        };
+        for (const entry of RELEASE_COPY_ENTRIES) await visit(entry);
+        return sha256(JSON.stringify(identity));
+      };
+      const [stagedIdentity, installedIdentity] = await Promise.all([
+        releaseTreeIdentity(staging),
+        releaseTreeIdentity(destination)
+      ]);
+      if (stagedIdentity !== installedIdentity) {
+        throw new ConnectorError("VERSION_IDENTITY_CONFLICT", "The installed TAG Plugin version has another identity.");
+      }
+      await fs.rm(staging, { recursive: true, force: true });
+      return destination;
     }
-    await fs.rm(backup, { recursive: true, force: true });
+    await fs.rename(staging, destination);
   } catch (error) {
     await fs.rm(staging, { recursive: true, force: true });
     throw error;
   }
+  await fs.rm(staging, { recursive: true, force: true });
   return destination;
 }
 
@@ -2592,6 +2749,11 @@ export async function install(options = {}) {
       previewResult.releaseCopy.source,
       previewResult.releaseCopy.destination
     );
+    const launcher = await installStableLauncher(
+      paths,
+      path.join(previewResult.releaseCopy.destination, "src", "launcher.mjs")
+    );
+    const activeRelease = await activateRelease(paths, { version: CONNECTOR_VERSION });
     const result = await applyScheduler(previewResult.plan, options);
     const antigravity = (runtime.config.allowedPlatforms || []).includes("gemini")
       ? await installAntigravityStatusline({
@@ -2606,6 +2768,8 @@ export async function install(options = {}) {
       executed: true,
       ...result,
       installedRelease: previewResult.releaseCopy.destination,
+      launcher,
+      activeRelease,
       antigravity,
       plan: previewResult.plan
     };
@@ -2624,9 +2788,12 @@ export async function uninstall(options = {}) {
     const plan = schedulerPlan({
       platform: options.platform,
       nodeExecutable: options.nodeExecutable,
-      cliPath: path.join(paths.home, "versions", CONNECTOR_VERSION, "src", "cli.mjs"),
+      cliPath: paths.launcher,
       home: paths.home,
-      env: options.env
+      env: options.env,
+      userHome: options.userHome,
+      xdgConfigHome: options.xdgConfigHome,
+      uid: options.uid
     });
     const antigravity = await uninstallAntigravityStatusline({
       paths,
@@ -2634,9 +2801,11 @@ export async function uninstall(options = {}) {
       statePath: options.antigravityStatuslineStatePath
     });
     const result = await removeScheduler(plan, options);
-    const installedRelease = path.join(paths.home, "versions", CONNECTOR_VERSION);
-    assertInstallTarget(paths.home, installedRelease);
-    await fs.rm(installedRelease, { recursive: true, force: true });
+    const installedReleases = path.join(paths.home, "versions");
+    assertInstallTarget(paths.home, installedReleases);
+    await fs.rm(installedReleases, { recursive: true, force: true });
+    await fs.rm(paths.launcher, { force: true });
+    await fs.rm(paths.activeRelease, { force: true });
     return {
       executed: true,
       ...result,

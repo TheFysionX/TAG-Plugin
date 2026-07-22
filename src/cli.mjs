@@ -62,7 +62,7 @@ function help() {
       install: "Preview by default; apply only with install --confirm-install.",
       pause: "Pause scheduled collection locally.",
       resume: "Resume scheduled collection locally.",
-      uninstall: "Preview by default; remove the scheduler and current versioned program copy only with uninstall --confirm-uninstall. Local state is preserved."
+      uninstall: "Preview by default; remove the scheduler and all TAG Plugin versioned program copies only with uninstall --confirm-uninstall. Local state is preserved."
     }
   };
 }

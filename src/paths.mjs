@@ -25,7 +25,11 @@ export function runtimePaths(options = {}) {
     pendingSecrets: path.join(home, "pending-device-secrets.json"),
     syncPages: path.join(home, "sync-pages"),
     log: path.join(home, "connector.log.jsonl"),
-    lock: path.join(home, "connector.lock")
+    lock: path.join(home, "connector.lock"),
+    updateLock: path.join(home, "update.lock"),
+    updateState: path.join(home, "update-state.json"),
+    activeRelease: path.join(home, "active-release.json"),
+    launcher: path.join(home, "launcher.mjs")
   };
 }
 
