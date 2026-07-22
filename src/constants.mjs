@@ -1,8 +1,10 @@
-export const CONNECTOR_VERSION = "0.1.7";
+export const CONNECTOR_VERSION = "0.1.8";
 export const SCHEMA_VERSION = 1;
 export const CODEX_ACCOUNTING_VERSION = 5;
 export const CLAUDE_ACCOUNTING_VERSION = 5;
 export const KIMI_ACCOUNTING_VERSION = 2;
+export const ANTIGRAVITY_ACCOUNTING_VERSION = 1;
+export const GROK_BUILD_ACCOUNTING_VERSION = 1;
 export const AGGREGATE_CURSOR_VERSION = 3;
 export const CODEX_SNAPSHOT_STATE_VERSION = 1;
 export const GENESIS_HASH = "0".repeat(64);
@@ -38,15 +40,15 @@ export const SUPPORTED_ADAPTERS = Object.freeze({
     evidence: "Claude Code project JSONL assistant usage records"
   },
   gemini: {
-    status: "pending_verified_adapter",
-    evidence: null
+    status: "prospective_partial",
+    evidence: "Antigravity CLI sanitized status-line captures; no historical backfill"
   },
   kimi: {
     status: "supported",
     evidence: "Kimi Code v0.28 wire usage.record journal entries"
   },
   grok: {
-    status: "pending_verified_adapter",
-    evidence: null
+    status: "prospective_partial",
+    evidence: "Grok Build local session summaries only; no consumer Grok or billable-token reconstruction"
   }
 });

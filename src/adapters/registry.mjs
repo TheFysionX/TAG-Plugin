@@ -17,8 +17,10 @@ export function adapterStatus() {
     },
     gemini: {
       ...SUPPORTED_ADAPTERS.gemini,
-      preference: ["official_otel_usage_when_schema_verified"],
-      active: null
+      preference: ["antigravity_sanitized_statusline_capture"],
+      active: "antigravity_sanitized_statusline_capture",
+      requiresExplicitOptIn: true,
+      historicalCompleteness: "none"
     },
     kimi: {
       ...SUPPORTED_ADAPTERS.kimi,
@@ -28,8 +30,11 @@ export function adapterStatus() {
     },
     grok: {
       ...SUPPORTED_ADAPTERS.grok,
-      preference: ["provider_backed_usage_when_available"],
-      active: null
+      preference: ["grok_build_local_session_summary"],
+      active: "grok_build_local_session_summary",
+      requiresExplicitOptIn: true,
+      historicalCompleteness: "none",
+      accounting: "informational_only"
     }
   };
 }

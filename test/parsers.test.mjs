@@ -7,8 +7,8 @@ import { fileURLToPath } from "node:url";
 import { parseCodexRollout } from "../src/adapters/codex-rollout.mjs";
 import { parseClaudeProject } from "../src/adapters/claude-project.mjs";
 import { parseKimiWire } from "../src/adapters/kimi-wire.mjs";
-import { MAX_JOURNAL_LINE_BYTES, normalizeMode } from "../src/adapters/shared.mjs";
-import { canonicalModelId as resolveCanonicalModel } from "../src/model-registry.mjs";
+import { MAX_JOURNAL_LINE_BYTES, normalizeMode, normalizeUsage } from "../src/adapters/shared.mjs";
+import { canonicalModelId as resolveCanonicalModel, providerForModelId } from "../src/model-registry.mjs";
 import { collectUsage, hasRawTokenUsage, toWireEvent } from "../src/collector.mjs";
 
 const fixtureDirectory = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
@@ -74,6 +74,63 @@ test("zero-token source observations never become ledger events", () => {
     cacheWriteInputTokens: "0",
     outputTokens: "0",
   }), true);
+});
+
+test("reported/component disagreements stay raw-only and never resize model usage", () => {
+  const usage = normalizeUsage({ input_tokens: 10, output_tokens: 5, total_tokens: 99 }, "claude");
+  assert.equal(usage.total, 15);
+  assert.equal(usage.reportedTotal, 99);
+  assert.equal(usage.componentConflict, true);
+  const wire = toWireEvent({
+    eventId: "component-conflict-event",
+    provider: "claude",
+    modelId: "claude-sonnet-5",
+    observedAt: "2026-07-19T10:00:00.000Z",
+    mode: { fast: false, classified: true },
+    usage,
+    provenance: { surface: "claude_code" },
+  });
+  assert.deepEqual({
+    attribution: wire.attribution,
+    modelId: wire.modelId,
+    serviceMode: wire.serviceMode,
+    inputTokens: wire.inputTokens,
+    cachedInputTokens: wire.cachedInputTokens,
+    outputTokens: wire.outputTokens,
+  }, {
+    attribution: "raw_only",
+    modelId: "unknown",
+    serviceMode: "unknown",
+    inputTokens: "99",
+    cachedInputTokens: "0",
+    outputTokens: "0",
+  });
+});
+
+test("host journals attribute known models to their actual providers", async (context) => {
+  assert.equal(providerForModelId("deepseek-v4-pro"), "deepseek");
+  assert.equal(resolveCanonicalModel("claude", "deepseek-v4-pro"), "deepseek-v4-pro");
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-hosted-provider-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const projectPath = path.join(temporary, "hosted-deepseek.jsonl");
+  await fs.writeFile(projectPath, JSON.stringify({
+    type: "assistant",
+    timestamp: "2026-07-19T10:00:00.000Z",
+    message: {
+      id: "msg_hosted_deepseek_0001",
+      model: "deepseek-v4-pro",
+      stop_reason: "end_turn",
+      usage: { input_tokens: 10, output_tokens: 5, speed: "standard" }
+    }
+  }) + "\n", "utf8");
+  const parsed = await parseClaudeProject(projectPath, { dedupNamespaceKey });
+  assert.equal(parsed.events[0].provider, "deepseek");
+  assert.equal(parsed.events[0].serviceProviderId, "claude");
+  assert.equal(parsed.events[0].modelId, "deepseek-v4-pro");
+  assert.equal(parsed.events[0].provenance.surface, "claude_code");
+  const wire = toWireEvent(parsed.events[0]);
+  assert.equal(wire.provider, "deepseek");
+  assert.equal(wire.serviceProviderId, "claude");
 });
 
 test("Codex treats both fast and priority service tiers as classified Fast", async (context) => {
@@ -603,7 +660,10 @@ test("Codex cursor resets after an in-place larger rewrite preserves file metada
   });
   assert.equal(second.cursor.fileIdentity, first.cursor.fileIdentity);
   assert.equal(second.events.length, 1);
-  assert.equal(second.events[0].usage.total, 270);
+  assert.equal(second.events[0].usage.total, 135);
+  assert.equal(second.events[0].usage.reportedTotal, 270);
+  assert.equal(second.events[0].usage.componentConflict, true);
+  assert.equal(toWireEvent(second.events[0]).attribution, "raw_only");
   assert.notEqual(second.events[0].eventId, first.events[0].eventId);
   assert.notEqual(second.cursor.usagePrefixDigest, first.cursor.usagePrefixDigest);
 });

@@ -42,7 +42,7 @@ function parseProviderList(value) {
   if (typeof value !== "string") throw new Error("--allow-journal-fallbacks requires a comma-separated provider list.");
   const result = {};
   for (const provider of value.split(",").map((item) => item.trim().toLowerCase())) {
-    if (["codex", "claude", "kimi"].includes(provider)) {
+    if (["codex", "claude", "kimi", "gemini", "grok", "deepseek"].includes(provider)) {
       result[provider] = true;
     }
   }

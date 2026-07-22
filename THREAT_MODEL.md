@@ -40,6 +40,9 @@
 | Inflated journal totals | Provider-backed aggregate checkpoints and server anomaly rules | Some inconsistencies can be flagged. |
 | Stale/offline connector | Signed heartbeat cadence | Gaps become visible. |
 | Cumulative usage mismatch/reset | Codex per-file cumulative validation, persisted logical-session reset epoch, reset high-watermark, and `degraded` heartbeat | Duplicate snapshots are ignored, valid post-reset usage gets a distinct stable identity, and suspicious discontinuity remains visible. |
+| False quota-reset exception | Persisted provider/surface/window boundary plus a signed reset observation only after that boundary advances | A percentage decrease alone cannot waive volume checks; a real observed window transition can be reviewed separately from journal accounting. |
+| Provider-plan inflation | Capability-scoped plan observations: Codex app-server, Claude auth status, consented Antigravity status line, or explicit DeepSeek API evidence | A hosted model name, journal record, or local Grok summary cannot fabricate an entitlement. |
+| Antigravity status-line disruption | Explicit consent, saved prior command, bounded sanitizer, forwarding wrapper, ownership-aware restore | TAG changes `statusLine` only for a chosen Antigravity connection and restores it unless the user has since changed it. |
 | Privilege escalation | Stable user-only scheduler, no elevation path, Windows pending/final secret ACL fail-closed | Pairing traffic and installation do not proceed with an unhardened Windows secret. |
 
 ## What it cannot prove

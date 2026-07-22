@@ -6,14 +6,14 @@
     "repository": "https://github.com/TheFysionX/TAG-Plugin",
     "package": "@the-artificial-games/tag-plugin"
   },
-  "connectorVersion": "0.1.7",
+  "connectorVersion": "0.1.8",
   "runtime": {
     "name": "Node.js",
     "minimumMajor": 22,
     "thirdPartyDependencies": []
   },
   "releaseArtifact": {
-    "archiveName": "tag-plugin-0.1.7.tgz",
+    "archiveName": "tag-plugin-0.1.8.tgz",
     "includesSyntheticTestSuite": true,
     "testCommand": "npm test",
     "releaseContract": "require package @the-artificial-games/tag-plugin; reject -local; require tag v<package-version>; require package, runtime constant, and manifest versions to match; require archive tag-plugin-<package-version>.tgz",
@@ -44,6 +44,20 @@
     },
     {
       "provider": "codex",
+      "surface": "codex app-server account/read and account/rateLimits/read",
+      "contentFree": true,
+      "default": true,
+      "purpose": "plan and rate-window observations only"
+    },
+    {
+      "provider": "claude",
+      "surface": "claude auth status --json",
+      "contentFree": true,
+      "default": true,
+      "purpose": "first-party subscription-plan observation only"
+    },
+    {
+      "provider": "codex",
       "surface": "~/.codex/sessions/**/*.jsonl",
       "sensitiveJournal": true,
       "default": false,
@@ -63,6 +77,22 @@
       "sensitiveJournal": true,
       "default": false,
       "requiresExplicitOptIn": true
+    },
+    {
+      "provider": "gemini",
+      "surface": "Antigravity CLI statusLine JSON through TAG's consented wrapper",
+      "contentFree": true,
+      "default": false,
+      "requiresExplicitOptIn": true,
+      "purpose": "prospective usage, plan, and quota-window observations; no historical backfill"
+    },
+    {
+      "provider": "grok",
+      "surface": "Grok Build local session summaries",
+      "contentFree": true,
+      "default": false,
+      "requiresExplicitOptIn": true,
+      "purpose": "local activity diagnostics only; never token accounting or an uploaded usage event"
     }
   ],
   "localWrites": [
@@ -73,6 +103,8 @@
     ".<known-runtime-json>.<pid>.<12-hex>.tmp (atomic write only; stale exact files are reclaimed under the overlap lock only when the committed counterpart remains a regular file)",
     "connector.log.jsonl",
     "connector.log.jsonl.1",
+    "antigravity-statusline-state.json (only after explicit Antigravity wrapper installation; saves prior statusLine value for restoration)",
+    "<Antigravity home>/tag-plugin-statusline.jsonl (sanitized prospective capture only after explicit Antigravity wrapper installation)",
     "connector.lock (ephemeral owner-token lease during state-changing commands)",
     "sync-pages/<batch-id>/*.json (temporary content-free future pages during catch-up)",
     "versions/<connector-version>/**",
@@ -98,6 +130,7 @@
     "aggregateWatermarks": "independent Codex, Claude, and Kimi settled-through times staged per complete provider and committed only after the final sync page",
     "unresolvedModels": "unknown-model or unknown-mode usage uploads immediately as an atomic raw-only event without a local queue; modelId and serviceMode are both the unknown sentinel, attribution is raw_only, source model tokens never upload, and a one-time stable-ID backfill repairs the retired queue generation",
     "eventIdentity": "raw source IDs are account-scoped HMACs over content-independent source identity and deduplicate locally; Codex and Claude logical aggregates retain the released v4 identity domain and Kimi retains v3, binding provider, stable source-session scope, UTC hour, raw source-model token, raw mode token, and coding surface independently of parser/accounting generation and raw-versus-attributed classification; source-ID set, totals, canonical model mapping, and collector provenance are excluded from identity but changed canonical observation fields produce a new payload revision under the same event ID; raw source IDs and identity inputs do not upload as separate fields",
+    "planAndResetObservations": "a signed heartbeat may contain bounded content-free provider plan observations and actual quota-window reset observations. Codex plan/rate-window values come from official app-server account RPCs; Claude plan comes from claude auth status JSON; Antigravity values come only from the explicitly installed sanitized statusLine wrapper. A reset is emitted only when a previously observed quota-window boundary advances, never merely because a percentage changes. DeepSeek api_payg is reported only when explicit API evidence exists; a hosted DeepSeek model never creates that entitlement.",
     "operationLock": "random owner token, open-handle lease renewed every stale-window quarter, live-PID stale-takeover guard, atomic rename/revalidation, and ownership-checked release",
     "atomicWriteRecovery": "atomic rename is the only replacement step; Windows EEXIST or EPERM retries that same primitive five times with bounded delay, then fails closed without unlinking the prior committed JSON and removes only that operation's temp; after the 15-minute lease window, state-changing startup may remove only exact known runtime-JSON temp names under connector home, only while proving ownership of the canonical overlap lock, only when both the temp and its unchanged committed counterpart are regular files and the encoded PID is no longer live; a temp that is the sole recovery copy is preserved; root and direct sync-page scans are non-recursive and bounded",
     "pathPrivacy": "raw paths are not persisted; installation-keyed HMAC aliases are persisted locally as cursor keys",
@@ -132,6 +165,7 @@
     "eventId",
     "occurredAt",
     "provider",
+    "serviceProviderId",
     "attribution (raw-only events only)",
     "modelId",
     "serviceMode",
@@ -141,6 +175,15 @@
     "outputTokens",
     "reasoningTokens",
     "surface"
+  ],
+  "outboundHeartbeatObservationFields": [
+    "providerId",
+    "serviceSurface",
+    "rawPlanCode",
+    "observedAt",
+    "evidenceType",
+    "windowKey (reset observations only)",
+    "resetAtBefore/resetAtAfter (actual quota reset only)"
   ],
   "neverUploadedPersistedHashedOrLogged": [
     "prompts",
@@ -182,7 +225,8 @@
   "uninstall": {
     "removesScheduler": true,
     "removesCurrentVersionedRelease": true,
-    "removesLocalState": false
+    "removesLocalState": false,
+    "antigravityStatusLine": "when TAG still owns the configured wrapper, uninstall restores the saved prior statusLine (or removes TAG's entry if none existed). A later user change is preserved; TAG only removes its private capture/state files."
   },
   "codingAgentPrompt": {
     "providerMayReceiveAndRetainPrompt": true,

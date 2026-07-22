@@ -355,6 +355,10 @@ export function initialState() {
     nextSequence: 1,
     previousRequestDigest: "",
     pendingRequest: null,
+    // These are privacy-minimal observation identities, never raw provider
+    // responses. They are advanced only after the signed heartbeat echoes the
+    // exact submitted observations back to us.
+    heartbeatObservationSnapshots: { version: 1, plans: {}, resetWindows: {} },
     pendingPair: null,
     syncOutbox: null,
     quarantinedEventIds: [],
@@ -456,10 +460,34 @@ export async function loadRuntime(paths) {
       ? state.cursors.kimi.files
       : {};
   }
+  const configuredFallbacks = config.transcriptFallbacks || {};
   config.transcriptFallbacks = {
-    codex: Boolean(config.transcriptFallbacks?.codex),
-    claude: Boolean(config.transcriptFallbacks?.claude),
-    kimi: Boolean(config.transcriptFallbacks?.kimi)
+    codex: Boolean(configuredFallbacks.codex),
+    claude: Boolean(configuredFallbacks.claude),
+    kimi: Boolean(configuredFallbacks.kimi),
+    ...(Object.hasOwn(configuredFallbacks, "gemini") ? { gemini: Boolean(configuredFallbacks.gemini) } : {}),
+    ...(Object.hasOwn(configuredFallbacks, "grok") ? { grok: Boolean(configuredFallbacks.grok) } : {}),
+    // DeepSeek has no local journal root. This flag is only a consent marker
+    // for separately discovered host/API evidence.
+    ...(Object.hasOwn(configuredFallbacks, "deepseek") ? { deepseek: Boolean(configuredFallbacks.deepseek) } : {})
+  };
+  const snapshots = state.heartbeatObservationSnapshots;
+  state.heartbeatObservationSnapshots = {
+    version: 1,
+    plans: snapshots?.plans && typeof snapshots.plans === "object" && !Array.isArray(snapshots.plans)
+      ? Object.fromEntries(Object.entries(snapshots.plans)
+          .filter(([key, value]) => /^[a-z]+:[a-z_]+$/.test(key)
+            && typeof value?.rawPlanCode === "string"
+            && /^[a-z0-9]+(?:[_-][a-z0-9]+)*$/.test(value.rawPlanCode))
+          .map(([key, value]) => [key, { rawPlanCode: value.rawPlanCode }]))
+      : {},
+    resetWindows: snapshots?.resetWindows && typeof snapshots.resetWindows === "object" && !Array.isArray(snapshots.resetWindows)
+      ? Object.fromEntries(Object.entries(snapshots.resetWindows)
+          .filter(([key, value]) => /^[a-z]+:[a-z_]+:[a-z]+$/.test(key)
+            && typeof value?.resetAt === "string"
+            && Number.isFinite(Date.parse(value.resetAt)))
+          .map(([key, value]) => [key, { resetAt: new Date(value.resetAt).toISOString() }]))
+      : {}
   };
   config.allowedPlatforms = Array.isArray(config.allowedPlatforms) ? config.allowedPlatforms : [];
   config.supportedProviders = Array.isArray(config.supportedProviders) ? config.supportedProviders : [];

@@ -34,10 +34,16 @@ export function providerRoots(env = process.env) {
   const codexHome = env.CODEX_HOME || path.join(userHome, ".codex");
   const claudeHome = env.CLAUDE_CONFIG_DIR || path.join(userHome, ".claude");
   const kimiHome = env.KIMI_CODE_HOME || path.join(userHome, ".kimi-code");
+  const antigravityHome = env.ANTIGRAVITY_HOME || path.join(userHome, ".gemini", "antigravity-cli");
+  const grokHome = env.GROK_HOME || path.join(userHome, ".grok");
   return {
     codex: path.resolve(env.TAG_PLUGIN_CODEX_ROOT || env.TOKENBOARD_CODEX_ROOT || path.join(codexHome, "sessions")),
     claude: path.resolve(env.TAG_PLUGIN_CLAUDE_ROOT || env.TOKENBOARD_CLAUDE_ROOT || path.join(claudeHome, "projects")),
     claudeStats: path.resolve(path.join(claudeHome, "stats-cache.json")),
-    kimi: path.resolve(env.TAG_PLUGIN_KIMI_ROOT || env.TOKENBOARD_KIMI_ROOT || path.join(kimiHome, "sessions"))
+    kimi: path.resolve(env.TAG_PLUGIN_KIMI_ROOT || env.TOKENBOARD_KIMI_ROOT || path.join(kimiHome, "sessions")),
+    // This log is created only by the future opt-in status-line wrapper. It
+    // contains its sanitized capture format, never Antigravity's raw input.
+    antigravity: path.resolve(env.TAG_PLUGIN_ANTIGRAVITY_ROOT || path.join(antigravityHome, "tag-plugin-statusline.jsonl")),
+    grok: path.resolve(env.TAG_PLUGIN_GROK_ROOT || path.join(grokHome, "sessions"))
   };
 }

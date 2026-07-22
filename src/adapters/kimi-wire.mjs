@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { canonicalModelId } from "../model-registry.mjs";
+import { canonicalModelId, providerForModelId } from "../model-registry.mjs";
 import { accountScopedEventId, payloadHash, sha256 } from "../crypto.mjs";
 import {
   normalizeMode,
@@ -208,6 +208,7 @@ export async function parseKimiWire(filePath, options) {
     }
     const contentDigest = usageContentDigest(usageRecord, options.stableJournalIdentity);
     const modelId = resolveModel("kimi", sourceModelId);
+    const provider = providerForModelId(modelId) || "kimi";
     const providerIdentity = providerRecordIdentity(usageRecord);
     const occurrenceOrdinal = providerIdentity
       ? null
@@ -220,7 +221,8 @@ export async function parseKimiWire(filePath, options) {
     ].join("\0");
     const event = {
       eventId: accountScopedEventId(options.dedupNamespaceKey, "kimi", stableRecordIdentity),
-      provider: "kimi",
+      provider,
+      serviceProviderId: "kimi",
       modelId,
       sourceModelId,
       aggregationScope: options.stableJournalIdentity,

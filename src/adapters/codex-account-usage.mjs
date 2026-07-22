@@ -4,6 +4,17 @@ import path from "node:path";
 import { CONNECTOR_VERSION } from "../constants.mjs";
 
 const MAX_STDOUT_BYTES = 1024 * 1024;
+// This mirrors the current PlanType enum emitted by Codex app-server.  Keep
+// the native code intact: the server assigns a conservative catalog entry
+// rather than guessing a commercial SKU from a similarly named family.
+const PLAN_TYPES = new Set([
+  "free", "go", "plus", "pro", "prolite", "team",
+  "self_serve_business_usage_based", "enterprise_cbp_usage_based",
+  "enterprise", "edu", "unknown"
+]);
+const MAX_RATE_LIMIT_WINDOW_MINUTES = 10_080;
+const MIN_RESET_AT_MS = Date.UTC(2000, 0, 1);
+const MAX_RESET_AT_MS = Date.UTC(2100, 0, 1);
 
 function safeInteger(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
@@ -36,6 +47,63 @@ function sanitizeUsageResult(value) {
     },
     dailyUsageBuckets: buckets
   };
+}
+
+function canonicalPlanType(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  return PLAN_TYPES.has(normalized) ? normalized : null;
+}
+
+function canonicalResetAt(value) {
+  const numeric = typeof value === "number" && Number.isFinite(value) ? value : null;
+  if (numeric === null) return null;
+  const milliseconds = numeric < 10_000_000_000 ? numeric * 1_000 : numeric;
+  if (!Number.isSafeInteger(milliseconds) || milliseconds < MIN_RESET_AT_MS || milliseconds > MAX_RESET_AT_MS) {
+    return null;
+  }
+  return new Date(milliseconds).toISOString();
+}
+
+function sanitizeRateLimitWindow(value) {
+  const usedPercent = typeof value?.usedPercent === "number" && Number.isFinite(value.usedPercent)
+    && value.usedPercent >= 0 && value.usedPercent <= 100
+    ? Math.round(value.usedPercent * 100) / 100
+    : null;
+  const windowMinutes = safeInteger(value?.windowDurationMins);
+  const resetAt = canonicalResetAt(value?.resetsAt);
+  if (usedPercent === null && windowMinutes === null && resetAt === null) return null;
+  return {
+    usedPercent,
+    windowMinutes: windowMinutes !== null && windowMinutes <= MAX_RATE_LIMIT_WINDOW_MINUTES ? windowMinutes : null,
+    resetAt
+  };
+}
+
+function sanitizeAccountResult(value) {
+  const account = value?.account && typeof value.account === "object" ? value.account : value;
+  const rawSurface = typeof account?.type === "string" ? account.type.trim().toLowerCase() : "";
+  if (rawSurface !== "chatgpt") return null;
+  return {
+    authSurface: "chatgpt",
+    planType: canonicalPlanType(account.planType)
+  };
+}
+
+function sanitizeRateLimitsResult(value) {
+  const rateLimits = value?.rateLimits && typeof value.rateLimits === "object" ? value.rateLimits : value;
+  if (!rateLimits || typeof rateLimits !== "object") return null;
+  const primary = sanitizeRateLimitWindow(rateLimits.primary);
+  const secondary = sanitizeRateLimitWindow(rateLimits.secondary);
+  const credits = rateLimits.credits && typeof rateLimits.credits === "object"
+    ? {
+        hasCredits: typeof rateLimits.credits.hasCredits === "boolean" ? rateLimits.credits.hasCredits : null,
+        unlimited: typeof rateLimits.credits.unlimited === "boolean" ? rateLimits.credits.unlimited : null
+      }
+    : null;
+  const sanitizedCredits = credits && (credits.hasCredits !== null || credits.unlimited !== null) ? credits : null;
+  if (!primary && !secondary && !sanitizedCredits) return null;
+  return { primary, secondary, credits: sanitizedCredits };
 }
 
 function executeForStdout(executable, arguments_, options = {}) {
@@ -124,6 +192,10 @@ export async function readCodexAccountUsage(options = {}) {
     let settled = false;
     let pending = "";
     let bytes = 0;
+    let usage = null;
+    let account = null;
+    let rateLimits = null;
+    const completed = new Set();
     const finish = (result) => {
       if (settled) {
         return;
@@ -137,12 +209,28 @@ export async function readCodexAccountUsage(options = {}) {
       }
       resolve(result);
     };
-    const timer = setTimeout(() => finish({ status: "unavailable", reason: "timeout" }), timeoutMs);
+    const finishBestAvailable = (fallbackReason) => {
+      if (usage) {
+        finish({
+          status: "available",
+          verification: "provider_backed_codex_account_usage",
+          ...usage,
+          account,
+          rateLimits
+        });
+        return;
+      }
+      finish({ status: "unavailable", reason: fallbackReason });
+    };
+    const maybeFinish = () => {
+      if (usage && completed.has(1) && completed.has(2) && completed.has(3)) finishBestAvailable("rpc_rejected");
+    };
+    const timer = setTimeout(() => finishBestAvailable("timeout"), timeoutMs);
 
-    child.once("error", () => finish({ status: "unavailable", reason: "not_installed" }));
-    child.once("exit", () => finish({ status: "unavailable", reason: "exited" }));
-    child.stdin.on("error", () => finish({ status: "unavailable", reason: "stdin_error" }));
-    child.stdout.on("error", () => finish({ status: "unavailable", reason: "stdout_error" }));
+    child.once("error", () => finishBestAvailable("not_installed"));
+    child.once("exit", () => finishBestAvailable("exited"));
+    child.stdin.on("error", () => finishBestAvailable("stdin_error"));
+    child.stdout.on("error", () => finishBestAvailable("stdout_error"));
     child.stdout.on("data", (chunk) => {
       bytes += chunk.length;
       if (bytes > MAX_STDOUT_BYTES) {
@@ -166,14 +254,20 @@ export async function readCodexAccountUsage(options = {}) {
         if (message.id === 0 && message.result) {
           child.stdin.write(JSON.stringify({ method: "initialized", params: {} }) + "\n");
           child.stdin.write(JSON.stringify({ method: "account/usage/read", id: 1 }) + "\n");
-        } else if (message.id === 1 && message.result) {
-          finish({
-            status: "available",
-            verification: "provider_backed_codex_account_usage",
-            ...sanitizeUsageResult(message.result)
-          });
-        } else if (message.id === 1 && message.error) {
-          finish({ status: "unavailable", reason: "rpc_rejected" });
+          child.stdin.write(JSON.stringify({ method: "account/read", id: 2, params: { refreshToken: false } }) + "\n");
+          child.stdin.write(JSON.stringify({ method: "account/rateLimits/read", id: 3 }) + "\n");
+        } else if (message.id === 1) {
+          completed.add(1);
+          if (message.result) usage = sanitizeUsageResult(message.result);
+          maybeFinish();
+        } else if (message.id === 2) {
+          completed.add(2);
+          if (message.result) account = sanitizeAccountResult(message.result);
+          maybeFinish();
+        } else if (message.id === 3) {
+          completed.add(3);
+          if (message.result) rateLimits = sanitizeRateLimitsResult(message.result);
+          maybeFinish();
         }
       }
     });

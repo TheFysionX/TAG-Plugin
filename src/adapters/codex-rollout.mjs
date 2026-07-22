@@ -9,7 +9,7 @@ import {
   readCompleteJsonLines
 } from "./shared.mjs";
 import { accountScopedEventId, hmacAlias, payloadHash, sha256 } from "../crypto.mjs";
-import { canonicalModelId } from "../model-registry.mjs";
+import { canonicalModelId, providerForModelId } from "../model-registry.mjs";
 
 function appliedThreadSettings(record) {
   if (record?.type === "turn_context") {
@@ -549,9 +549,11 @@ export async function parseCodexRollout(filePath, options) {
     const mode = normalizeMode({ provider: "codex", serviceTier: context.serviceTier });
     if (!mode.classified) unclassifiedModes += 1;
     const modelId = resolveModel("codex", context.model);
+    const provider = providerForModelId(modelId) || "codex";
     const event = {
       eventId: accountScopedEventId(options.dedupNamespaceKey, "codex", stableRecordIdentity),
-      provider: "codex",
+      provider,
+      serviceProviderId: "codex",
       modelId,
       sourceModelId: context.model,
       aggregationScope: sessionIdentityHash,

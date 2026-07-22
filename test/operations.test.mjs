@@ -18,6 +18,7 @@ import { discoverJsonlFiles } from "../src/discovery.mjs";
 import { acquireLock } from "../src/lock.mjs";
 import {
   chunkSyncPayloads,
+  doctor,
   pair,
   scheduledRun,
   sync,
@@ -174,6 +175,30 @@ test("pair signs exchange, stores one device, and restricts approved fallbacks",
   assert.equal(captured.init.headers["x-tokenboard-sequence"], "0");
   const runtime = await loadRuntime(fixture.paths);
   assert.equal(runtime.state.deviceId, "device_12345678");
+});
+
+test("pair preserves a server-authorized DeepSeek platform", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const result = await pair({
+    home: fixture.home,
+    platform: "linux",
+    endpoint: "https://artificial-games.example",
+    code: "ABCD-EFGH",
+    enabledFallbacks: { deepseek: true },
+    fetchImpl: async () => jsonResponse({
+      device: {
+        id: "device_deepseek_1234",
+        allowedPlatforms: ["deepseek"],
+        supportedProviders: ["deepseek"]
+      },
+      dedupNamespaceKey,
+      signing: { nextSequence: 1, lastRequestDigest: "" }
+    })
+  });
+  assert.deepEqual(result.allowedPlatforms, ["deepseek"]);
+  assert.deepEqual(result.supportedProviders, ["deepseek"]);
+  assert.equal(result.transcriptFallbacks.deepseek, true);
 });
 
 test("pair is idempotent for an existing device on the same endpoint", async (context) => {
@@ -653,7 +678,7 @@ test("sync sends only strict allowlisted wire events and advances the request ch
   const sentEvents = calls.flatMap((call) => JSON.parse(call.init.body).events);
   assert.equal(sentEvents.length, 4);
   const allowedEventKeys = new Set([
-    "eventId", "occurredAt", "provider", "modelId", "serviceMode",
+    "eventId", "occurredAt", "provider", "serviceProviderId", "modelId", "serviceMode",
     "inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens", "reasoningTokens", "surface",
     "attribution"
   ]);
@@ -704,6 +729,141 @@ test("sync sends only strict allowlisted wire events and advances the request ch
     now: 1_750_000_100_000
   });
   assert.equal(second.sent, 0);
+});
+
+test("Codex consent uploads a hosted DeepSeek model with separate vendor and service attribution", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_hosted_deepseek";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["codex"];
+  config.supportedProviders = ["codex"];
+  config.transcriptFallbacks = { codex: true, claude: false, kimi: false };
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+  const uploaded = [];
+  const result = await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    officialEvidence: false,
+    canonicalModelId: () => "deepseek-v4-pro",
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      uploaded.push(...body.events);
+      return jsonResponse({
+        request: { digest: "digest_hosted_deepseek_1234567890" },
+        accepted: body.events.length,
+        duplicates: 0,
+        rejected: 0,
+        events: body.events.map(acceptedEventResult)
+      });
+    }
+  });
+  assert.equal(result.sent, 1);
+  assert.equal(result.withheld, 0);
+  assert.equal(uploaded[0].provider, "deepseek");
+  assert.equal(uploaded[0].serviceProviderId, "codex");
+  assert.equal(uploaded[0].surface, "codex");
+});
+
+test("an explicitly consented Antigravity capture reaches the sync outbox", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  fixture.roots.antigravity = path.join(fixture.temporary, "tag-plugin-statusline.jsonl");
+  await fs.writeFile(fixture.roots.antigravity, JSON.stringify({
+    kind: "tag.antigravity.statusline.v1",
+    observedAt: "2026-07-21T10:00:00.000Z",
+    sessionAlias: "a".repeat(64),
+    sourceModelId: "gemini-3-pro",
+    executionMode: "fast",
+    quotaResets: [],
+    usage: { input: 12, cachedInput: 3, cacheWriteInput: 0, output: 5 }
+  }) + "\n", "utf8");
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_antigravity";
+  const config = initialConfig();
+  config.endpoint = "https://artificial-games.example";
+  config.allowedPlatforms = ["gemini"];
+  config.supportedProviders = ["gemini"];
+  config.transcriptFallbacks = { codex: false, claude: false, kimi: false, gemini: true };
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+  const uploaded = [];
+  const result = await sync({
+    home: fixture.home,
+    roots: fixture.roots,
+    officialEvidence: false,
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      uploaded.push(...body.events);
+      return jsonResponse({
+        request: { digest: "digest_antigravity_1234567890" },
+        accepted: body.events.length,
+        duplicates: 0,
+        rejected: 0,
+        events: body.events.map(acceptedEventResult)
+      });
+    }
+  });
+  assert.equal(result.sent, 1);
+  assert.equal(uploaded[0].provider, "gemini");
+  assert.equal(uploaded[0].serviceProviderId, "gemini");
+  assert.equal(uploaded[0].surface, "antigravity");
+});
+
+test("persisted outboxes reject invalid service-provider and surface combinations", async (context) => {
+  for (const mutation of [
+    { serviceProviderId: "claude" },
+    { surface: "unsupported_surface" }
+  ]) {
+    const fixture = await setup();
+    context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+    const secrets = createDeviceSecrets();
+    secrets.dedupNamespaceKey = dedupNamespaceKey;
+    const state = initialState();
+    state.paired = true;
+    state.deviceId = "device_invalid_host_surface";
+    const config = initialConfig();
+    config.endpoint = "https://artificial-games.example";
+    config.allowedPlatforms = ["codex"];
+    config.supportedProviders = ["codex"];
+    config.transcriptFallbacks = { codex: true, claude: false, kimi: false };
+    await saveSecrets(fixture.paths, secrets);
+    await saveRuntime(fixture.paths, { state, config });
+    await sync({
+      home: fixture.home,
+      roots: fixture.roots,
+      officialEvidence: false,
+      maxIngestRequests: 0,
+      fetchImpl: async () => { throw new Error("zero-request staging must not use the network"); }
+    });
+    const staged = await loadRuntime(fixture.paths);
+    const event = staged.state.syncOutbox.chunks[0].events[0];
+    Object.assign(event, mutation);
+    const outbox = staged.state.syncOutbox;
+    const events = outbox.chunks.flatMap((chunk) => chunk.events);
+    outbox.pages[0].digest = payloadHash({
+      version: 1,
+      batchId: outbox.batchId,
+      pageIndex: 0,
+      events
+    });
+    await saveRuntime(fixture.paths, staged);
+    await assert.rejects(() => sync({
+      home: fixture.home,
+      roots: fixture.roots,
+      officialEvidence: false,
+      fetchImpl: async () => { throw new Error("invalid outbox must fail before network"); }
+    }), (error) => error.code === "SYNC_BATCH_CORRUPT");
+  }
 });
 
 test("Codex checkpoints carry account scope and use lifetime authority as the final commit marker", async (context) => {
@@ -3103,6 +3263,7 @@ test("the retired unresolved queue migrates once to raw-only without exposing or
     eventId: "e".repeat(64),
     occurredAt: "2026-07-19T12:00:00.000Z",
     provider: "kimi",
+    serviceProviderId: "kimi",
     attribution: "raw_only",
     modelId: "unknown",
     serviceMode: "unknown",
@@ -3691,7 +3852,13 @@ test("preview is local-only and journal reads require pairing authorization", as
   });
   assert.equal(result.records, 0);
   assert.equal(result.adapters.codex.status, "opt_in_required");
+  assert.equal(result.localReadSurfaces.find((surface) => surface.provider === "gemini").source,
+    "Antigravity sanitized statusLine capture");
   assert.equal(result.networkPerformed, false);
+  const diagnostics = await doctor({ home: fixture.home, roots: fixture.roots });
+  assert.equal(diagnostics.sources.gemini.status, "antigravity_sanitized_statusline_capture");
+  assert.equal(diagnostics.sources.grok.status, "local_session_summary_only");
+  assert.equal(diagnostics.sources.deepseek.status, "hosted_model_attribution_or_explicit_api_evidence_only");
 });
 
 test("scheduler mutation is preview-only until the exact confirmation flag", async (context) => {
@@ -3727,7 +3894,7 @@ test("scheduler mutation is preview-only until the exact confirmation flag", asy
   assert.match(commands[0].join(" "), /SetAccessRuleProtection/);
   assert.match(commands[0].join(" "), /Current-user-only ACL verification failed/);
   assert.equal(commands[1][0], "schtasks.exe");
-  assert.match(commands[1].join(" "), /versions[\\/]0\.1\.7[\\/]src[\\/]cli\.mjs/);
+  assert.match(commands[1].join(" "), /versions[\\/]0\.1\.8[\\/]src[\\/]cli\.mjs/);
   assert.match(commands[1].join(" "), /scheduled-run --home/);
   assert.equal(await fs.access(path.join(installed.installedRelease, "package.json")).then(() => true), true);
   assert.equal(await fs.access(path.join(installed.installedRelease, "RELEASING.md")).then(() => true), true);
@@ -3765,7 +3932,7 @@ test("Windows installation fails closed before copying or scheduling when ACL ha
   }), (error) => error.code === "WINDOWS_ACL_HARDENING_FAILED");
   assert.equal(commands.length, 1);
   assert.match(commands[0][0], /powershell\.exe$/i);
-  const installedPath = path.join(fixture.home, "versions", "0.1.7");
+  const installedPath = path.join(fixture.home, "versions", "0.1.8");
   assert.equal(await fs.access(installedPath).then(() => true).catch(() => false), false);
 });
 
@@ -3798,7 +3965,7 @@ test("confirmed install and uninstall refuse to overlap another connector operat
 
   assert.deepEqual(commands, []);
   assert.equal(
-    await fs.access(path.join(fixture.home, "versions", "0.1.7")).then(() => true).catch(() => false),
+    await fs.access(path.join(fixture.home, "versions", "0.1.8")).then(() => true).catch(() => false),
     false
   );
 });

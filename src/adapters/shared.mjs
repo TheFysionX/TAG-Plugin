@@ -96,19 +96,29 @@ export function normalizeUsage(usage = {}, provider) {
   const reasoningOutput = safeNonNegativeInteger(
     usage.reasoning_output_tokens ?? usage.reasoning_tokens ?? usage.reasoning_output ?? 0
   );
-  const reportedTotal = safeNonNegativeInteger(usage.total_tokens ?? usage.total ?? 0);
+  const rawReportedTotal = usage.total_tokens ?? usage.total;
+  const reportedTotal = typeof rawReportedTotal === "number"
+    && Number.isFinite(rawReportedTotal)
+    && rawReportedTotal >= 0
+    ? Math.floor(rawReportedTotal)
+    : null;
   const input = provider === "codex" ? Math.max(0, reportedInput - cachedInput) : reportedInput;
   const calculatedTotal = provider === "codex"
     ? reportedInput + cacheWriteInput + output
     : input + cachedInput + cacheWriteInput + output;
-  return {
+  const normalized = {
     input,
     cachedInput,
     cacheWriteInput,
     output,
     reasoningOutput,
-    total: reportedTotal || calculatedTotal
+    // Component totals are the only model-attributable value. A provider's
+    // separate aggregate must never resize a model row.
+    total: calculatedTotal
   };
+  return reportedTotal !== null && reportedTotal !== calculatedTotal
+    ? { ...normalized, reportedTotal, componentConflict: true }
+    : normalized;
 }
 
 export function normalizeTimestamp(value) {

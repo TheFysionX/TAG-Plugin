@@ -20,6 +20,7 @@ import {
   SCHEDULED_MAX_INGEST_REQUESTS
 } from "./constants.mjs";
 import { adapterStatus } from "./adapters/registry.mjs";
+import { readClaudeAccountStatus } from "./adapters/claude-account-status.mjs";
 import { aggregatePreview, collectUsage, hasRawTokenUsage, toWireEvent } from "./collector.mjs";
 import { createDeviceSecrets, payloadHash, sha256 } from "./crypto.mjs";
 import { discoverJsonlFiles } from "./discovery.mjs";
@@ -31,6 +32,7 @@ import { providerRoots, runtimePaths } from "./paths.mjs";
 import { safeLog } from "./safe-log.mjs";
 import { applyScheduler, removeScheduler, schedulerPlan } from "./scheduler.mjs";
 import { hardenWindowsConnectorHome, hardenWindowsSecrets } from "./windows-security.mjs";
+import { installAntigravityStatusline, uninstallAntigravityStatusline } from "./antigravity-wrapper.mjs";
 import {
   atomicWriteJson,
   cleanupStaleAtomicWriteTemps,
@@ -45,7 +47,14 @@ import {
   savePendingSecrets
 } from "./state.mjs";
 
-const PLATFORM_IDS = new Set(["codex", "claude", "gemini", "grok", "kimi"]);
+const PLATFORM_IDS = new Set(["codex", "claude", "deepseek", "gemini", "grok", "kimi"]);
+const MODEL_PROVIDER_IDS = new Set(["codex", "claude", "deepseek", "gemini", "grok", "kimi"]);
+const SERVICE_PROVIDER_BY_SURFACE = Object.freeze({
+  codex: "codex",
+  claude_code: "claude",
+  kimi_code: "kimi",
+  antigravity: "gemini"
+});
 const UNRESOLVED_EVENT_KEYS = Object.freeze([
   "eventId",
   "occurredAt",
@@ -63,11 +72,11 @@ const TOKEN_COUNT_PATTERN = /^\d{1,30}$/;
 const SYNC_BATCH_ID_PATTERN = /^[a-f0-9]{24}$/;
 const MAX_SYNC_PAGE_BYTES = 64 * 1024 * 1024;
 const SYNC_EVENT_KEYS = new Set([
-  "eventId", "occurredAt", "provider", "modelId", "serviceMode",
+  "eventId", "occurredAt", "provider", "serviceProviderId", "modelId", "serviceMode",
   "inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens", "reasoningTokens", "surface",
   "attribution"
 ]);
-const SYNC_SURFACES = new Set(["codex", "claude_code", "kimi_code"]);
+const SYNC_SURFACES = new Set(Object.keys(SERVICE_PROVIDER_BY_SURFACE));
 const BISECTABLE_SYNC_CODES = new Set([
   "BODY_TOO_LARGE",
   "INVALID_EVENTS",
@@ -95,6 +104,14 @@ function isDedupNamespaceKey(value) {
   return typeof value === "string"
     && /^[A-Za-z0-9_-]{43}$/.test(value)
     && Buffer.from(value, "base64url").length === 32;
+}
+
+function serviceProviderForEvent(event) {
+  const inferred = SERVICE_PROVIDER_BY_SURFACE[event?.surface ?? event?.provenance?.surface];
+  if (!inferred) return null;
+  return event?.serviceProviderId === undefined || event.serviceProviderId === inferred
+    ? inferred
+    : null;
 }
 
 function runtimeOptions(options = {}) {
@@ -282,10 +299,13 @@ function isNormalizedUnresolvedEvent(event) {
 
 function legacyUnresolvedToRawOnlyWireEvent(event) {
   if (!isNormalizedUnresolvedEvent(event)) return null;
+  const serviceProviderId = serviceProviderForEvent(event);
+  if (!serviceProviderId) return null;
   const rawOnly = {
     eventId: event.eventId,
     occurredAt: event.occurredAt,
     provider: event.provider,
+    serviceProviderId,
     attribution: "raw_only",
     modelId: "unknown",
     serviceMode: "unknown",
@@ -336,7 +356,12 @@ function requestedFallbacks(value = {}) {
   return {
     codex: Boolean(value.codex),
     claude: Boolean(value.claude),
-    kimi: Boolean(value.kimi)
+    kimi: Boolean(value.kimi),
+    ...(Object.hasOwn(value, "gemini") ? { gemini: Boolean(value.gemini) } : {}),
+    ...(Object.hasOwn(value, "grok") ? { grok: Boolean(value.grok) } : {}),
+    // There is intentionally no DeepSeek journal root. This flag can enable
+    // only separately proven host/API evidence.
+    ...(Object.hasOwn(value, "deepseek") ? { deepseek: Boolean(value.deepseek) } : {})
   };
 }
 
@@ -659,7 +684,8 @@ function isWireEvent(event) {
   if (!Object.keys(event).every((key) => SYNC_EVENT_KEYS.has(key))) return false;
   if (typeof event.eventId !== "string" || !/^[a-f0-9]{64}$/.test(event.eventId)) return false;
   if (typeof event.occurredAt !== "string" || !Number.isFinite(Date.parse(event.occurredAt))) return false;
-  if (!["codex", "claude", "kimi"].includes(event.provider)) return false;
+  if (!MODEL_PROVIDER_IDS.has(event.provider)) return false;
+  if (!serviceProviderForEvent(event)) return false;
   const rawOnly = event.attribution === "raw_only";
   if (event.attribution !== undefined && !rawOnly) return false;
   if (rawOnly) {
@@ -940,6 +966,13 @@ async function finalizePending(runtime, response, paths) {
   if (pending.sequence !== runtime.state.nextSequence) {
     throw new ConnectorError("PENDING_SEQUENCE_MISMATCH", "The pending request does not match the local request sequence.");
   }
+  if (pending.kind === "heartbeat" && !heartbeatObservationsAcknowledged(pending.body, response)) {
+    throw new ConnectorError(
+      "HEARTBEAT_OBSERVATION_UNACKNOWLEDGED",
+      "The server did not acknowledge every submitted heartbeat observation; local observation state remains uncommitted.",
+      { retryable: false }
+    );
+  }
   const hydratedCodexSnapshot = pending.kind === "heartbeat" && pending.commit?.hydrateCodexSnapshot === true
     ? remoteCodexCheckpointSnapshot(response, runtime.state.codexCheckpointSnapshot)
     : null;
@@ -1021,6 +1054,9 @@ async function finalizePending(runtime, response, paths) {
     return { pending, cleanupBatchId };
   } else if (pending.kind === "heartbeat") {
     runtime.state.lastHeartbeatAt = pending.commit.observedAt;
+    if (pending.commit?.observationSnapshots) {
+      runtime.state.heartbeatObservationSnapshots = pending.commit.observationSnapshots;
+    }
     if (pending.commit?.hydrateCodexSnapshot === true) {
       runtime.state.codexCheckpointSnapshot = hydratedCodexSnapshot;
       if (hydratedCodexSnapshot.generationId !== null) {
@@ -1030,6 +1066,185 @@ async function finalizePending(runtime, response, paths) {
   }
   runtime.state.pendingRequest = null;
   return { pending, cleanupBatchId: null };
+}
+
+const OBSERVATION_PROVIDER_SURFACES = Object.freeze({
+  codex: new Set(["codex"]),
+  claude: new Set(["claude_code"]),
+  kimi: new Set(["kimi_code"]),
+  gemini: new Set(["gemini_cli", "antigravity"]),
+  grok: new Set(["grok", "grok_build"]),
+  deepseek: new Set(["deepseek_api", "cli"])
+});
+const RESET_WINDOW_KEYS = new Set(["primary", "secondary", "session", "daily", "weekly", "api"]);
+const RESET_BOUNDARY_GRACE_MS = 5 * 60 * 1_000;
+
+function normalizedObservationTime(value) {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) return null;
+  return new Date(value).toISOString();
+}
+
+function isObservationSurface(providerId, surface) {
+  return OBSERVATION_PROVIDER_SURFACES[providerId]?.has(surface) === true;
+}
+
+function normalizePlanObservation(value) {
+  const providerId = value?.providerId;
+  const surface = value?.surface ?? value?.serviceSurface;
+  const rawPlanCode = typeof value?.rawPlanCode === "string" ? value.rawPlanCode.trim().toLowerCase() : null;
+  const observedAt = normalizedObservationTime(value?.observedAt);
+  if (!isObservationSurface(providerId, surface)
+    || !rawPlanCode || !/^[a-z0-9]+(?:[_-][a-z0-9]+)*$/u.test(rawPlanCode)
+    || !observedAt) return null;
+  return { providerId, surface, rawPlanCode, observedAt };
+}
+
+function normalizeResetCandidate(value) {
+  const providerId = value?.providerId;
+  const surface = value?.surface ?? value?.serviceSurface;
+  const windowKey = value?.windowKey;
+  const observedAt = normalizedObservationTime(value?.observedAt);
+  const resetAt = normalizedObservationTime(value?.resetAt ?? value?.resetAtAfter);
+  if (!isObservationSurface(providerId, surface) || !RESET_WINDOW_KEYS.has(windowKey)
+    || !observedAt || !resetAt) return null;
+  return { providerId, surface, windowKey, observedAt, resetAt };
+}
+
+function observationProviderEnabled(runtime, providerId) {
+  const allowed = new Set(runtime.config.allowedPlatforms || []);
+  const supported = runtime.config.supportedProviders || [];
+  return allowed.has(providerId) && (supported.length === 0 || supported.includes(providerId));
+}
+
+function deepseekUsageEvidencePresent(value) {
+  if (value?.status !== "available" && value?.actualUsage !== true && value?.usageObserved !== true) return false;
+  if (value?.actualUsage === true || value?.usageObserved === true) return true;
+  if (Number.isFinite(value?.usage?.total) && value.usage.total > 0) return true;
+  return false;
+}
+
+async function collectHeartbeatObservationInputs(runtime, secrets, roots, options) {
+  if (options.observationCollection) return options.observationCollection;
+  const enabledFallbacks = allowedFallbacks(runtime.config.transcriptFallbacks, runtime.config.allowedPlatforms);
+  return collectUsage({
+    roots,
+    state: runtime.state,
+    secrets,
+    now: options.now,
+    officialEvidence: options.officialEvidence,
+    readCodexAccountUsage: options.readCodexAccountUsage,
+    codexAccountUsageOptions: options.codexAccountUsageOptions,
+    enabledFallbacks,
+    enabledProviders: { codex: observationProviderEnabled(runtime, "codex") },
+    dedupNamespaceKey: secrets.dedupNamespaceKey,
+    discoverJsonlFiles: options.discoverJsonlFiles,
+    discoverGrokSignalFiles: options.discoverGrokSignalFiles
+  });
+}
+
+async function heartbeatObservationPlan(runtime, secrets, roots, options) {
+  const collection = await collectHeartbeatObservationInputs(runtime, secrets, roots, options);
+  const candidates = [...(collection.providerObservations || [])].map(normalizePlanObservation).filter(Boolean);
+  const resetCandidates = [...(collection.resetObservations || [])].map(normalizeResetCandidate).filter(Boolean);
+  const codex = collection.providerEvidence?.codex;
+  const observedAt = new Date(options.now ?? Date.now()).toISOString();
+  if (observationProviderEnabled(runtime, "codex") && codex?.status === "available") {
+    const planType = codex.account?.authSurface === "chatgpt" ? codex.account.planType : null;
+    if (planType) candidates.push({ providerId: "codex", surface: "codex", rawPlanCode: planType, observedAt });
+    for (const windowKey of ["primary", "secondary"]) {
+      const window = codex.rateLimits?.[windowKey];
+      // usedPercent and credit availability deliberately remain local evidence
+      // only. The reset boundary is the provider's next scheduled reset time.
+      if (window?.resetAt) resetCandidates.push({ providerId: "codex", surface: "codex", windowKey, observedAt, resetAt: window.resetAt });
+    }
+  }
+  if (observationProviderEnabled(runtime, "claude")) {
+    const readStatus = options.readClaudeAccountStatus || readClaudeAccountStatus;
+    const claude = await readStatus(options.claudeAccountStatusOptions);
+    // API-key/BYOK and non-Anthropic routes are intentionally incapable of
+    // producing a subscription claim.
+    if (claude?.status === "available" && claude.loggedIn === true
+      && claude.authMethod === "claude_ai" && claude.apiProvider === "anthropic"
+      && claude.subscriptionType) {
+      candidates.push({ providerId: "claude", surface: "claude_code", rawPlanCode: claude.subscriptionType, observedAt });
+    }
+  }
+  const deepseekEvidence = options.deepseekEvidence ?? collection.providerEvidence?.deepseek;
+  if (observationProviderEnabled(runtime, "deepseek")
+    && deepseekUsageEvidencePresent(deepseekEvidence)) {
+    candidates.push({ providerId: "deepseek", surface: "deepseek_api", rawPlanCode: "api_payg", observedAt });
+  }
+  const snapshots = structuredClone(runtime.state.heartbeatObservationSnapshots || { version: 1, plans: {}, resetWindows: {} });
+  snapshots.version = 1;
+  snapshots.plans ||= {};
+  snapshots.resetWindows ||= {};
+  const plansBySurface = new Map();
+  for (const candidate of candidates) {
+    if (observationProviderEnabled(runtime, candidate.providerId)) plansBySurface.set(`${candidate.providerId}:${candidate.surface}`, candidate);
+  }
+  const providerObservations = [];
+  const changedPlans = [];
+  for (const [key, candidate] of [...plansBySurface.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+    if (snapshots.plans[key]?.rawPlanCode !== candidate.rawPlanCode) {
+      changedPlans.push([key, candidate]);
+    }
+  }
+  for (const [key, candidate] of changedPlans.slice(0, 4)) {
+    providerObservations.push(candidate);
+    snapshots.plans[key] = { rawPlanCode: candidate.rawPlanCode };
+  }
+  const resetsByWindow = new Map();
+  for (const candidate of resetCandidates) {
+    if (observationProviderEnabled(runtime, candidate.providerId)) resetsByWindow.set(`${candidate.providerId}:${candidate.surface}:${candidate.windowKey}`, candidate);
+  }
+  const resetObservations = [];
+  const actualResets = [];
+  const baselineResetSnapshots = [];
+  for (const [key, candidate] of [...resetsByWindow.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+    const prior = snapshots.resetWindows[key];
+    const priorMs = Date.parse(prior?.resetAt || "");
+    const nextMs = Date.parse(candidate.resetAt);
+    // A new future reset time means a quota window rolled only when we have
+    // reached (or are close enough to) the previous boundary. A percentage
+    // drop inside the same window is deliberately not evidence of a reset.
+    if (Number.isFinite(priorMs) && nextMs > priorMs
+      && Date.parse(candidate.observedAt) >= priorMs - RESET_BOUNDARY_GRACE_MS) {
+      // The event is the boundary that just elapsed, not the provider's next
+      // future reset. Keep both so the server receives the causal boundary
+      // while local detection advances to the next scheduled window.
+      actualResets.push([key, { ...candidate, resetAt: prior.resetAt }, candidate.resetAt]);
+    } else {
+      baselineResetSnapshots.push([key, candidate]);
+    }
+  }
+  // A reset that did not fit in this heartbeat remains pending on the next
+  // collection; never mark it sent merely because it exceeded the server cap.
+  for (const [key, candidate, nextResetAt] of actualResets.slice(0, 4)) {
+    resetObservations.push(candidate);
+    snapshots.resetWindows[key] = { resetAt: nextResetAt };
+  }
+  for (const [key, candidate] of baselineResetSnapshots) {
+    snapshots.resetWindows[key] = { resetAt: candidate.resetAt };
+  }
+  return {
+    providerObservations,
+    resetObservations,
+    snapshots
+  };
+}
+
+function heartbeatObservationsAcknowledged(body, response) {
+  const expectedPlans = body.providerObservations || [];
+  const expectedResets = body.resetObservations || [];
+  if (expectedPlans.length === 0 && expectedResets.length === 0) return true;
+  const plans = response?.observations?.plans;
+  const resets = response?.observations?.resets;
+  if (!Array.isArray(plans) || !Array.isArray(resets)) return false;
+  const planKey = (item) => `${item?.providerId}:${item?.surface}:${item?.observedAt}`;
+  const resetKey = (item) => `${item?.providerId}:${item?.surface}:${item?.windowKey}:${item?.observedAt}`;
+  return expectedPlans.length === plans.length && expectedResets.length === resets.length
+    && expectedPlans.every((item) => plans.some((ack) => planKey(ack) === planKey(item)))
+    && expectedResets.every((item) => resets.some((ack) => resetKey(ack) === resetKey(item)));
 }
 
 async function replayPending(runtime, secrets, paths, options) {
@@ -1127,6 +1342,12 @@ async function sendHeartbeatRequest(runtime, secrets, paths, options) {
   }
   const observedAt = new Date(options.now ?? Date.now()).toISOString();
   const sequence = runtime.state.nextSequence;
+  const observationPlan = await heartbeatObservationPlan(
+    runtime,
+    secrets,
+    options.roots || providerRoots(options.env),
+    options
+  );
   const stagedCommit = runtime.state.syncOutbox?.commit;
   const adapterHealth = Object.values(stagedCommit?.scanSummary || runtime.state.lastScan?.adapters || {});
   const effectiveBackfill = stagedCommit?.nextRawOnlyBackfill || runtime.state.rawOnlyBackfill;
@@ -1145,6 +1366,12 @@ async function sendHeartbeatRequest(runtime, secrets, paths, options) {
     status: runtime.state.paused ? "paused" : (degraded ? "degraded" : "healthy"),
     connectorVersion: CONNECTOR_VERSION,
     previousRequestDigest: runtime.state.previousRequestDigest,
+    ...(observationPlan.providerObservations.length > 0
+      ? { providerObservations: observationPlan.providerObservations }
+      : {}),
+    ...(observationPlan.resetObservations.length > 0
+      ? { resetObservations: observationPlan.resetObservations }
+      : {}),
     ...((options.hydrateCodexSnapshot === true
       || ((runtime.config.allowedPlatforms || []).includes("codex")
         && (runtime.config.supportedProviders || []).includes("codex")))
@@ -1167,6 +1394,7 @@ async function sendHeartbeatRequest(runtime, secrets, paths, options) {
     body,
     {
       observedAt,
+      observationSnapshots: observationPlan.snapshots,
       ...(options.hydrateCodexSnapshot === true ? { hydrateCodexSnapshot: true } : {})
     }
   );
@@ -1464,8 +1692,8 @@ export async function preview(options = {}) {
       { provider: "codex", source: "~/.codex/sessions/**/*.jsonl", sensitiveJournal: true, enabled: enabledFallbacks.codex },
       { provider: "claude", source: "~/.claude/projects/**/*.jsonl", sensitiveJournal: true, enabled: enabledFallbacks.claude },
       { provider: "kimi", source: "~/.kimi-code/sessions/**/agents/*/wire.jsonl", sensitiveJournal: true, enabled: enabledFallbacks.kimi },
-      { provider: "gemini", source: "planned official telemetry adapter", enabled: false },
-      { provider: "grok", source: "planned official telemetry adapter", enabled: false }
+      { provider: "gemini", source: "Antigravity sanitized statusLine capture", sensitiveJournal: false, enabled: enabledFallbacks.gemini === true },
+      { provider: "grok", source: "Grok Build local session summary", sensitiveJournal: false, enabled: enabledFallbacks.grok === true }
     ],
     networkPerformed: false
   };
@@ -1769,6 +1997,7 @@ export async function sync(options = {}) {
     if (staleAggregateV3Outbox(runtime.state) && runtime.state.pendingRequest?.kind === "sync") {
       const recovered = await processSyncOutbox(runtime, secrets, paths, {
         ...options,
+        roots,
         maxIngestRequests: 1
       });
       let discarded = null;
@@ -1818,7 +2047,7 @@ export async function sync(options = {}) {
     if (runtime.state.syncOutbox) {
       return {
         recovered: true,
-        ...await processSyncOutbox(runtime, secrets, paths, options)
+        ...await processSyncOutbox(runtime, secrets, paths, { ...options, roots })
       };
     }
     if (runtime.state.paused) {
@@ -1859,6 +2088,24 @@ export async function sync(options = {}) {
       discoverJsonlFiles: options.discoverJsonlFiles,
       excludedEventIds: runtime.state.migrationExcludedEvents.map((event) => event.eventId)
     });
+    // Reset evidence changes how the server evaluates subsequent immutable
+    // usage. When a fresh observation exists, its signed heartbeat must land
+    // before we construct or drain this newly collected outbox. Existing
+    // outboxes are handled above and deliberately retain their original order.
+    const pendingObservationPlan = await heartbeatObservationPlan(runtime, secrets, roots, {
+      ...options,
+      roots,
+      observationCollection: collection
+    });
+    if (pendingObservationPlan.providerObservations.length > 0
+      || pendingObservationPlan.resetObservations.length > 0
+      || JSON.stringify(pendingObservationPlan.snapshots) !== JSON.stringify(runtime.state.heartbeatObservationSnapshots)) {
+      await sendHeartbeatRequest(runtime, secrets, paths, {
+        ...options,
+        roots,
+        observationCollection: collection
+      });
+    }
     if (historyRanges) {
       for (const [provider, range] of Object.entries(historyRanges)) {
         if (collection.providerScans?.[provider]?.progressComplete) {
@@ -1867,17 +2114,22 @@ export async function sync(options = {}) {
       }
     }
     const scannedAt = new Date(options.now ?? Date.now()).toISOString();
-    const eligibleEvents = collection.events.filter((event) =>
-      allowedProviderSet.has(event.provider) && supportedProviderSet.has(event.provider)
-    );
+    const eligibleEvents = collection.events.filter((event) => {
+      const serviceProviderId = serviceProviderForEvent(event);
+      return serviceProviderId !== null
+        && allowedProviderSet.has(serviceProviderId)
+        && supportedProviderSet.has(serviceProviderId);
+    });
     const currentWireEvents = eligibleEvents.map(toWireEvent).filter(Boolean);
     const scanSummary = safeScanSummary(collection.stats);
     const collectionPending = Object.values(collection.stats).some((adapter) => adapter.pending === true);
     const retainedUnresolved = [];
     const legacyRawOnlyEvents = [];
     for (const event of runtime.state.unresolvedEvents || []) {
-      const providerStillEligible = allowedProviderSet.has(event.provider)
-        && supportedProviderSet.has(event.provider);
+      const serviceProviderId = serviceProviderForEvent(event);
+      const providerStillEligible = serviceProviderId !== null
+        && allowedProviderSet.has(serviceProviderId)
+        && supportedProviderSet.has(serviceProviderId);
       const rawOnly = providerStillEligible
         ? legacyUnresolvedToRawOnlyWireEvent(event)
         : null;
@@ -1935,6 +2187,8 @@ export async function sync(options = {}) {
       // instead of producing a blind GENESIS or sibling generation.
       await sendHeartbeatRequest(runtime, secrets, paths, {
         ...options,
+        roots,
+        observationCollection: collection,
         hydrateCodexSnapshot: true
       });
     }
@@ -1999,12 +2253,12 @@ export async function sync(options = {}) {
       await cleanupSyncBatch(paths, createdOutbox.batchId);
       throw error;
     }
-    return processSyncOutbox(runtime, secrets, paths, options);
+    return processSyncOutbox(runtime, secrets, paths, { ...options, roots });
   });
 }
 
 export async function heartbeat(options = {}) {
-  const { paths } = runtimeOptions(options);
+  const { paths, roots } = runtimeOptions(options);
   await ensureRuntimeDirectory(paths);
   return withLock(paths.lock, async (lease) => {
     await cleanupStaleAtomicWriteTemps(paths, { ownerToken: lease.ownerToken });
@@ -2022,7 +2276,7 @@ export async function heartbeat(options = {}) {
         continuityState: recovered.response?.device?.continuityState || null
       };
     }
-    return sendHeartbeatRequest(runtime, secrets, paths, options);
+    return sendHeartbeatRequest(runtime, secrets, paths, { ...options, roots });
   });
 }
 
@@ -2138,8 +2392,15 @@ export async function doctor(options = {}) {
         fallbackEnabled: connectorStatus.transcriptFallbacks.kimi,
         accessible: !kimi.unavailable
       },
-      gemini: { status: "planned_official_telemetry_not_universal" },
-      grok: { status: "planned_official_telemetry" }
+      gemini: {
+        status: "antigravity_sanitized_statusline_capture",
+        fallbackEnabled: connectorStatus.transcriptFallbacks.gemini === true
+      },
+      grok: {
+        status: "local_session_summary_only",
+        fallbackEnabled: connectorStatus.transcriptFallbacks.grok === true
+      },
+      deepseek: { status: "hosted_model_attribution_or_explicit_api_evidence_only" }
     },
     networkProbePerformed: false
   };
@@ -2273,7 +2534,7 @@ export async function install(options = {}) {
   if (!options.confirmInstall) {
     return previewResult;
   }
-  const { paths } = runtimeOptions(options);
+  const { paths, roots } = runtimeOptions(options);
   await ensureRuntimeDirectory(paths);
   return withLock(paths.lock, async (lease) => {
     await cleanupStaleAtomicWriteTemps(paths, { ownerToken: lease.ownerToken });
@@ -2288,10 +2549,20 @@ export async function install(options = {}) {
       previewResult.releaseCopy.destination
     );
     const result = await applyScheduler(previewResult.plan, options);
+    const antigravity = (runtime.config.allowedPlatforms || []).includes("gemini")
+      ? await installAntigravityStatusline({
+          paths,
+          roots,
+          wrapperPath: path.join(previewResult.releaseCopy.destination, "src", "antigravity-wrapper.mjs"),
+          settingsPath: options.antigravitySettingsPath,
+          nodeExecutable: options.nodeExecutable
+        })
+      : { installed: false, reason: "gemini_not_consented" };
     return {
       executed: true,
       ...result,
       installedRelease: previewResult.releaseCopy.destination,
+      antigravity,
       plan: previewResult.plan
     };
   });
@@ -2302,7 +2573,7 @@ export async function uninstall(options = {}) {
   if (!options.confirmUninstall) {
     return previewResult;
   }
-  const { paths } = runtimeOptions(options);
+  const { paths, roots } = runtimeOptions(options);
   await ensureRuntimeDirectory(paths);
   return withLock(paths.lock, async (lease) => {
     await cleanupStaleAtomicWriteTemps(paths, { ownerToken: lease.ownerToken });
@@ -2313,6 +2584,11 @@ export async function uninstall(options = {}) {
       home: paths.home,
       env: options.env
     });
+    const antigravity = await uninstallAntigravityStatusline({
+      paths,
+      roots,
+      statePath: options.antigravityStatuslineStatePath
+    });
     const result = await removeScheduler(plan, options);
     const installedRelease = path.join(paths.home, "versions", CONNECTOR_VERSION);
     assertInstallTarget(paths.home, installedRelease);
@@ -2321,6 +2597,7 @@ export async function uninstall(options = {}) {
       executed: true,
       ...result,
       installedReleaseRemoved: true,
+      antigravity,
       localStateRemoved: false,
       localStatePreservedForRecovery: true
     };

@@ -1,6 +1,8 @@
 import {
+  ANTIGRAVITY_ACCOUNTING_VERSION,
   CLAUDE_ACCOUNTING_VERSION,
   CODEX_ACCOUNTING_VERSION,
+  GROK_BUILD_ACCOUNTING_VERSION,
   KIMI_ACCOUNTING_VERSION,
   MAX_CLAUDE_SEEN_EVENTS,
   MAX_CODEX_LOGICAL_SESSIONS,
@@ -13,15 +15,35 @@ import { chooseClaudeSnapshot, parseClaudeProject } from "./adapters/claude-proj
 import { readCodexAccountUsage } from "./adapters/codex-account-usage.mjs";
 import path from "node:path";
 import { parseKimiWire } from "./adapters/kimi-wire.mjs";
+import { parseAntigravityStatuslineLog } from "./adapters/antigravity-statusline.mjs";
+import { discoverGrokSignalFiles, parseGrokBuildSession } from "./adapters/grok-build-sessions.mjs";
 
 const AGGREGATE_USAGE_FIELDS = ["input", "cachedInput", "cacheWriteInput", "output", "reasoningOutput"];
 const WIRE_RAW_USAGE_FIELDS = ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens"];
 const LOGICAL_AGGREGATE_IDENTITY_SCHEMA = Object.freeze({
   codex: "session-hour-aggregate-v4",
   claude: "session-hour-aggregate-v4",
-  kimi: "session-hour-aggregate-v3"
+  gemini: "session-hour-aggregate-v1",
+  grok: "session-hour-aggregate-v1",
+  kimi: "session-hour-aggregate-v3",
+  deepseek: "session-hour-aggregate-v1"
 });
-const AGGREGATE_COLLECTOR_GENERATION = Object.freeze({ codex: 4, claude: 4, kimi: 3 });
+const AGGREGATE_COLLECTOR_GENERATION = Object.freeze({ codex: 4, claude: 4, gemini: 1, grok: 1, kimi: 3, deepseek: 1 });
+const HOST_PROVIDER_BY_SURFACE = Object.freeze({
+  codex: "codex",
+  claude_code: "claude",
+  kimi_code: "kimi",
+  antigravity: "gemini",
+  grok_build: "grok"
+});
+
+function serviceProviderForEvent(event) {
+  const inferred = HOST_PROVIDER_BY_SURFACE[event?.provenance?.surface];
+  if (!inferred) return null;
+  return event?.serviceProviderId === undefined || event.serviceProviderId === inferred
+    ? inferred
+    : null;
+}
 
 export function hasRawTokenUsage(event) {
   let total = 0n;
@@ -57,7 +79,8 @@ function createHourlyAggregator(options) {
       excluded += 1;
       return;
     }
-    const range = ranges[event.provider];
+    const serviceProviderId = serviceProviderForEvent(event);
+    const range = serviceProviderId ? ranges[serviceProviderId] : null;
     if (!range) return;
     const observedAtMs = Date.parse(event.observedAt || "");
     if (!Number.isFinite(observedAtMs)) {
@@ -77,6 +100,13 @@ function createHourlyAggregator(options) {
       return;
     }
     seenSourceEventIds.add(event.eventId);
+    // Preserve provider/component disagreements as individual raw-only
+    // observations. Grouping would erase the disagreement and could make the
+    // model components scoreable again.
+    if (event.usage?.componentConflict === true) {
+      passthrough.push(event);
+      return;
+    }
     if (!event.modelId && !event.sourceModelId) {
       passthrough.push(event);
       return;
@@ -105,6 +135,7 @@ function createHourlyAggregator(options) {
     const group = groups.get(key) || {
       hourStartMs,
       provider: event.provider,
+      serviceProviderId,
       modelId: event.modelId,
       sourceModelId: rawModelToken,
       mode: modeLabel(event),
@@ -129,6 +160,7 @@ function createHourlyAggregator(options) {
       events.push({
         eventId: accountScopedEventId(options.dedupNamespaceKey, group.provider, key),
         provider: group.provider,
+        serviceProviderId: group.serviceProviderId,
         modelId: group.modelId,
         sourceModelId: group.sourceModelId,
         observedAt: new Date(group.hourStartMs + 30 * 60 * 1_000).toISOString(),
@@ -226,7 +258,9 @@ export async function collectUsage(options) {
   const nextCursors = structuredClone(state.cursors || {
     codex: { accountingVersion: CODEX_ACCOUNTING_VERSION, files: {}, sessions: {} },
     claude: { accountingVersion: CLAUDE_ACCOUNTING_VERSION, seen: {} },
-    kimi: { accountingVersion: KIMI_ACCOUNTING_VERSION, files: {} }
+    kimi: { accountingVersion: KIMI_ACCOUNTING_VERSION, files: {} },
+    antigravity: { accountingVersion: ANTIGRAVITY_ACCOUNTING_VERSION },
+    grok: { accountingVersion: GROK_BUILD_ACCOUNTING_VERSION, sessions: {} }
   });
   nextCursors.codex = nextCursors.codex || { accountingVersion: CODEX_ACCOUNTING_VERSION, files: {}, sessions: {} };
   nextCursors.codex.accountingVersion = CODEX_ACCOUNTING_VERSION;
@@ -238,17 +272,24 @@ export async function collectUsage(options) {
   nextCursors.kimi = nextCursors.kimi || { accountingVersion: KIMI_ACCOUNTING_VERSION, files: {} };
   nextCursors.kimi.accountingVersion = KIMI_ACCOUNTING_VERSION;
   nextCursors.kimi.files = nextCursors.kimi.files || {};
+  nextCursors.antigravity = nextCursors.antigravity || { accountingVersion: ANTIGRAVITY_ACCOUNTING_VERSION };
+  nextCursors.antigravity.accountingVersion = ANTIGRAVITY_ACCOUNTING_VERSION;
+  nextCursors.grok = nextCursors.grok || { accountingVersion: GROK_BUILD_ACCOUNTING_VERSION, sessions: {} };
+  nextCursors.grok.accountingVersion = GROK_BUILD_ACCOUNTING_VERSION;
+  nextCursors.grok.sessions = nextCursors.grok.sessions || {};
   const result = {
     events: [],
     providerEvidence: {},
+    providerObservations: [],
+    resetObservations: [],
     providerScans: {},
     nextCursors,
     stats: {
       codex: { files: 0, events: 0, pending: false, malformed: 0, duplicateSnapshots: 0, cumulativeResets: 0, cumulativeMismatches: 0, inheritedSnapshots: 0, ambiguousLineage: 0, unclassifiedModes: 0, unavailable: false, collector: "local_log_fallback" },
       claude: { files: 0, events: 0, pending: false, malformed: 0, unavailable: false, collector: "local_log_fallback" },
-      gemini: { status: "pending_verified_adapter" },
+      gemini: { status: "opt_in_required", collector: "antigravity_statusline_v1_prospective", historicalCompleteness: "none" },
       kimi: { files: 0, events: 0, pending: false, malformed: 0, unavailable: false, collector: "kimi_v0_28_wire_usage_record_fallback" },
-      grok: { status: "pending_verified_adapter" }
+      grok: { status: "opt_in_required", collector: "grok_build_local_session_summary", historicalCompleteness: "none", accounting: "informational_only" }
     }
   };
 
@@ -261,7 +302,7 @@ export async function collectUsage(options) {
     result.providerEvidence.codex = { status: "not_queried" };
   }
 
-  const enabledFallbacks = options.enabledFallbacks || { codex: false, claude: false };
+  const enabledFallbacks = options.enabledFallbacks || { codex: false, claude: false, kimi: false, gemini: false, grok: false };
   const discover = options.discoverJsonlFiles || discoverJsonlFiles;
   const codexDiscovery = enabledFallbacks.codex
     ? await discover(roots.codex)
@@ -461,6 +502,76 @@ export async function collectUsage(options) {
   }
   nextCursors.kimi.files = newestEntries(nextCursors.kimi.files, MAX_CURSOR_FILES, "lastSeenAt");
 
+  // Antigravity never reads the product's raw status-line input from disk.
+  // The only accepted source is the future wrapper's sanitized append-only
+  // capture file. It is prospective: absence is expected before opt-in.
+  const antigravityEnabled = enabledFallbacks.gemini === true || enabledFallbacks.antigravity === true;
+  result.providerScans.gemini = {
+    enabled: antigravityEnabled,
+    discoveryComplete: antigravityEnabled,
+    complete: false,
+    reason: antigravityEnabled ? "prospective_statusline_capture" : "disabled",
+    range: aggregateRanges?.gemini || null,
+    historicalCompleteness: "none"
+  };
+  if (antigravityEnabled) {
+    const parsed = await parseAntigravityStatuslineLog(roots.antigravity, {
+      dedupNamespaceKey,
+      canonicalModelId: options.canonicalModelId
+    });
+    result.events.push(...parsed.events);
+    result.providerObservations.push(...parsed.planObservations);
+    result.resetObservations.push(...parsed.resetObservations);
+    result.stats.gemini = {
+      status: parsed.status,
+      reason: parsed.reason,
+      captures: parsed.captures,
+      events: parsed.events.length,
+      malformed: parsed.malformed,
+      collector: "antigravity_statusline_v1_prospective",
+      historicalCompleteness: "none"
+    };
+  }
+
+  // Grok Build's signals are intentionally surfaced only as a local usage
+  // capability. They are context/session summaries, so no event can enter the
+  // raw-token or scoring ledger from this source.
+  const grokEnabled = enabledFallbacks.grok === true;
+  const findGrokSignals = options.discoverGrokSignalFiles || discoverGrokSignalFiles;
+  const grokDiscovery = grokEnabled
+    ? await findGrokSignals(roots.grok)
+    : { files: [], unavailable: false, truncated: false };
+  result.providerScans.grok = {
+    enabled: grokEnabled,
+    discoveryComplete: Boolean(grokEnabled && !grokDiscovery.unavailable && !grokDiscovery.truncated),
+    complete: false,
+    reason: !grokEnabled ? "disabled" : (grokDiscovery.unavailable ? "unavailable" : (grokDiscovery.truncated ? "truncated" : "informational_session_summary_only")),
+    historicalCompleteness: "none"
+  };
+  if (grokEnabled) {
+    const sessions = [];
+    let malformed = 0;
+    for (const signalsPath of grokDiscovery.files) {
+      const parsed = await parseGrokBuildSession(signalsPath, { localAliasKey: secrets.localAliasKey });
+      if (parsed.status === "available_prospective_partial") sessions.push(parsed.session);
+      else if (parsed.status === "malformed") malformed += 1;
+    }
+    result.providerEvidence.grok = {
+      status: sessions.length > 0 ? "available_prospective_partial" : "unavailable",
+      reason: sessions.length > 0 ? "session_summary_not_token_ledger" : "no_supported_grok_build_session_signals",
+      sessions
+    };
+    result.stats.grok = {
+      status: sessions.length > 0 ? "available_prospective_partial" : (grokDiscovery.unavailable ? "unavailable" : "no_supported_session_signals"),
+      files: grokDiscovery.files.length,
+      malformed,
+      sessions: sessions.length,
+      collector: "grok_build_local_session_summary",
+      historicalCompleteness: "none",
+      accounting: "informational_only"
+    };
+  }
+
   for (const provider of ["codex", "claude", "kimi"]) {
     finalizeProviderCoverage(result, provider);
   }
@@ -489,21 +600,35 @@ export function toWireEvent(event) {
   if (!event?.eventId || !event?.provider || !event?.observedAt || !event?.usage || !event?.provenance?.surface) {
     return null;
   }
-  const usage = {
-    inputTokens: String(event.usage.input || 0),
-    cachedInputTokens: String(event.usage.cachedInput || 0),
-    cacheWriteInputTokens: String(event.usage.cacheWriteInput || 0),
-    outputTokens: String(event.usage.output || 0),
+  const serviceProviderId = serviceProviderForEvent(event);
+  if (!serviceProviderId) return null;
+  const componentConflict = event.usage.componentConflict === true;
+  const usage = componentConflict
+    ? {
+        // Raw-only rows have no model/category semantics. Put the authoritative
+        // provider total in one wire counter solely so the lossless raw ledger
+        // can retain it without inventing a proportional component split.
+        inputTokens: String(event.usage.reportedTotal || 0),
+        cachedInputTokens: "0",
+        cacheWriteInputTokens: "0",
+        outputTokens: "0"
+      }
+    : {
+        inputTokens: String(event.usage.input || 0),
+        cachedInputTokens: String(event.usage.cachedInput || 0),
+        cacheWriteInputTokens: String(event.usage.cacheWriteInput || 0),
+        outputTokens: String(event.usage.output || 0),
     ...(event.usage.reasoningOutput > 0 ? { reasoningTokens: String(event.usage.reasoningOutput) } : {})
-  };
+      };
   const common = {
     eventId: event.eventId,
     occurredAt: event.observedAt,
     provider: event.provider,
+    serviceProviderId,
     ...usage,
     surface: event.provenance.surface
   };
-  if (!event.modelId || event.modelId === "unknown" || event.mode?.classified !== true) {
+  if (componentConflict || !event.modelId || event.modelId === "unknown" || event.mode?.classified !== true) {
     const rawOnly = {
       ...common,
       attribution: "raw_only",
@@ -524,9 +649,11 @@ export function aggregatePreview(collection) {
   const groups = new Map();
   for (const event of collection.events) {
     const mode = modeLabel(event);
-    const key = [event.provider, event.modelId || "unscored", mode].join("|");
+    const serviceProviderId = serviceProviderForEvent(event);
+    const key = [event.provider, serviceProviderId || "unknown-host", event.modelId || "unscored", mode].join("|");
     const current = groups.get(key) || {
       provider: event.provider,
+      serviceProviderId,
       model: event.modelId,
       sourceModelId: event.sourceModelId,
       scored: Boolean(event.modelId),

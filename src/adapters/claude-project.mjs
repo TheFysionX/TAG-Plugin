@@ -1,6 +1,6 @@
 import { normalizeMode, normalizeModel, normalizeTimestamp, normalizeUsage, readCompleteJsonLines, totalForComparison } from "./shared.mjs";
 import { accountScopedEventId, sha256 } from "../crypto.mjs";
-import { canonicalModelId } from "../model-registry.mjs";
+import { canonicalModelId, providerForModelId } from "../model-registry.mjs";
 import path from "node:path";
 
 function assistantSnapshot(record, options, line) {
@@ -24,6 +24,8 @@ function assistantSnapshot(record, options, line) {
   const sourceModelId = normalizeModel(record.message.model);
   const resolveModel = options.canonicalModelId || canonicalModelId;
   const usage = normalizeUsage(record.message.usage, "claude");
+  const modelId = resolveModel("claude", sourceModelId);
+  const provider = providerForModelId(modelId) || "claude";
   // Claude writes terminal synthetic assistant records for API failures and
   // "No response requested.". They have usage metadata but no usage. Keeping
   // them would create phantom raw-only aggregates and false overlap signals.
@@ -32,8 +34,9 @@ function assistantSnapshot(record, options, line) {
   }
   return {
     eventId: accountScopedEventId(options.dedupNamespaceKey, "claude", messageId),
-    provider: "claude",
-    modelId: resolveModel("claude", sourceModelId),
+    provider,
+    serviceProviderId: "claude",
+    modelId,
     sourceModelId,
     aggregationScope: options.stableJournalIdentity,
     aggregationModeToken: sha256([
