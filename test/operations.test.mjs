@@ -4019,7 +4019,7 @@ test("Windows installation fails closed before copying or scheduling when ACL ha
   }), (error) => error.code === "WINDOWS_ACL_HARDENING_FAILED");
   assert.equal(commands.length, 1);
   assert.match(commands[0][0], /powershell\.exe$/i);
-  const installedPath = path.join(fixture.home, "versions", "0.1.10");
+  const installedPath = path.join(fixture.home, "versions", "0.1.11");
   assert.equal(await fs.access(installedPath).then(() => true).catch(() => false), false);
 });
 
@@ -4052,7 +4052,7 @@ test("confirmed install and uninstall refuse to overlap another connector operat
 
   assert.deepEqual(commands, []);
   assert.equal(
-    await fs.access(path.join(fixture.home, "versions", "0.1.10")).then(() => true).catch(() => false),
+    await fs.access(path.join(fixture.home, "versions", "0.1.11")).then(() => true).catch(() => false),
     false
   );
 });
