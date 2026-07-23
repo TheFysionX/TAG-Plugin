@@ -4079,8 +4079,9 @@ test("scheduler mutation is preview-only until the exact confirmation flag", asy
   assert.match(commands[0].join(" "), /SetAccessRuleProtection/);
   assert.match(commands[0].join(" "), /Current-user-only ACL verification failed/);
   assert.equal(commands[1][0], "schtasks.exe");
-  assert.match(commands[1].join(" "), /[\\/]launcher\.mjs/);
-  assert.match(commands[1].join(" "), /scheduled-run --home/);
+  assert.match(commands[1].join(" "), /wscript\.exe.*\/\/B.*tag-plugin-scheduled-run\.vbs/i);
+  assert.doesNotMatch(commands[1].join(" "), /node\.exe/i);
+  assert.match(await fs.readFile(path.join(fixture.home, "tag-plugin-scheduled-run.vbs"), "utf8"), /scheduled-run --home/);
   assert.equal(await fs.access(fixture.paths.launcher).then(() => true), true);
   assert.equal(await fs.access(fixture.paths.activeRelease).then(() => true), true);
   assert.equal(await fs.access(path.join(installed.installedRelease, "package.json")).then(() => true), true);

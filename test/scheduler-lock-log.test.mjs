@@ -9,7 +9,7 @@ import { connectorHome, providerRoots, runtimePaths } from "../src/paths.mjs";
 import { safeLog } from "../src/safe-log.mjs";
 import { applyScheduler, removeScheduler, schedulerPlan } from "../src/scheduler.mjs";
 
-test("Windows scheduler plan is branded, hourly, current-user-only, and has no elevation flags", () => {
+test("Windows scheduler plan is branded, hourly, current-user-only, and launches through a hidden runner", () => {
   assert.equal(
     connectorHome({ LOCALAPPDATA: "C:/Local" }, "win32"),
     path.join("C:/Local", "The Artificial Games", "TAG Plugin")
@@ -43,11 +43,39 @@ test("Windows scheduler plan is branded, hourly, current-user-only, and has no e
   assert.equal(plan.cadence, "hourly");
   assert.match(plan.create.arguments.join(" "), /\/RL LIMITED/);
   assert.match(plan.create.arguments.join(" "), /\/TN TAG Plugin/);
-  assert.match(plan.create.arguments.join(" "), /scheduled-run --home/);
+  assert.match(plan.create.arguments.join(" "), /wscript\.exe.*\/\/B.*tag-plugin-scheduled-run\.vbs/i);
+  assert.doesNotMatch(plan.create.arguments.join(" "), /node\.exe/i);
+  assert.match(plan.create.hiddenRunnerContents, /WScript\.Quit shell\.Run/);
+  assert.match(plan.create.hiddenRunnerContents, /scheduled-run --home/);
+  assert.match(plan.create.hiddenRunnerContents, /, 0, True\)/);
   assert.equal(
     plan.create.arguments.some((argument) => /^(?:SYSTEM|HIGHEST|\/RU)$/i.test(argument)),
     false
   );
+});
+
+test("Windows scheduler writes and removes only its hidden runner in connector state", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-windows-scheduler-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const home = path.join(temporary, "state");
+  const commands = [];
+  const plan = schedulerPlan({
+    platform: "win32",
+    home,
+    nodeExecutable: "C:/Program Files/nodejs/node.exe",
+    cliPath: path.join(temporary, "launcher.mjs"),
+    userHome: temporary,
+    systemRoot: "C:\\Windows"
+  });
+  const runCommand = async (executable, args) => commands.push([executable, ...args]);
+  await applyScheduler(plan, { runCommand });
+  const runner = await fs.readFile(plan.create.hiddenRunner, "utf8");
+  assert.match(runner, /WScript\.Quit shell\.Run/);
+  assert.match(runner, /, 0, True\)/);
+  assert.doesNotMatch(runner, /cmd\.exe/i);
+  assert.equal(commands[0][0], "schtasks.exe");
+  await removeScheduler(plan, { runCommand });
+  assert.equal(await fs.access(plan.create.hiddenRunner).then(() => true).catch(() => false), false);
 });
 
 test("repeated Windows uninstall ignores only the known missing-task outcome", async () => {

@@ -11,6 +11,27 @@ function quoted(value) {
   return '"' + String(value).replaceAll('"', '\\"') + '"';
 }
 
+function vbsQuoted(value) {
+  return '"' + String(value).replaceAll('"', '""') + '"';
+}
+
+function windowsHiddenRunnerContents(nodeExecutable, cliPath, home) {
+  const command = [
+    quoted(nodeExecutable),
+    quoted(cliPath),
+    "scheduled-run",
+    "--home",
+    quoted(home)
+  ].join(" ");
+  return [
+    "Option Explicit",
+    "Dim shell",
+    'Set shell = CreateObject("WScript.Shell")',
+    "WScript.Quit shell.Run(" + vbsQuoted(command) + ", 0, True)",
+    ""
+  ].join("\r\n");
+}
+
 function xml(value) {
   return String(value)
     .replaceAll("&", "&amp;")
@@ -31,6 +52,9 @@ export function schedulerPlan(options = {}) {
   const home = path.resolve(options.home);
   const userHome = path.resolve(options.userHome || defaultUserHome(options.env));
   if (platform === "win32") {
+    const systemRoot = options.systemRoot || options.env?.SystemRoot || process.env.SystemRoot || "C:\\Windows";
+    const scriptHost = path.win32.join(systemRoot, "System32", "wscript.exe");
+    const hiddenRunner = path.join(home, "tag-plugin-scheduled-run.vbs");
     return {
       platform: "windows",
       currentUserOnly: true,
@@ -38,18 +62,21 @@ export function schedulerPlan(options = {}) {
       cadence: "hourly",
       create: {
         executable: "schtasks.exe",
+        hiddenRunner,
+        hiddenRunnerContents: windowsHiddenRunnerContents(nodeExecutable, cliPath, home),
         arguments: [
           "/Create", "/SC", "HOURLY", "/MO", "1", "/TN", "TAG Plugin",
-          "/TR", quoted(nodeExecutable) + " " + quoted(cliPath) + " scheduled-run --home " + quoted(home),
+          "/TR", quoted(scriptHost) + " //B " + quoted(hiddenRunner),
           "/RL", "LIMITED",
           "/F"
         ]
       },
       remove: {
         executable: "schtasks.exe",
-        arguments: ["/Delete", "/TN", "TAG Plugin", "/F"]
+        arguments: ["/Delete", "/TN", "TAG Plugin", "/F"],
+        files: [hiddenRunner]
       },
-      files: [home]
+      files: [home, hiddenRunner]
     };
   }
   if (platform === "darwin") {
@@ -186,6 +213,8 @@ export async function applyScheduler(plan, options = {}) {
   const run = options.runCommand || defaultRunner;
   const fileSystem = options.fileSystem || fs;
   if (plan.platform === "windows") {
+    await fileSystem.mkdir(path.dirname(plan.create.hiddenRunner), { recursive: true, mode: 0o700 });
+    await atomicSchedulerWrite(fileSystem, plan.create.hiddenRunner, plan.create.hiddenRunnerContents);
     await run(plan.create.executable, plan.create.arguments);
   } else if (plan.platform === "macos") {
     await fileSystem.mkdir(path.dirname(plan.create.file), { recursive: true, mode: 0o700 });
@@ -216,6 +245,9 @@ export async function removeScheduler(plan, options = {}) {
   const fileSystem = options.fileSystem || fs;
   if (plan.platform === "windows") {
     await runAllowingKnownMissing("windows", run, plan.remove.executable, plan.remove.arguments);
+    for (const file of plan.remove.files) {
+      await fileSystem.rm(file, { force: true });
+    }
   } else if (plan.platform === "macos") {
     await runAllowingKnownMissing("macos", run, plan.remove.command.executable, plan.remove.command.arguments);
     for (const file of plan.remove.files) {

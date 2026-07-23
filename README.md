@@ -10,6 +10,10 @@ The initial confirmed installation explicitly authorizes future **verified stabl
 
 `v0.1.20` moves existing paired installations from the retired `the-artificial-games-dev.theo-lupescu.workers.dev` Worker origin to `app.theartificialgames.workers.dev`. It preserves the existing device key and signed request chain. The migration is deliberately limited to that one exact retired origin; any other endpoint change still requires an explicit re-pair.
 
+## v0.1.21 quiet Windows scheduler
+
+`v0.1.21` has Windows Task Scheduler call a small local WScript wrapper instead of launching Node directly. The wrapper starts the same current-user heartbeat hidden, waits for it to finish, and returns its exit code to Task Scheduler. New Windows installations no longer flash a terminal window for hourly heartbeats.
+
 ## What is supported
 
 | Provider | Preferred source | Model-level source | Current status |

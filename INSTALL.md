@@ -54,11 +54,11 @@ node src/cli.mjs sync
 node src/cli.mjs heartbeat
 ```
 
-- Windows: creates one hourly Task Scheduler task for the current user.
+- Windows: creates one hourly Task Scheduler task for the current user. It calls a local hidden WScript runner, so the scheduled heartbeat does not open a terminal window.
 - macOS: creates one user LaunchAgent.
 - Linux: creates one `systemd --user` service and timer.
 
-The confirmed install first acquires the connector overlap lock, reclaims only stale exact runtime-JSON atomic temps that pass the lock/age/dead-PID safety checks, copies the already verified release into `<connector-home>/versions/<connector-version>`, writes the stable `launcher.mjs` and atomic `active-release.json` pointer, and makes the scheduler target that launcher. Later verified updates use a separate update lock/state and do not overwrite an existing version directory. Every scheduler command includes `--home <connector-home>`, including when a custom home was supplied. On Windows, a local non-interactive PowerShell ACL operation disables inheritance, replaces all access rules with one full-control grant for the resolved current user, and verifies the resulting SID/rule before continuing; installation stops before copying or scheduling if that operation fails.
+The confirmed install first acquires the connector overlap lock, reclaims only stale exact runtime-JSON atomic temps that pass the lock/age/dead-PID safety checks, copies the already verified release into `<connector-home>/versions/<connector-version>`, writes the stable `launcher.mjs` and atomic `active-release.json` pointer, and makes the scheduler target that launcher. On Windows, the task targets a generated `tag-plugin-scheduled-run.vbs` wrapper in that same current-user connector directory, which starts the launcher hidden and waits for its exit code. Later verified updates use a separate update lock/state and do not overwrite an existing version directory. Every scheduler command includes `--home <connector-home>`, including when a custom home was supplied. On Windows, a local non-interactive PowerShell ACL operation disables inheritance, replaces all access rules with one full-control grant for the resolved current user, and verifies the resulting SID/rule before continuing; installation stops before copying or scheduling if that operation fails.
 
 The immediate sync uploads the available allowlisted usage records, and the heartbeat establishes continuity without waiting for the first hourly trigger. No platform path uses an administrator, root, SYSTEM account, highest-run-level flag, or system-wide service directory.
 
