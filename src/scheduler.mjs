@@ -66,7 +66,7 @@ export function schedulerPlan(options = {}) {
         hiddenRunnerContents: windowsHiddenRunnerContents(nodeExecutable, cliPath, home),
         arguments: [
           "/Create", "/SC", "HOURLY", "/MO", "1", "/TN", "TAG Plugin",
-          "/TR", quoted(scriptHost) + " //B " + quoted(hiddenRunner),
+          "/TR", "'" + scriptHost + "' //B \\\"" + hiddenRunner + "\\\"",
           "/RL", "LIMITED",
           "/F"
         ]
