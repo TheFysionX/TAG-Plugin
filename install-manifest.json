@@ -6,7 +6,7 @@
     "repository": "https://github.com/TheFysionX/TAG-Plugin",
     "package": "@the-artificial-games/tag-plugin"
   },
-  "connectorVersion": "0.1.19",
+  "connectorVersion": "0.1.20",
   "runtime": {
     "name": "Node.js",
     "minimumMajor": 22,
@@ -22,7 +22,7 @@
     "failurePolicy": "an update failure never rolls back or invalidates an already committed sync or heartbeat; the current and previous releases remain available"
   },
   "releaseArtifact": {
-    "archiveName": "tag-plugin-0.1.19.tgz",
+    "archiveName": "tag-plugin-0.1.20.tgz",
     "includesSyntheticTestSuite": true,
     "testCommand": "npm test",
     "releaseContract": "require package @the-artificial-games/tag-plugin; reject -local; require tag v<package-version>; require package, runtime constant, and manifest versions to match; require archive tag-plugin-<package-version>.tgz",

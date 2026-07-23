@@ -6,6 +6,10 @@ Official builds are published only as versioned, checksummed, attested GitHub re
 
 The initial confirmed installation explicitly authorizes future **verified stable updates**. After a successful signed heartbeat, TAG may accept only a newer release offer pinned to the official GitHub repository, exact tag, full commit, archive name, and SHA-256. It independently verifies those release facts, safely validates the package contract, adds an immutable `versions/<version>` directory, and atomically changes a stable local launcher pointer. A verification or download failure is fail-open for the completed heartbeat: it does not invalidate that sync, replace the active release, or discard pairing, state, or pending outbox data. This updater does not perform local GitHub-attestation verification or use an offline release-envelope signature. Existing `v0.1.9` installations require one explicit install of the first updater-capable release before this heartbeat path exists.
 
+## v0.1.20 endpoint migration
+
+`v0.1.20` moves existing paired installations from the retired `the-artificial-games-dev.theo-lupescu.workers.dev` Worker origin to `app.theartificialgames.workers.dev`. It preserves the existing device key and signed request chain. The migration is deliberately limited to that one exact retired origin; any other endpoint change still requires an explicit re-pair.
+
 ## What is supported
 
 | Provider | Preferred source | Model-level source | Current status |

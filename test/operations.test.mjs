@@ -3906,6 +3906,38 @@ test("heartbeat uses the same monotonic request chain", async (context) => {
   assert.equal(updated.state.previousRequestDigest, "digest_next_1234567890");
 });
 
+test("heartbeat migrates the retired Worker endpoint before sending an existing device request", async (context) => {
+  const fixture = await setup();
+  context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));
+  const secrets = createDeviceSecrets();
+  secrets.dedupNamespaceKey = dedupNamespaceKey;
+  const state = initialState();
+  state.paired = true;
+  state.deviceId = "device_endpoint_migration";
+  const config = initialConfig();
+  config.endpoint = "https://the-artificial-games-dev.theo-lupescu.workers.dev";
+  await saveSecrets(fixture.paths, secrets);
+  await saveRuntime(fixture.paths, { state, config });
+  let requestUrl;
+  await heartbeat({
+    home: fixture.home,
+    fetchImpl: async (url) => {
+      requestUrl = url;
+      return jsonResponse({
+        request: { digest: "digest_endpoint_migration_1234567890" },
+        heartbeat: { nextExpectedAt: "2026-07-19T13:00:00.000Z" },
+        device: { continuityState: "continuous" }
+      });
+    },
+    now: Date.parse("2026-07-19T12:00:00.000Z"),
+    nonce: "endpoint-migration-request",
+    skipAutomaticUpdate: true
+  });
+  assert.equal(requestUrl, "https://app.theartificialgames.workers.dev/api/connectors/v1/heartbeat");
+  const updated = await loadRuntime(fixture.paths);
+  assert.equal(updated.config.endpoint, "https://app.theartificialgames.workers.dev");
+});
+
 test("a failed automatic update cannot roll back a committed heartbeat", async (context) => {
   const fixture = await setup();
   context.after(() => fs.rm(fixture.temporary, { recursive: true, force: true }));

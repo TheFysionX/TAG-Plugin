@@ -112,6 +112,12 @@ const BISECTABLE_SYNC_CODES = new Set([
   "CHECKPOINT_SOURCE_NOT_SUPPORTED",
   "MIXED_INGEST_NOT_ALLOWED"
 ]);
+const RETIRED_ENDPOINT_MIGRATIONS = new Map([
+  [
+    "https://the-artificial-games-dev.theo-lupescu.workers.dev",
+    "https://app.theartificialgames.workers.dev"
+  ]
+]);
 
 function isDedupNamespaceKey(value) {
   return typeof value === "string"
@@ -149,6 +155,23 @@ function assertPaired(state, config, secrets) {
       "This pairing predates account-scoped deduplication. Re-pair the connector before syncing."
     );
   }
+}
+
+// The backend service moved behind the public application Worker. The device
+// key and signed request chain remain valid because requests are authenticated
+// by route and body, not by hostname. Migrate only this exact retired origin;
+// arbitrary endpoint changes still require an explicit re-pair.
+async function migrateRetiredEndpoint(runtime, paths) {
+  const replacement = RETIRED_ENDPOINT_MIGRATIONS.get(runtime.config.endpoint);
+  if (!replacement) return false;
+  runtime.config.endpoint = replacement;
+  await saveRuntime(paths, runtime);
+  await safeLog(paths.log, {
+    action: "endpoint_migration",
+    status: "success",
+    migration: "retired_workers_dev_to_public_app"
+  });
+  return true;
 }
 
 function safeScanSummary(stats) {
@@ -2153,6 +2176,7 @@ export async function sync(options = {}) {
   return withLock(paths.lock, async (lease) => {
     await cleanupStaleAtomicWriteTemps(paths, { ownerToken: lease.ownerToken });
     const runtime = await loadRuntime(paths);
+    await migrateRetiredEndpoint(runtime, paths);
     const secrets = await loadSecrets(paths);
     assertPaired(runtime.state, runtime.config, secrets);
     const aggregateHistory = options.aggregateHistory === true;
@@ -2533,6 +2557,7 @@ async function heartbeatCore(options = {}) {
   return withLock(paths.lock, async (lease) => {
     await cleanupStaleAtomicWriteTemps(paths, { ownerToken: lease.ownerToken });
     const runtime = await loadRuntime(paths);
+    await migrateRetiredEndpoint(runtime, paths);
     const secrets = await loadSecrets(paths);
     assertPaired(runtime.state, runtime.config, secrets);
     assertPendingCanReplay(runtime);
