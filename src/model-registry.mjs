@@ -8,6 +8,7 @@ const MODEL_PROVIDERS = new Map(Object.entries({
   "gpt-5.3-codex": "codex",
   "gpt-5.2": "codex",
   "claude-fable-5": "claude",
+  "claude-opus-5": "claude",
   "claude-opus-4.8": "claude",
   "claude-opus-4.7": "claude",
   "claude-opus-4.6": "claude",
@@ -41,6 +42,7 @@ const KNOWN_MODELS = new Set(MODEL_PROVIDERS.keys());
 const CLAUDE_ALIASES = [
   [/^claude-sonnet-5(?:[-@]\d{8})?$/, "claude-sonnet-5"],
   [/^claude-fable-5(?:[-@]\d{8})?$/, "claude-fable-5"],
+  [/^claude-opus-5(?:[-@]\d{8})?$/, "claude-opus-5"],
   [/^claude-opus-4[-.]8(?:[-@]\d{8})?$/, "claude-opus-4.8"],
   [/^claude-opus-4[-.]7(?:[-@]\d{8})?$/, "claude-opus-4.7"],
   [/^claude-opus-4[-.]6(?:[-@]\d{8})?$/, "claude-opus-4.6"],

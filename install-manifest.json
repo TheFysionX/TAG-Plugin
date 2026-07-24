@@ -6,7 +6,7 @@
     "repository": "https://github.com/TheFysionX/TAG-Plugin",
     "package": "@the-artificial-games/tag-plugin"
   },
-  "connectorVersion": "0.1.22",
+  "connectorVersion": "0.1.23",
   "runtime": {
     "name": "Node.js",
     "minimumMajor": 22,
@@ -22,7 +22,7 @@
     "failurePolicy": "an update failure never rolls back or invalidates an already committed sync or heartbeat; the current and previous releases remain available"
   },
   "releaseArtifact": {
-    "archiveName": "tag-plugin-0.1.22.tgz",
+    "archiveName": "tag-plugin-0.1.23.tgz",
     "includesSyntheticTestSuite": true,
     "testCommand": "npm test",
     "releaseContract": "require package @the-artificial-games/tag-plugin; reject -local; require tag v<package-version>; require package, runtime constant, and manifest versions to match; require archive tag-plugin-<package-version>.tgz",
@@ -45,6 +45,13 @@
     ]
   },
   "localReads": [
+    {
+      "provider": "all",
+      "surface": "content-free local provider detection (data-directory presence only)",
+      "contentFree": true,
+      "default": true,
+      "purpose": "checks only whether each supported provider's local data directory exists so the connector can report which providers are recognized on this machine; never opens, lists, or reads any file inside those directories. Detecting a provider never starts tracking it: reading a provider's usage stays an explicit choice unless the separate auto-track standing consent is enabled, and even then only for a provider the account already authorized"
+    },
     {
       "provider": "codex",
       "surface": "codex app-server account/usage/read",
@@ -231,7 +238,8 @@
     "rawPlanCode",
     "observedAt",
     "windowKey (reset observations only)",
-    "resetAtBefore/resetAtAfter (actual quota reset only)"
+    "resetAtBefore/resetAtAfter (actual quota reset only)",
+    "detectedProviders[] (content-free local presence only: providerId, detected, ready, and a coarse reason code; no paths, file contents, versions, or timestamps; sent only when detection reporting is explicitly enabled)"
   ],
   "neverUploadedPersistedHashedOrLogged": [
     "prompts",

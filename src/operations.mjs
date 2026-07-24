@@ -32,6 +32,8 @@ import { ConnectorError } from "./errors.mjs";
 import { signedPost, validateEndpoint } from "./http.mjs";
 import { withLock } from "./lock.mjs";
 import { canonicalModelId } from "./model-registry.mjs";
+import { PROVIDER_DESCRIPTORS } from "./providers/registry.mjs";
+import { DETECTION_STATE_VERSION, detectionWireReport, probeInstalledProviders } from "./providers/detect.mjs";
 import { providerRoots, runtimePaths } from "./paths.mjs";
 import { safeLog } from "./safe-log.mjs";
 import { applyScheduler, removeScheduler, schedulerPlan } from "./scheduler.mjs";
@@ -1041,6 +1043,9 @@ async function finalizePending(runtime, response, paths) {
     }
   }
   applyAcceptedRequest(runtime.state, response);
+  if (pending.kind === "heartbeat") {
+    applyServerControls(runtime, response);
+  }
   if (pending.kind === "sync") {
     const outbox = syncOutbox;
     const rejected = Number.isSafeInteger(response.rejected) ? response.rejected : 0;
@@ -1167,6 +1172,39 @@ function observationProviderEnabled(runtime, providerId) {
   const allowed = new Set(runtime.config.allowedPlatforms || []);
   const supported = runtime.config.supportedProviders || [];
   return allowed.has(providerId) && (supported.length === 0 || supported.includes(providerId));
+}
+
+// Defensive wrapper: a detection failure must never abort a scan or heartbeat.
+async function probeDetection(roots, options) {
+  const probe = options.probeInstalledProviders || probeInstalledProviders;
+  try {
+    return await probe(roots, { now: options.now });
+  } catch {
+    return null;
+  }
+}
+
+// When auto-track is on, standing consent promotes a freshly detected journal
+// provider to tracked in the same scan. It can only ever enable providers the
+// server already authorized (allowedPlatforms ∩ supportedProviders); it never
+// widens the server grant, and version-pinned / non-journal providers are left
+// to their own explicit gates.
+function applyAutoTrackConsent(config, detection) {
+  if (config.autoTrack !== true || !detection) return [];
+  const allowed = new Set(config.allowedPlatforms || []);
+  const supported = new Set(config.supportedProviders || []);
+  const enabled = [];
+  for (const descriptor of PROVIDER_DESCRIPTORS) {
+    if (descriptor.trackingClass !== "journal") continue;
+    const probe = detection[descriptor.id];
+    if (!probe?.detected || probe.ready !== true) continue;
+    if (!allowed.has(descriptor.id) || !supported.has(descriptor.id)) continue;
+    if (config.transcriptFallbacks[descriptor.id] !== true) {
+      config.transcriptFallbacks[descriptor.id] = true;
+      enabled.push(descriptor.id);
+    }
+  }
+  return enabled;
 }
 
 function deepseekUsageEvidencePresent(value) {
@@ -1407,6 +1445,67 @@ async function heartbeatObservationPlan(runtime, secrets, roots, options) {
   };
 }
 
+// The website account settings are the consent surface for tracking. A signed
+// heartbeat response may carry the account's current switches; the connector
+// applies them locally so a Settings change takes effect within the hour.
+// Consent can only ever move along explicit paths:
+//   - autoTrack/reportDetection apply only when the account has actually used
+//     the website switches (controls.configured), so a default response can
+//     never overwrite a locally chosen value.
+//   - A journal read turns ON only for a provider in journalProviders — the
+//     server sends there only explicit website Track choices, never legacy
+//     signup selections — and turns OFF only when the provider was untracked.
+//     A provider that is tracked but has no website journal choice keeps its
+//     local (pair-time) consent untouched.
+//   - The Antigravity status-line wrapper keeps its separate local consent and
+//     is never enabled from here.
+export function applyServerControls(runtime, response) {
+  const controls = response?.controls;
+  if (!controls || typeof controls !== "object" || Array.isArray(controls)) return false;
+  let changed = false;
+  if (controls.configured === true) {
+    if (controls.autoTrack === true || controls.autoTrack === false) {
+      changed ||= runtime.config.autoTrack !== controls.autoTrack;
+      runtime.config.autoTrack = controls.autoTrack;
+    }
+    if (controls.reportDetection === true || controls.reportDetection === false) {
+      changed ||= runtime.config.reportDetection !== controls.reportDetection;
+      runtime.config.reportDetection = controls.reportDetection;
+    }
+  }
+  if (Array.isArray(controls.trackedProviders)) {
+    const supported = new Set((runtime.config.supportedProviders?.length
+      ? runtime.config.supportedProviders
+      : PROVIDER_DESCRIPTORS.map((descriptor) => descriptor.id)));
+    const validProvider = (id) => typeof id === "string"
+      && supported.has(id)
+      && PROVIDER_DESCRIPTORS.some((descriptor) => descriptor.id === id);
+    const tracked = [...new Set(controls.trackedProviders)].filter(validProvider).sort();
+    const journalConsent = new Set((Array.isArray(controls.journalProviders)
+      ? controls.journalProviders
+      : []).filter(validProvider));
+    if (JSON.stringify(tracked) !== JSON.stringify([...(runtime.config.allowedPlatforms || [])].sort())) {
+      runtime.config.allowedPlatforms = tracked;
+      changed = true;
+    }
+    for (const descriptor of PROVIDER_DESCRIPTORS) {
+      if (descriptor.trackingClass !== "journal") continue;
+      const current = Boolean(runtime.config.transcriptFallbacks[descriptor.id]);
+      let next = current;
+      if (!tracked.includes(descriptor.id)) {
+        next = false;
+      } else if (journalConsent.has(descriptor.id)) {
+        next = true;
+      }
+      if (current !== next) {
+        runtime.config.transcriptFallbacks[descriptor.id] = next;
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
 function heartbeatObservationsAcknowledged(body, response) {
   const expectedPlans = body.providerObservations || [];
   const expectedResets = body.resetObservations || [];
@@ -1535,11 +1634,19 @@ async function sendHeartbeatRequest(runtime, secrets, paths, options) {
     || runtime.state.unresolvedOverflow.totalDropped > 0
     || (effectiveBackfill?.pendingProviders?.length || 0) > 0
     || Boolean(runtime.state.syncOutbox?.permanentFailure);
+  // Only send the content-free detection snapshot once the operator has enabled
+  // reporting (which they do after confirming the deployed server accepts it).
+  // Default-off guarantees a connector never sends a field an older server would
+  // reject and stall the signed request chain on.
+  const detectedProviders = runtime.config.reportDetection === true
+    ? detectionWireReport(runtime.state.detection)
+    : [];
   const body = {
     observedAt,
     status: runtime.state.paused ? "paused" : (degraded ? "degraded" : "healthy"),
     connectorVersion: CONNECTOR_VERSION,
     previousRequestDigest: runtime.state.previousRequestDigest,
+    ...(detectedProviders.length > 0 ? { detectedProviders } : {}),
     ...(observationPlan.providerObservations.length > 0
       ? { providerObservations: observationPlan.providerObservations }
       : {}),
@@ -2249,6 +2356,19 @@ export async function sync(options = {}) {
     if (runtime.state.paused) {
       return { skipped: true, reason: "paused" };
     }
+    // Content-free local detection runs before consent is resolved so that,
+    // with auto-track enabled, a newly detected provider begins tracking in this
+    // same scan. The probe only checks directory presence; it opens no journal
+    // and can never abort the scan.
+    const detection = await probeDetection(roots, options);
+    if (detection) {
+      runtime.state.detection = {
+        version: DETECTION_STATE_VERSION,
+        providers: detection,
+        lastRefreshedAt: new Date(options.now ?? Date.now()).toISOString()
+      };
+      applyAutoTrackConsent(runtime.config, detection);
+    }
     const configuredFallbacks = allowedFallbacks(
       consentedFallbacks(runtime.config, runtime.config.transcriptFallbacks),
       runtime.config.allowedPlatforms
@@ -2651,6 +2771,9 @@ export async function status(options = {}) {
     allowedPlatforms: config.allowedPlatforms || [],
     supportedProviders: config.supportedProviders || [],
     transcriptFallbacks: config.transcriptFallbacks,
+    autoTrack: config.autoTrack === true,
+    reportDetection: config.reportDetection === true,
+    detection: state.detection,
     adapters: adapterStatus(),
     updates: {
       installedVersion: updateState.installedVersion,
@@ -2659,6 +2782,47 @@ export async function status(options = {}) {
       safeErrorCode: updateState.safeErrorCode
     }
   };
+}
+
+// Force a content-free re-detection now instead of waiting for the next hourly
+// scan, and optionally set the auto-track standing consent. No network; writes
+// only the local detection snapshot and (when auto-track is on and the provider
+// is already authorized) the resolved consent flags.
+export async function refreshDetection(options = {}) {
+  const { paths, roots } = runtimeOptions(options);
+  // refresh-detection is a lightweight diagnostic that can run before any pair
+  // or install has created the home, so the runtime directory must exist before
+  // the lock file is opened inside it.
+  await ensureRuntimeDirectory(paths);
+  return withLock(paths.lock, async () => {
+    const runtime = await loadRuntime(paths);
+    if (options.setAutoTrack === true || options.setAutoTrack === false) {
+      runtime.config.autoTrack = options.setAutoTrack;
+    }
+    if (options.setReportDetection === true || options.setReportDetection === false) {
+      runtime.config.reportDetection = options.setReportDetection;
+    }
+    const detection = await probeDetection(roots, options);
+    const refreshedAt = new Date(options.now ?? Date.now()).toISOString();
+    if (detection) {
+      runtime.state.detection = {
+        version: DETECTION_STATE_VERSION,
+        providers: detection,
+        lastRefreshedAt: refreshedAt
+      };
+    }
+    const autoEnabledTracking = detection ? applyAutoTrackConsent(runtime.config, detection) : [];
+    await saveRuntime(paths, runtime);
+    return {
+      probed: Boolean(detection),
+      refreshedAt: detection ? refreshedAt : null,
+      autoTrack: runtime.config.autoTrack === true,
+      reportDetection: runtime.config.reportDetection === true,
+      autoEnabledTracking,
+      detection: runtime.state.detection,
+      transcriptFallbacks: runtime.config.transcriptFallbacks
+    };
+  });
 }
 
 export async function doctor(options = {}) {

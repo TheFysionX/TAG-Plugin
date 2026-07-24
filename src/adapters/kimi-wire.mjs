@@ -13,6 +13,15 @@ function getUsageRecord(record) {
   if (record?.type !== "usage.record" || !record?.usage) {
     return null;
   }
+  // Kimi Code writes both per-turn and session-scoped usage.record lines. The
+  // session-scoped rows are cumulative running totals, so counting them next to
+  // the per-turn rows double-counts every turn. Only per-turn records are real
+  // increments. A record that omits the scope is treated as a turn (the common
+  // case) so a format that simply drops the field never silently under-counts,
+  // while any explicit non-turn (cumulative) scope is excluded.
+  if (typeof record.usageScope === "string" && record.usageScope !== "turn") {
+    return null;
+  }
   return record;
 }
 

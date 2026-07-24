@@ -14,6 +14,16 @@ The initial confirmed installation explicitly authorizes future **verified stabl
 
 `v0.1.22` has Windows Task Scheduler call a small local WScript wrapper instead of launching Node directly. The wrapper starts the same current-user heartbeat hidden, waits for it to finish, and returns its exit code to Task Scheduler. New Windows installations no longer flash a terminal window for hourly heartbeats.
 
+## v0.1.23 Kimi turn-scope correction
+
+`v0.1.23` fixes the Kimi Code adapter so it counts only per-turn `usage.record` rows. Kimi's `wire.jsonl` also emits session-scoped rows that are cumulative running totals; the earlier adapter counted every `usage.record`, which double-counted usage on a real journal. The parser now excludes any explicit non-turn (cumulative) scope while still counting a row that omits the scope, so a documented per-turn increment is never dropped and a running total is never re-added. This aligns the adapter with Moonshot's documented v0.28 wire format. Kimi collection stays opt-in and pending live client validation.
+
+## v0.1.24 local provider detection
+
+`v0.1.24` adds content-free local detection so one installation can recognize which supported providers are present on the machine instead of being told at pairing. Each scan (and the new `refresh-detection` command) checks only whether each provider's data directory exists — it never opens, lists, or reads a file inside — and records the result in local state, visible in `status`. Detection is always safe and on by default; it does not start tracking anything. Reading a provider's usage stays an explicit choice, unless the new `autoTrack` standing consent is enabled, which promotes a *detected, already-authorized* journal provider to tracked (it never widens the account's authorization, and version-pinned providers stay manual). Provider identity, detection, and consent now derive from a single `src/providers/registry.mjs` descriptor list, so a future provider is added as one descriptor plus its adapter rather than edits across the collector, state, and config.
+
+The signed heartbeat can carry the content-free detection snapshot (which supported providers are present — presence booleans only, never paths, file contents, versions, or timestamps) so the account can surface recognized providers. This send is **off by default** and guarded by `reportDetection`: a connector never sends the field until the operator enables it with `refresh-detection --enable-detection-report`, after the deployed server is known to accept it. Because the server validates the heartbeat body against a strict key allowlist, this ordering (server accepts first, connector sends second) is what prevents a rejected heartbeat from stalling the signed request chain. Provider-agnostic authorization and the Connections UI for these controls land in a later release.
+
 ## What is supported
 
 | Provider | Preferred source | Model-level source | Current status |

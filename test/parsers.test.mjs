@@ -501,6 +501,34 @@ test("Kimi v0.28 fallback prefilters usage.record and maps HighSpeed to fast", a
   assert.doesNotMatch(serialized(parsed), /SECRET_|private|kimi\.py/i);
 });
 
+test("Kimi excludes cumulative session-scoped usage.record rows so turns are not double-counted", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-kimi-scope-test-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const activePath = path.join(temporary, "wire.jsonl");
+  const base = {
+    type: "usage.record",
+    model: "kimi-code/kimi-for-coding-highspeed"
+  };
+  const lines = [
+    // Real per-turn increment.
+    { ...base, time: "2026-07-19T12:00:01.000Z", usage: { inputOther: 12, inputCacheRead: 7, inputCacheCreation: 3, output: 20 }, usageScope: "turn" },
+    // Cumulative session total covering the same turn — must be ignored.
+    { ...base, time: "2026-07-19T12:00:01.500Z", usage: { inputOther: 12, inputCacheRead: 7, inputCacheCreation: 3, output: 20 }, usageScope: "session" },
+    // Second per-turn increment; the running session total below repeats it.
+    { ...base, time: "2026-07-19T12:00:02.000Z", usage: { inputOther: 5, inputCacheRead: 0, inputCacheCreation: 0, output: 4 }, usageScope: "turn" },
+    { ...base, time: "2026-07-19T12:00:02.500Z", usage: { inputOther: 17, inputCacheRead: 7, inputCacheCreation: 3, output: 24 }, usageScope: "session" }
+  ];
+  await fs.writeFile(activePath, lines.map(JSON.stringify).join("\n") + "\n", "utf8");
+  const parsed = await parseKimiWire(activePath, {
+    stableJournalIdentity: "stable-kimi-session-agent",
+    dedupNamespaceKey
+  });
+  // Only the two per-turn rows are counted; cumulative session rows are dropped.
+  assert.equal(parsed.events.length, 2);
+  const total = parsed.events.reduce((sum, event) => sum + event.usage.total, 0);
+  assert.equal(total, 42 + 9);
+});
+
 test("Kimi fallback pages a large journal without changing event identity or totals", async (context) => {
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "tag-plugin-kimi-page-test-"));
   context.after(() => fs.rm(temporary, { recursive: true, force: true }));

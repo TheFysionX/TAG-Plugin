@@ -20,6 +20,8 @@ import {
 } from "./constants.mjs";
 import { ConnectorError } from "./errors.mjs";
 import { payloadHash } from "./crypto.mjs";
+import { ALWAYS_CONSENT_KEYS, PROVIDER_IDS } from "./providers/registry.mjs";
+import { DETECTION_STATE_VERSION } from "./providers/detect.mjs";
 
 const UNRESOLVED_EVENT_KEYS = new Set([
   "eventId",
@@ -372,6 +374,34 @@ function normalizedAntigravityFiles(value) {
     .slice(0, MAX_CURSOR_FILES));
 }
 
+function normalizedDetection(value) {
+  const providers = {};
+  const source = value?.providers;
+  if (source && typeof source === "object" && !Array.isArray(source)) {
+    for (const [id, entry] of Object.entries(source)) {
+      if (!PROVIDER_IDS.includes(id) || !entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      providers[id] = {
+        detected: entry.detected === true,
+        ready: entry.ready === true,
+        reason: typeof entry.reason === "string" && /^[a-z_]{1,40}$/.test(entry.reason) ? entry.reason : "unknown",
+        ...(typeof entry.versionPin === "string" && entry.versionPin.length > 0 && entry.versionPin.length <= 20
+          ? { versionPin: entry.versionPin }
+          : {}),
+        checkedAt: typeof entry.checkedAt === "string" && Number.isFinite(Date.parse(entry.checkedAt))
+          ? new Date(entry.checkedAt).toISOString()
+          : null
+      };
+    }
+  }
+  return {
+    version: DETECTION_STATE_VERSION,
+    providers,
+    lastRefreshedAt: typeof value?.lastRefreshedAt === "string" && Number.isFinite(Date.parse(value.lastRefreshedAt))
+      ? new Date(value.lastRefreshedAt).toISOString()
+      : null
+  };
+}
+
 function normalizedUnresolvedEvent(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   if (!Object.keys(value).every((key) => UNRESOLVED_EVENT_KEYS.has(key))) return null;
@@ -426,7 +456,10 @@ export function initialState() {
     },
     lastSyncAt: null,
     lastHeartbeatAt: null,
-    lastScan: null
+    lastScan: null,
+    // Last content-free local-detection probe result. Populated by scans and by
+    // the explicit refresh-detection command; never gates existing collection.
+    detection: { version: DETECTION_STATE_VERSION, providers: {}, lastRefreshedAt: null }
   };
 }
 
@@ -440,6 +473,15 @@ export function initialConfig() {
     // before TAG may modify Antigravity CLI settings for the optional
     // statusLine fallback.
     antigravityStatuslineConsent: false,
+    // Standing consent to automatically begin tracking any supported provider
+    // detected on this machine. Off by default: detection is always safe, but
+    // reading a provider's usage stays an explicit choice until this is enabled.
+    autoTrack: false,
+    // Whether the content-free detection snapshot is included on the signed
+    // heartbeat. Off by default so a connector can never send a field the
+    // deployed server has not yet been taught to accept; enable only after the
+    // server advertises support (see refresh-detection --enable-detection-report).
+    reportDetection: false,
     transcriptFallbacks: {
       codex: false,
       claude: false,
@@ -525,15 +567,18 @@ export async function loadRuntime(paths) {
   }
   const configuredFallbacks = config.transcriptFallbacks || {};
   config.antigravityStatuslineConsent = config.antigravityStatuslineConsent === true;
+  config.autoTrack = config.autoTrack === true;
+  config.reportDetection = config.reportDetection === true;
+  // The legacy providers are always materialized for backward compatibility; any
+  // other registry provider stays an optional key. DeepSeek has no local journal
+  // root, so its flag is only a consent marker for separately discovered
+  // host/API evidence. Driving this from the registry means a newly registered
+  // provider becomes a recognized consent key with no change here.
   config.transcriptFallbacks = {
-    codex: Boolean(configuredFallbacks.codex),
-    claude: Boolean(configuredFallbacks.claude),
-    kimi: Boolean(configuredFallbacks.kimi),
-    ...(Object.hasOwn(configuredFallbacks, "gemini") ? { gemini: Boolean(configuredFallbacks.gemini) } : {}),
-    ...(Object.hasOwn(configuredFallbacks, "grok") ? { grok: Boolean(configuredFallbacks.grok) } : {}),
-    // DeepSeek has no local journal root. This flag is only a consent marker
-    // for separately discovered host/API evidence.
-    ...(Object.hasOwn(configuredFallbacks, "deepseek") ? { deepseek: Boolean(configuredFallbacks.deepseek) } : {})
+    ...Object.fromEntries(ALWAYS_CONSENT_KEYS.map((id) => [id, Boolean(configuredFallbacks[id])])),
+    ...Object.fromEntries(PROVIDER_IDS
+      .filter((id) => !ALWAYS_CONSENT_KEYS.includes(id) && Object.hasOwn(configuredFallbacks, id))
+      .map((id) => [id, Boolean(configuredFallbacks[id])]))
   };
   const snapshots = state.heartbeatObservationSnapshots;
   const priorHeartbeatObservationVersion = Number.isInteger(snapshots?.version)
@@ -660,6 +705,7 @@ export async function loadRuntime(paths) {
       ? state.unresolvedOverflow.lastOverflowAt
       : null
   };
+  state.detection = normalizedDetection(state.detection);
   return { state, config };
 }
 

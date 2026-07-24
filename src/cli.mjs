@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { FOREGROUND_MAX_INGEST_REQUESTS } from "./constants.mjs";
 import { publicError } from "./errors.mjs";
+import { PROVIDER_IDS } from "./providers/registry.mjs";
 import {
   doctor,
   heartbeat,
@@ -10,6 +11,7 @@ import {
   pair,
   pause,
   preview,
+  refreshDetection,
   resume,
   scheduledRun,
   status,
@@ -42,7 +44,7 @@ function parseProviderList(value) {
   if (typeof value !== "string") throw new Error("--allow-journal-fallbacks requires a comma-separated provider list.");
   const result = {};
   for (const provider of value.split(",").map((item) => item.trim().toLowerCase())) {
-    if (["codex", "claude", "kimi", "gemini", "grok", "deepseek"].includes(provider)) {
+    if (PROVIDER_IDS.includes(provider)) {
       result[provider] = true;
     }
   }
@@ -58,6 +60,7 @@ function help() {
       sync: "Collect and explicitly send new allowlisted usage records.",
       heartbeat: "Explicitly send one signed health heartbeat.",
       status: "Show local status; no network.",
+      "refresh-detection": "Re-check now which supported providers are installed locally (content-free); no network. Toggle auto-track standing consent with --enable-auto-track/--disable-auto-track, and heartbeat detection reporting with --enable-detection-report/--disable-detection-report.",
       doctor: "Run privacy-safe local checks; no network.",
       install: "Preview by default; apply only with install --confirm-install.",
       pause: "Pause scheduled collection locally.",
@@ -108,6 +111,17 @@ async function main() {
       break;
     case "status":
       result = await status(common);
+      break;
+    case "refresh-detection":
+      result = await refreshDetection({
+        ...common,
+        setAutoTrack: flags["enable-auto-track"] === true
+          ? true
+          : (flags["disable-auto-track"] === true ? false : undefined),
+        setReportDetection: flags["enable-detection-report"] === true
+          ? true
+          : (flags["disable-detection-report"] === true ? false : undefined)
+      });
       break;
     case "doctor":
       result = await doctor(common);
