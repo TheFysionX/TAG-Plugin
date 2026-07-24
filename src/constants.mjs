@@ -1,4 +1,4 @@
-export const CONNECTOR_VERSION = "0.1.23";
+export const CONNECTOR_VERSION = "0.1.24";
 export const SCHEMA_VERSION = 1;
 export const CODEX_ACCOUNTING_VERSION = 5;
 export const CLAUDE_ACCOUNTING_VERSION = 5;

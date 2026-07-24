@@ -2382,8 +2382,15 @@ export async function sync(options = {}) {
         Boolean(enabled && supportedProviderSet.has(provider))
       ])
     );
+    // Antigravity desktop usage is collected directly (enabledProviders.gemini),
+    // not through a transcript fallback. The hourly aggregator silently discards
+    // any event whose provider has no range, so a provider that is authorized for
+    // direct collection must still get an aggregation window or its usage is lost.
+    const rangeProviders = allowedProviderSet.has("gemini") && supportedProviderSet.has("gemini")
+      ? { ...enabledFallbacks, gemini: true }
+      : enabledFallbacks;
     const historyRanges = aggregateHistory
-      ? aggregateHistoryRanges(options.now ?? Date.now(), runtime.state, enabledFallbacks)
+      ? aggregateHistoryRanges(options.now ?? Date.now(), runtime.state, rangeProviders)
       : null;
     const collection = await collectUsage({
       roots,
